@@ -1,0 +1,33 @@
+{
+  "name": "anchored",
+  "owner": {
+    "name": "jholhewres",
+    "url": "https://github.com/jholhewres"
+  },
+  "metadata": {
+    "description": "Persistent cross-tool memory for AI coding agents",
+    "version": "0.4.0"
+  },
+  "plugins": [
+    {
+      "name": "anchored",
+      "source": "./",
+      "description": "MCP memory server with hybrid search (vector + BM25), knowledge graph, and slash commands. Memory persists across Claude Code, Cursor, OpenCode, and any MCP-compatible AI tool.",
+      "version": "0.4.0",
+      "author": {
+        "name": "jholhewres"
+      },
+      "category": "development",
+      "keywords": [
+        "mcp",
+        "memory",
+        "cross-tool",
+        "persistent",
+        "knowledge-graph",
+        "embeddings",
+        "fts5",
+        "local-first"
+      ]
+    }
+  ]
+}

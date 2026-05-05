@@ -37,7 +37,7 @@ func (n *noopOptimizer) Search(ctx context.Context, query string, maxResults int
 	return nil, fmt.Errorf("not supported on windows")
 }
 
-func (n *noopOptimizer) FetchAndIndex(ctx context.Context, url string, source string, projectID string) (string, string, bool, error) {
+func (n *noopOptimizer) FetchAndIndex(ctx context.Context, url string, source string, projectID string, force bool) (string, string, bool, error) {
 	return "", "", false, fmt.Errorf("not supported on windows")
 }
 

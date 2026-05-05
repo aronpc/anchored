@@ -140,3 +140,93 @@ func TestSandbox_ConcurrentExecution(t *testing.T) {
 		}
 	}
 }
+
+func TestFilePrelude_PythonInjectsPathAndContent(t *testing.T) {
+	tmp := t.TempDir() + "/sample.txt"
+	if err := writeFileForTest(tmp, "alpha\nbeta\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	prelude := FilePrelude("python", tmp)
+	if prelude == "" {
+		t.Fatal("python prelude should not be empty")
+	}
+
+	code := prelude + "print('len=' + str(len(FILE_CONTENT)))\nprint('first=' + FILE_CONTENT.split(chr(10))[0])\n"
+	sb := NewSandbox(5*time.Second, 1<<20, "")
+	r, err := sb.Execute(context.Background(), "python", code)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if r.ExitCode != 0 {
+		t.Fatalf("exit %d, stderr=%s", r.ExitCode, r.Stderr)
+	}
+	if !strings.Contains(r.Stdout, "len=11") || !strings.Contains(r.Stdout, "first=alpha") {
+		t.Errorf("expected len=11 and first=alpha, got: %q", r.Stdout)
+	}
+}
+
+func TestFilePrelude_ShellExportsPath(t *testing.T) {
+	tmp := t.TempDir() + "/shell.txt"
+	if err := writeFileForTest(tmp, "shell-content\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	prelude := FilePrelude("shell", tmp)
+	code := prelude + `echo "path=$FILE_PATH"; echo "content=$FILE_CONTENT"`
+	sb := NewSandbox(5*time.Second, 1<<20, "")
+	r, err := sb.Execute(context.Background(), "shell", code)
+	if err != nil || r.ExitCode != 0 {
+		t.Fatalf("exec failed: %v exit=%d stderr=%s", err, r.ExitCode, r.Stderr)
+	}
+	if !strings.Contains(r.Stdout, "path="+tmp) {
+		t.Errorf("FILE_PATH not exported: %q", r.Stdout)
+	}
+	if !strings.Contains(r.Stdout, "content=shell-content") {
+		t.Errorf("FILE_CONTENT not loaded: %q", r.Stdout)
+	}
+}
+
+func TestSanitizedEnv_BlocksDenylistedVars(t *testing.T) {
+	t.Setenv("LD_PRELOAD", "/should/be/stripped.so")
+	t.Setenv("BASH_ENV", "/should/be/stripped.sh")
+	t.Setenv("PYTHONSTARTUP", "/should/be/stripped.py")
+
+	got := sanitizedEnv()
+	for _, kv := range got {
+		for _, blocked := range []string{"LD_PRELOAD=", "BASH_ENV=", "PYTHONSTARTUP="} {
+			if strings.HasPrefix(kv, blocked) {
+				t.Errorf("denylisted var leaked: %s", kv)
+			}
+		}
+	}
+
+	// Forced vars must be present.
+	want := map[string]string{
+		"PYTHONUNBUFFERED": "1",
+		"NO_COLOR":         "1",
+		"TERM":             "dumb",
+	}
+	for k, v := range want {
+		if !contains(got, k+"="+v) {
+			t.Errorf("missing forced env: %s=%s", k, v)
+		}
+	}
+}
+
+func writeFileForTest(path, content string) error {
+	return exec.Command("sh", "-c", "printf '%s' "+shellQuoteForTest(content)+" > "+shellQuoteForTest(path)).Run()
+}
+
+func shellQuoteForTest(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func contains(slice []string, target string) bool {
+	for _, s := range slice {
+		if s == target {
+			return true
+		}
+	}
+	return false
+}

@@ -137,6 +137,14 @@ func (f *Fetcher) ClearCache() {
 	f.cacheMu.Unlock()
 }
 
+// Invalidate drops the cached entry for url, forcing the next FetchAndConvert
+// call to hit the network.
+func (f *Fetcher) Invalidate(url string) {
+	f.cacheMu.Lock()
+	delete(f.cache, url)
+	f.cacheMu.Unlock()
+}
+
 func htmlToMarkdown(html string) (string, error) {
 	conv := converter.NewConverter(
 		converter.WithPlugins(

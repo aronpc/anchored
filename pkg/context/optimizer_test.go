@@ -99,7 +99,7 @@ func TestOptimizer_FetchAndIndex(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	result, err := o.FetchAndIndex(ctx, ts.URL, "test-fetch", "")
+	result, err := o.FetchAndIndex(ctx, ts.URL, "test-fetch", "", false)
 	if err != nil {
 		t.Fatalf("fetch and index: %v", err)
 	}

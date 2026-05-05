@@ -7,6 +7,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/jholhewres/anchored/pkg/config"
@@ -102,11 +104,31 @@ func (o *Optimizer) Execute(ctx context.Context, code string, language string, t
 	return o.sandbox.Execute(ctx, language, code)
 }
 
-// ExecuteFile runs code in the sandbox. The path parameter is for
-// metadata/logging only — the sandbox writes to temp files internally.
+// ExecuteFile runs user code in the sandbox after injecting a language-specific
+// prelude that exposes FILE_PATH (and FILE_CONTENT for languages where reading
+// is idiomatic). The user's code is concatenated after the prelude so it can
+// reference these variables directly without doing its own I/O.
+//
+// For PHP the prelude is wrapped in <?php tags, so the user code must contain
+// its own <?php opening tag if it expects to write PHP — same constraint as
+// any other PHP CLI runner.
 func (o *Optimizer) ExecuteFile(ctx context.Context, path string, language string, code string) (*ExecuteResult, error) {
-	o.logger.Debug("execute file", "path", path, "language", language)
-	return o.sandbox.Execute(ctx, language, code)
+	if path == "" {
+		return nil, fmt.Errorf("path is required")
+	}
+
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve path: %w", err)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return nil, fmt.Errorf("file: %w", err)
+	}
+
+	prelude := FilePrelude(language, abs)
+	o.logger.Debug("execute file", "path", abs, "language", language, "preludeBytes", len(prelude))
+
+	return o.sandbox.Execute(ctx, language, prelude+code)
 }
 
 // IndexContent chunks markdown content and indexes it. Returns a sourceGroupID.
@@ -130,7 +152,12 @@ func (o *Optimizer) Search(ctx context.Context, query string, maxResults int, co
 }
 
 // FetchAndIndex fetches a URL, converts to markdown, and indexes the content.
-func (o *Optimizer) FetchAndIndex(ctx context.Context, url string, source string, projectID string) (*FetchResult, error) {
+// If force is true, the URL's cache entry is invalidated first.
+func (o *Optimizer) FetchAndIndex(ctx context.Context, url string, source string, projectID string, force bool) (*FetchResult, error) {
+	if force {
+		o.fetcher.Invalidate(url)
+	}
+
 	result, err := o.fetcher.FetchAndConvert(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("fetch: %w", err)

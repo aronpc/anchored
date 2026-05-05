@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-05-05
+
+### Added
+
+- **Claude Code plugin** — installable via `/plugin marketplace add jholhewres/anchored` and `/plugin install anchored@anchored`. Bundles 6 slash commands (`/anchored:context`, `/anchored:search`, `/anchored:save`, `/anchored:stats`, `/anchored:doctor`, `/anchored:purge`), an auto-triggered skill, and the MCP server registration in one install.
+- **`anchored doctor`** — diagnostic checklist: binary version, ONNX model + tokenizer, FTS5/WAL, embedding coverage, MCP registration in Claude Code (`~/.claude.json`), Cursor, OpenCode, identity file. Each failure prints the exact fix command.
+- **`anchored purge`** — wipe memories. Default is soft-delete (recoverable for 30 days); `--hard` backs the DB up to `~/.anchored/data/anchored.db.YYYY-MM-DD-HHMMSS.bak` and resets to a fresh schema.
+- **Categorizer expansion** — ~25 new bilingual (PT+EN) regex patterns covering `learning` (was previously broken at 6/23K entries), `decision` ("vamos com", "settled on", "going forward"), `preference` ("I always", "minha preferência"), `plan` ("TODO", "next up", "preciso de"), and `event` ("merged", "shipped", "deployed"). Plan now runs before decision so "Next up: refactor" wins over "refactor". Unit tests cover each pattern.
+
+### Changed
+
+- **`anchored_save` requires `category`** — moved from optional to required in the MCP tool inputSchema. The description lists every category with examples so the LLM picks intentionally instead of relying on regex auto-detect. Service-level fallback to `Categorize()` is preserved if a client passes empty (no breaking change for older callers).
+- **Tool descriptions rewritten for proactive but discreet usage** — `anchored_context`, `anchored_search`, `anchored_save`, `kg_query`, `kg_add`, `anchored_update`, `anchored_forget` now lead with explicit trigger conditions and examples. `Instructions` field on `initialize` reframed: "use memory silently, don't narrate the search, quality over quantity". Generic across every IDE / AI tool.
+
+### Fixed
+
+- **`anchored_execute_file` was non-functional** — the `path` argument was logged and dropped; user code never received `FILE_PATH` or `FILE_CONTENT`. Now injects a language-specific prelude exposing both variables (JavaScript, TypeScript, Python, Shell, Ruby, Go, Rust, PHP, Perl, R, Elixir).
+- **`anchored_execute` env hardening** — host environment is now sanitized before launching the sandbox subprocess: ~40 hijack-prone vars stripped (`LD_PRELOAD`, `BASH_ENV`, `PYTHONSTARTUP`, `RUBYOPT`, `GIT_SSH_COMMAND`, `NODE_OPTIONS`, …) and forced sandbox vars added (`PYTHONUNBUFFERED=1`, `NO_COLOR=1`, `TERM=dumb`).
+- **`anchored_fetch_and_index` gains `force` parameter** — bypass the 24h URL cache to re-fetch fresh content. Defaults to false for backward compatibility.
+- **`purge --hard` data-safety** — `copyFile` now does explicit `Sync()` + checked `Close()`, removing the partial backup if anything fails. Pre-backup `PRAGMA wal_checkpoint(TRUNCATE)` ensures the `.bak` is self-contained even if another process holds the DB open.
+- **Categorizer false positives reduced** — bare `pattern` and `design` keywords removed from the `decision` regex; "design patterns in Python" no longer becomes a decision. Plan-pattern word boundaries tightened.
+
+### Docs
+
+- README setup makes `claude mcp add -s user anchored anchored` explicit. Without `-s user` Claude Code registers at local scope (current project only); user scope makes Anchored available in every project. Also documents that running sessions must be restarted to see newly-added MCP servers.
+
 ## [0.3.3] - 2026-05-05
 
 ### Added

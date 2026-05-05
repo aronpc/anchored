@@ -70,8 +70,8 @@ func (c *ctxOptimizer) Search(ctx context.Context, query string, maxResults int,
 	return out, nil
 }
 
-func (c *ctxOptimizer) FetchAndIndex(ctx context.Context, url string, source string, projectID string) (string, string, bool, error) {
-	r, err := c.inner.FetchAndIndex(ctx, url, source, projectID)
+func (c *ctxOptimizer) FetchAndIndex(ctx context.Context, url string, source string, projectID string, force bool) (string, string, bool, error) {
+	r, err := c.inner.FetchAndIndex(ctx, url, source, projectID, force)
 	if err != nil {
 		return "", "", false, err
 	}

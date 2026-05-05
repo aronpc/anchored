@@ -185,7 +185,7 @@ func TestImportJSONL_UserStringContent(t *testing.T) {
 
 func TestImportJSONL_AssistantArrayContent(t *testing.T) {
 	tmpDir := t.TempDir()
-	jsonlContent := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"The architecture uses microservices"},{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/main.go"}}]},"cwd":"/test/project","sessionId":"s1"}
+	jsonlContent := `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"We decided to go with microservices for this project"},{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/main.go"}}]},"cwd":"/test/project","sessionId":"s1"}
 `
 	jsonlPath := filepath.Join(tmpDir, "test.jsonl")
 	if err := os.WriteFile(jsonlPath, []byte(jsonlContent), 0644); err != nil {

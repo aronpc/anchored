@@ -20,7 +20,7 @@ type OptimizerFacade interface {
 	IndexContent(ctx context.Context, content string, source string, label string, projectID string) (string, error)
 	IndexRaw(ctx context.Context, content string, source string, label string, projectID string) (string, error)
 	Search(ctx context.Context, query string, maxResults int, contentType string, source string, projectID string) ([]OptimizerSearchResult, error)
-	FetchAndIndex(ctx context.Context, url string, source string, projectID string) (markdown string, fetchedAt string, fromCache bool, err error)
+	FetchAndIndex(ctx context.Context, url string, source string, projectID string, force bool) (markdown string, fetchedAt string, fromCache bool, err error)
 	ExecuteBatch(ctx context.Context, commands []OptimizerBatchCommand, queries []string, intent string, projectID string) (*OptimizerBatchResult, error)
 	Close()
 }
@@ -108,7 +108,7 @@ func (s *Server) handleInitialize(id json.RawMessage, params json.RawMessage) []
 			Name:    "anchored",
 			Version: s.version,
 		},
-		Instructions: "Anchored provides persistent cross-tool memory. Call anchored_context at conversation start. Use anchored_save to store facts and anchored_search to retrieve them. Never save secrets.",
+		Instructions: "Anchored is the user's persistent cross-tool memory, shared with every other AI coding agent and IDE they use. Use it silently — don't narrate \"let me check memory first\" or announce saves. The user expects you to remember, not to recite the act of remembering.\n\nCALL anchored_context once at the start of a new conversation to load identity, project, and recent decisions. Re-call only when the project changes.\n\nCALL anchored_search quietly before answering domain questions about the user's projects, decisions, or conventions — let the result inform your answer naturally, without flagging that you searched.\n\nCALL anchored_save (and kg_add for entity relationships) when durable, non-obvious knowledge emerges that future-you would need: stable preferences, architectural decisions, team/stack facts, lessons from incidents. Skip casual remarks, ephemeral task state, and anything inferable from the codebase. Quality over quantity — a few high-signal entries beat a flood of low-value ones.\n\nNEVER save secrets, credentials, or tokens.",
 	}
 	result.Capabilities.Tools.ListChanged = false
 	result.Capabilities.Resources.Subscribe = false
@@ -552,22 +552,9 @@ func (s *Server) toolCtxExecuteFile(ctx context.Context, args json.RawMessage) (
 		projectID = s.mem.ResolveProject(p.CWD)
 	}
 
-	data, err := os.ReadFile(p.Path)
-	if err != nil {
-		return "", fmt.Errorf("read file: %w", err)
-	}
-	tmpFile, err := os.CreateTemp("", "anchored-fc-*.txt")
-	if err != nil {
-		return "", fmt.Errorf("create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-	if _, err := tmpFile.Write(data); err != nil {
-		tmpFile.Close()
-		return "", fmt.Errorf("write temp file: %w", err)
-	}
-	tmpFile.Close()
-	wrapped := fmt.Sprintf("FILE_PATH=%q\n%s", tmpFile.Name(), p.Code)
-	stdout, stderr, exitCode, dur, timedOut, truncated, err := s.optimizer.ExecuteFile(ctx, p.Path, p.Language, wrapped, p.Timeout, projectID)
+	// Optimizer.ExecuteFile injects FILE_PATH and FILE_CONTENT preludes per
+	// language; we just forward the user's path and code as-is.
+	stdout, stderr, exitCode, dur, timedOut, truncated, err := s.optimizer.ExecuteFile(ctx, p.Path, p.Language, p.Code, p.Timeout, projectID)
 	if err != nil {
 		return "", err
 	}
@@ -735,6 +722,7 @@ func (s *Server) toolCtxFetchAndIndex(ctx context.Context, args json.RawMessage)
 		URL    string `json:"url"`
 		Source string `json:"source"`
 		CWD    string `json:"cwd"`
+		Force  bool   `json:"force"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
@@ -748,7 +736,7 @@ func (s *Server) toolCtxFetchAndIndex(ctx context.Context, args json.RawMessage)
 		projectID = s.mem.ResolveProject(p.CWD)
 	}
 
-	markdown, fetchedAt, fromCache, err := s.optimizer.FetchAndIndex(ctx, p.URL, p.Source, projectID)
+	markdown, fetchedAt, fromCache, err := s.optimizer.FetchAndIndex(ctx, p.URL, p.Source, projectID, p.Force)
 	if err != nil {
 		return "", err
 	}

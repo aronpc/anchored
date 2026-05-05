@@ -8,7 +8,7 @@ func ToolDefinitions() []Tool {
 	return []Tool{
 		{
 			Name:        "anchored_context",
-			Description: "ALWAYS call at conversation start. Returns your persistent identity + project context + relevant entity memories. This is your cross-tool memory — use it to load context before answering project questions.",
+			Description: "MUST CALL FIRST on every new conversation, before any other tool, before answering anything. Returns the user's identity, project summary, recent decisions, and relevant memories accumulated across every AI tool and IDE they use. This is persistent cross-tool memory — without it you have no context on who the user is, what they're working on, prior decisions, or established preferences. Re-call when the user changes directories or shifts to a different project. The cost is one tool call; the benefit is acting like you remember the user instead of starting fresh every session.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -26,7 +26,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_search",
-			Description: "Search your persistent cross-tool memory. Hybrid search (semantic vector + BM25 keyword). Use natural language queries. Returns ranked results with relevance scores.",
+			Description: "Quietly search persistent cross-tool memory before answering domain questions — let results inform your reply without narrating the search. TRIGGERS: user references prior context (\"like we discussed\", \"that bug from last week\"); user asks about a project, service, decision, preference, or convention; you're about to make an architectural/naming choice or recommend a tool (search first to honor existing decisions). Hybrid vector + BM25, results in milliseconds. Don't announce \"let me check memory\" — just search, integrate, answer naturally.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -53,25 +53,25 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_save",
-			Description: "Save a memory permanently. Auto-detects current project. Content is sanitized (secrets removed automatically). NEVER save API keys, tokens, passwords, or credentials.",
+			Description: "Capture durable knowledge into persistent cross-tool memory. CALL PROACTIVELY when high-signal information emerges; do not wait for the user to say \"remember this\". You MUST pick a category — picking wrong is better than skipping, and quality categorization beats keyword auto-detect. Categories:\n• fact — stable truth about user/team/stack/system (\"we run Go 1.22 on ARM\", \"the API lives at api.example.com\")\n• preference — recurring choice the user makes (\"I always pin deps\", \"prefer small PRs\")\n• decision — architectural or directional choice (\"settled on Postgres\", \"going forward, no co-author trailers\")\n• event — something that happened at a point in time (\"deployed v2 today\", \"merged #421\", \"meeting at 14h\")\n• learning — non-obvious lesson or post-mortem insight (\"TIL X\", \"got bit by Y\", \"causa raiz foi Z\")\n• plan — intent to do something (\"TODO: migrate\", \"next up: refactor\")\n• summary — consolidated recap (\"daily recap\", \"sprint summary\")\n\nDO NOT save: ephemeral task state, basic engineering trivia, anything inferable from the codebase, secrets/credentials. Auto-detects project from cwd. Content is sanitized for tokens/keys before storage.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"content": map[string]any{
 						"type":        "string",
-						"description": "The memory content to save",
+						"description": "The memory content to save (concise, self-contained)",
 					},
 					"category": map[string]any{
 						"type":        "string",
-						"description": "Category: fact, preference, decision, event, learning, plan (auto-detected if empty)",
-						"enum":        []string{"fact", "preference", "decision", "event", "learning", "plan"},
+						"description": "Pick the best fit. Falls back to keyword-based auto-detect if you pass an empty string, but explicit selection is strongly preferred.",
+						"enum":        []string{"fact", "preference", "decision", "event", "learning", "plan", "summary"},
 					},
 					"cwd": map[string]any{
 						"type":        "string",
 						"description": "Current working directory for project detection",
 					},
 				},
-				"required": []string{"content"},
+				"required": []string{"content", "category"},
 			},
 		},
 		{
@@ -97,7 +97,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_update",
-			Description: "Update an existing memory in-place. Preserves ID, project, and source. Re-embeds if content changed. Use to correct or evolve facts without losing context.",
+			Description: "Revise an existing memory in place. TRIGGER when the user corrects a stored fact (\"actually it's X, not Y\"), updates a decision (\"we changed our mind, now we use Z\"), or refines a preference. ALWAYS prefer this over creating a duplicate — search first to find the ID, then update. Preserves ID, project, source, and creation date. Re-embeds when content changes.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -124,7 +124,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_forget",
-			Description: "Remove a specific memory by ID. Soft-deletes by default (recoverable). Set hard=true for permanent deletion.",
+			Description: "Remove a memory. TRIGGER when the user says \"forget that\", \"that's no longer true\", \"we don't do X anymore\", or asks to delete a specific stored fact. Find the ID via anchored_search first. Soft-deletes by default (recoverable for 30 days); use hard=true only when the user explicitly requests permanent deletion.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -172,7 +172,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "kg_query",
-			Description: "Query the knowledge graph. Find entities (projects, services, people, APIs) and their relationships.",
+			Description: "Query the knowledge graph for an entity's relationships. Use IN ADDITION to anchored_search whenever the user names a specific project, service, repo, person, API, library, or environment — kg_query returns structured edges (depends_on, deployed_on, owns, uses) that prose search misses. Example triggers: \"how does X integrate with Y?\", \"what's the relationship between A and B?\", \"who owns service X?\", \"what depends on this library?\". Cheap; pair with anchored_search for full picture.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -190,7 +190,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "kg_add",
-			Description: "Add a relationship to the knowledge graph. Use for structured knowledge like project dependencies, deployment targets, team members.",
+			Description: "Capture a relationship into the knowledge graph. CALL PROACTIVELY when the user reveals a structural fact about their stack: \"X depends on Y\", \"service A is deployed on B\", \"repo X uses library Y\", \"team T owns service S\", \"X integrates with Y via Z\". The graph compounds across sessions and complements prose memory — both should be populated as facts emerge. Do not wait for explicit instructions. Subject/predicate/object should be short noun phrases; predicate uses snake_case (uses, depends_on, deployed_on, owns, integrates_with).",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -248,7 +248,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_execute_file",
-			Description: "Read a file and process it without loading contents into context. The file content is written to a temp file; FILE_PATH points to it. Only your printed summary enters context.",
+			Description: "Process a file in the sandbox without loading its contents into context. Two variables are auto-injected before your code runs: FILE_PATH (absolute path) and FILE_CONTENT (file read as UTF-8 text). Use them directly — don't repeat the read. Only your printed output (stdout) enters context. Available languages: javascript, typescript, python, shell, ruby, go, rust, php, perl, r, elixir.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -379,7 +379,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_fetch_and_index",
-			Description: "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, and returns a ~3KB preview. Full content stays in sandbox — use anchored_ctx_search for deeper lookups.",
+			Description: "Fetches URL content, converts HTML to markdown, indexes into the searchable knowledge base, and returns a ~3KB preview. Subsequent calls within the cache TTL (default 24h) return the cached result; pass force=true to bypass the cache and re-fetch from the network. Full content stays in the sandbox — use anchored_ctx_search for deeper lookups.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -394,6 +394,11 @@ func ToolDefinitions() []Tool {
 					"cwd": map[string]any{
 						"type":        "string",
 						"description": "Current working directory for project scoping",
+					},
+					"force": map[string]any{
+						"type":        "boolean",
+						"description": "Bypass cache and re-fetch (default: false)",
+						"default":     false,
 					},
 				},
 				"required": []string{"url"},

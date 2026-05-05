@@ -48,10 +48,12 @@ Run `anchored init` to auto-register Anchored with every detected tool. Or confi
 
 **Claude Code** (recommended):
 ```bash
-claude mcp add anchored anchored
+claude mcp add -s user anchored anchored
 ```
 
-This writes the entry to `~/.claude.json` (Claude Code's MCP config — it's `~/.claude.json`, not `~/.claude/mcp.json`).
+The `-s user` flag is important: it registers Anchored at user scope so it's available in every project. Without it, `claude mcp add` defaults to local (current project only). The entry lives in `~/.claude.json` — note: `~/.claude.json`, not `~/.claude/mcp.json`.
+
+After registering, **restart Claude Code** — running sessions don't pick up newly-added MCP servers.
 
 **Cursor** (`~/.cursor/mcp.json`) and **OpenCode** (`~/.config/opencode/opencode.json`):
 ```json

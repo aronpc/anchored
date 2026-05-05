@@ -10,7 +10,7 @@ import (
 
 func runSave(args []string) {
 	fs := newFlagSet("save")
-	category := fs.String("category", "fact", "memory category")
+	category := fs.String("category", "", "memory category (auto-detected if omitted)")
 	project := fs.String("project", "", "project ID")
 	configPath := fs.String("config", "", "path to config file")
 	fs.Parse(args)

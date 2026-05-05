@@ -5,7 +5,7 @@ import (
 	"os"
 )
 
-var Version = "0.3.3"
+var Version = "0.4.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -42,6 +42,10 @@ func main() {
 		runHook(os.Args[2:])
 	case "dream":
 		runDream(os.Args[2:])
+	case "doctor":
+		runDoctor(os.Args[2:])
+	case "purge":
+		runPurge(os.Args[2:])
 	case "--version", "-v":
 		fmt.Printf("anchored %s\n", Version)
 	case "--help", "-h":
@@ -69,6 +73,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored precompact         Pre-compact memory context\n")
 	fmt.Fprintf(os.Stderr, "  anchored hook <subcommand>  Run session continuity hooks\n")
 	fmt.Fprintf(os.Stderr, "  anchored dream              Analyze and consolidate duplicate memories\n")
+	fmt.Fprintf(os.Stderr, "  anchored doctor             Diagnose installation, config, MCP registration\n")
+	fmt.Fprintf(os.Stderr, "  anchored purge              Wipe memories (--hard for full DB reset)\n")
 	fmt.Fprintf(os.Stderr, "  anchored --version          Print version\n")
 	fmt.Fprintf(os.Stderr, "\nImport sources: claude-code devclaw opencode cursor all\n")
 	fmt.Fprintf(os.Stderr, "\nFlags:\n")
