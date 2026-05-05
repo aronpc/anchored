@@ -6,20 +6,21 @@
 [![Go](https://img.shields.io/badge/go-1.24+-00ADD8?style=for-the-badge&logo=go)]
 [![Release](https://img.shields.io/github/v/release/jholhewres/anchored?style=for-the-badge)](https://github.com/jholhewres/anchored/releases)
 
-Anchored is an MCP memory server that gives Claude Code, Cursor, OpenCode, and any MCP-compatible tool a shared, persistent memory. Install once, and all your tools read, write, and search the same knowledge base.
+Anchored is an MCP memory server that gives every AI coding agent and IDE you use a shared, persistent memory. Install once, and Claude Code, Cursor, OpenCode, Gemini CLI, and any other MCP-compatible tool read, write, and search the same knowledge base.
 
 No API keys. No daemon. All embeddings run locally.
 
 ## Features
 
+- **Cross-tool memory** — one knowledge base, every AI tool and IDE shares it
 - **Multilingual embeddings** — `paraphrase-multilingual-MiniLM-L12-v2` (50+ languages, PT-BR and EN parity)
-- **Hybrid search** — RRF fusion of vector similarity (384-dim ONNX) and BM25 (FTS5), with entity boost and project boost
-- **Entity detection** — regex-based extraction of project names, tools, and topics from queries, boosting relevant results
-- **Topic change detection** — identifies conversation shifts and increases retrieval diversity
-- **Memory stack** — L0 identity + L1 essential stories + L2 on-demand retrieval, budget-enforced (~900 tokens)
-- **Vector cache** — in-memory RAM cache of embeddings for fast similarity search
-- **Incremental indexer** — polling-based with SHA-256 delta sync, heading-aware chunking
+- **Hybrid search** — RRF fusion of vector similarity (384-dim ONNX) and BM25 (FTS5), with entity and project boost
 - **Knowledge graph** — automatic pattern-based extraction of entities and relationships (no LLM needed)
+- **Smart categorization** — bilingual PT+EN regex auto-classifies memories into 7 categories (fact, preference, decision, event, learning, plan, summary)
+- **Memory stack** — L0 identity + L1 essential stories + L2 on-demand retrieval, budget-enforced (~900 tokens)
+- **Sandbox tools** — `anchored_execute`/`anchored_execute_file` run code in 11 languages with stdout-only capture, hardened env, FILE_PATH/FILE_CONTENT injection
+- **Knowledge indexing** — `anchored_fetch_and_index` mirrors URLs to a local FTS5 store; sandbox keeps raw data out of context
+- **Background auto-updater** — checks GitHub releases on startup; new binary atomically replaced, current process unaffected
 - **Credential redaction** — regex-based secret sanitization before storage
 - **Multi-source import** — Claude Code (JSONL), OpenCode (SQLite), Cursor (.mdc rules), DevClaw
 
@@ -44,18 +45,36 @@ First run auto-downloads the embedding model (~470MB) and creates `~/.anchored/`
 
 ## Setup
 
-Run `anchored init` to auto-register Anchored with every detected tool. Or configure manually:
+### Claude Code (plugin)
 
-**Claude Code** (recommended):
+The fastest path. Installs the MCP server, six `/anchored:*` slash commands, and an auto-trigger skill in one step:
+
+```
+/plugin marketplace add jholhewres/anchored
+/plugin install anchored@anchored
+```
+
+Then restart Claude Code. From any project: `/anchored:context`, `/anchored:search <query>`, `/anchored:save <content>`, `/anchored:stats`, `/anchored:doctor`, `/anchored:purge`. The skill triggers `anchored_*` tools proactively when memory is relevant — no need to ask.
+
+### Claude Code (MCP only, no slash commands)
+
 ```bash
 claude mcp add -s user anchored anchored
 ```
 
-The `-s user` flag is important: it registers Anchored at user scope so it's available in every project. Without it, `claude mcp add` defaults to local (current project only). The entry lives in `~/.claude.json` — note: `~/.claude.json`, not `~/.claude/mcp.json`.
+The `-s user` flag registers Anchored at user scope so it's available in every project. Without it, `claude mcp add` defaults to local. Entry lives at `~/.claude.json` (not `~/.claude/mcp.json`). Restart Claude Code to pick up the new server.
 
-After registering, **restart Claude Code** — running sessions don't pick up newly-added MCP servers.
+### Other tools
 
-**Cursor** (`~/.cursor/mcp.json`) and **OpenCode** (`~/.config/opencode/opencode.json`):
+Run `anchored init` to auto-detect and register, or configure manually:
+
+| Tool | Config file |
+|---|---|
+| Cursor | `~/.cursor/mcp.json` |
+| OpenCode | `~/.config/opencode/opencode.json` |
+| Gemini CLI | `~/.gemini/settings.json` |
+| VS Code Copilot | `.vscode/mcp.json` |
+
 ```json
 {
   "mcpServers": {
@@ -69,33 +88,57 @@ After registering, **restart Claude Code** — running sessions don't pick up ne
 ## CLI
 
 ```
-anchored                    Start MCP server (STDIO)
+anchored                    Start MCP server (STDIO, default when no arg)
 anchored serve              Start MCP server (STDIO)
-anchored import [sources]   Import memories from detected sources
-anchored search <query>     Search memories
-anchored save <content>     Save a memory
-anchored list               List memories
-anchored forget <id>        Remove a memory
+anchored init [--tool]      Auto-detect tools and register MCP
+anchored doctor             Diagnose installation, config, MCP registration
 anchored stats              Show memory statistics
+
+anchored search <query>     Search memories
+anchored save <content>     Save a memory (auto-categorized if --category omitted)
+anchored update <id>        Update a memory
+anchored forget <id>        Remove a memory (soft delete; --hard for permanent)
+anchored list               List memories
+
+anchored import [sources]   Import memories from detected sources
 anchored identity [edit]    View or edit identity file
 anchored config [show|set]  View or modify configuration
-anchored init               Auto-detect tools and register MCP
+
+anchored dream              Analyze and consolidate duplicate memories
+anchored precompact         Pre-compact memory context
+anchored hook <subcommand>  Run session continuity hooks
+anchored purge              Wipe memories (--hard for full DB reset with backup)
 ```
 
 Import sources: `claude-code` `devclaw` `opencode` `cursor` `all`
 
 ## MCP Tools
 
-| Tool | Description |
+**Memory**
+
+| Tool | When to use |
 |---|---|
-| `anchored_context` | Load relevant memory for the current project |
-| `anchored_search` | Search across all memories (semantic + keyword) |
-| `anchored_save` | Persist a fact, decision, or preference |
-| `anchored_list` | List memories by category or project |
-| `anchored_forget` | Remove a memory |
+| `anchored_context` | First call of every conversation — loads identity, project, recent decisions |
+| `anchored_search` | Before answering domain questions (hybrid vector + BM25) |
+| `anchored_save` | Capture facts, preferences, decisions, learnings (category required) |
+| `anchored_update` | Revise an existing memory in place |
+| `anchored_forget` | Remove a memory (soft delete by default) |
+| `anchored_list` | List memories by category, project, or time |
 | `anchored_stats` | Memory overview |
-| `kg_query` | Query the knowledge graph |
-| `kg_add` | Add a relationship to the knowledge graph |
+| `anchored_session_end` | Close a tracked session |
+| `kg_query` | Query knowledge-graph relationships for an entity |
+| `kg_add` | Capture a relationship (subject — predicate — object) |
+
+**Sandbox / index** (context-saving tools that keep raw data out of context)
+
+| Tool | When to use |
+|---|---|
+| `anchored_execute` | Run code in 11 languages; only stdout enters context |
+| `anchored_execute_file` | Process a file; `FILE_PATH` and `FILE_CONTENT` auto-injected |
+| `anchored_batch_execute` | Run multiple commands and run search queries in one call |
+| `anchored_index` | Index documentation into FTS5 knowledge base |
+| `anchored_ctx_search` | Search indexed content with batched queries |
+| `anchored_fetch_and_index` | Fetch URL → markdown → index (`force=true` bypasses 24h cache) |
 
 ## How it works
 
