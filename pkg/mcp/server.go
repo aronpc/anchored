@@ -142,7 +142,7 @@ func (s *Server) handleInitialize(id json.RawMessage, params json.RawMessage) []
 			Name:    "anchored",
 			Version: s.version,
 		},
-		Instructions: "Anchored is the user's persistent cross-tool memory, shared with every other AI coding agent and IDE they use. Use it silently — don't narrate \"let me check memory first\" or announce saves. The user expects you to remember, not to recite the act of remembering.\n\nCALL anchored_context once at the start of a new conversation to load identity, project, and recent decisions. Re-call only when the project changes.\n\nCALL anchored_search quietly before answering domain questions about the user's projects, decisions, or conventions — let the result inform your answer naturally, without flagging that you searched.\n\nCALL anchored_save (and kg_add for entity relationships) when durable, non-obvious knowledge emerges that future-you would need: stable preferences, architectural decisions, team/stack facts, lessons from incidents. Skip casual remarks, ephemeral task state, and anything inferable from the codebase. Quality over quantity — a few high-signal entries beat a flood of low-value ones.\n\nNEVER save secrets, credentials, or tokens.",
+		Instructions: "Anchored is the user's persistent cross-tool memory, shared with every other AI coding agent and IDE they use. Use it silently — don't narrate \"let me check memory first\" or announce saves. The user expects you to remember, not to recite the act of remembering.\n\nCALL anchored_context once at the start of a new conversation to load identity, project, and recent decisions. Re-call only when the project changes.\n\nCALL anchored_search quietly before answering domain questions about the user's projects, decisions, or conventions — let the result inform your answer naturally, without flagging that you searched.\n\nCALL anchored_save (and anchored_kg_add for entity relationships) when durable, non-obvious knowledge emerges that future-you would need: stable preferences, architectural decisions, team/stack facts, lessons from incidents. Skip casual remarks, ephemeral task state, and anything inferable from the codebase. Quality over quantity — a few high-signal entries beat a flood of low-value ones.\n\nNEVER save secrets, credentials, or tokens.",
 	}
 	result.Capabilities.Tools.ListChanged = false
 	result.Capabilities.Resources.Subscribe = false
@@ -194,9 +194,9 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		return s.toolUpdate(ctx, args)
 	case "anchored_stats":
 		return s.toolStats(ctx)
-	case "kg_query":
+	case "anchored_kg_query", "kg_query":
 		return s.toolKGQuery(ctx, args)
-	case "kg_add":
+	case "anchored_kg_add", "kg_add":
 		return s.toolKGAdd(ctx, args)
 	case "anchored_session_end":
 		return s.toolSessionEnd(ctx, args)

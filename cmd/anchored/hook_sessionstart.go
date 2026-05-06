@@ -3,11 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 )
 
+// runHookSessionStart emits a Claude Code SessionStart hook payload that
+// injects the anchored routing block plus a project-scoped recap of recent
+// decisions / events. The shape `{hookSpecificOutput:{hookEventName,
+// additionalContext}}` is the contract Claude Code reads to add a system
+// reminder for the model. Cursor / OpenCode follow the same convention.
 func runHookSessionStart(args []string) {
 	fs := newFlagSet("hook sessionstart")
 	sessionID := fs.String("session-id", "", "session identifier")
@@ -18,75 +25,84 @@ func runHookSessionStart(args []string) {
 	content, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		slog.Error("failed to read stdin", "error", err)
-		os.Exit(1)
+		emitSessionStart(AnchoredRoutingBlock)
+		return
 	}
 
 	var input struct {
 		SessionID string `json:"session_id"`
+		Cwd       string `json:"cwd"`
 		Directory string `json:"directory"`
 	}
 	_ = json.Unmarshal(content, &input)
 
-	sid := *sessionID
-	if sid == "" {
-		sid = input.SessionID
-	}
-
-	_, _, svc, err := initService(*configPath)
-	if err != nil {
-		slog.Error("failed to initialize", "error", err)
-		os.Exit(1)
-	}
-	defer svc.Close()
+	_ = sessionID
 
 	cwdVal := *cwd
 	if cwdVal == "" {
+		cwdVal = input.Cwd
+	}
+	if cwdVal == "" {
+		cwdVal = input.Directory
+	}
+	if cwdVal == "" {
 		cwdVal = "."
 	}
-	projectID := svc.ResolveProject(cwdVal)
 
+	additional := AnchoredRoutingBlock
+
+	_, _, svc, err := initService(*configPath)
+	if err != nil {
+		// Routing block alone is still useful even if the DB is unavailable.
+		emitSessionStart(additional)
+		return
+	}
+	defer svc.Close()
+
+	projectID := svc.ResolveProject(cwdVal)
 	ctx := context.Background()
 	db := svc.StoreDB()
 
-	resumeContext := ""
-	row := db.QueryRowContext(ctx,
-		`SELECT summary FROM session_events WHERE event_type = 'precompact_snapshot' AND (project_id = ? OR project_id = '') ORDER BY created_at DESC LIMIT 1`,
-		projectID,
-	)
-	_ = row.Scan(&resumeContext)
-
+	// Recent project-scoped events (decisions, learnings, deployments, etc.).
 	type recentEvent struct {
-		EventType string `json:"event_type"`
-		ToolName  string `json:"tool_name"`
-		Summary   string `json:"summary"`
-		CreatedAt string `json:"created_at"`
+		EventType string
+		Summary   string
 	}
-
 	var recent []recentEvent
 	rows, err := db.QueryContext(ctx,
-		`SELECT event_type, tool_name, summary, created_at FROM session_events
-		 WHERE priority <= 2 AND (project_id = ? OR project_id = '') ORDER BY created_at DESC LIMIT 20`,
+		`SELECT event_type, summary FROM session_events
+		 WHERE priority <= 2 AND (project_id = ? OR project_id = '')
+		 ORDER BY created_at DESC LIMIT 8`,
 		projectID,
 	)
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var e recentEvent
-			if err := rows.Scan(&e.EventType, &e.ToolName, &e.Summary, &e.CreatedAt); err == nil {
+			if err := rows.Scan(&e.EventType, &e.Summary); err == nil && strings.TrimSpace(e.Summary) != "" {
 				recent = append(recent, e)
 			}
 		}
-		_ = rows.Err()
 	}
 
-	suggestion := "No previous session context found"
-	if resumeContext != "" {
-		suggestion = "Resume from previous context"
+	if len(recent) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\n\n<anchored_recent_events>\n")
+		for _, e := range recent {
+			fmt.Fprintf(&sb, "  <event type=%q>%s</event>\n", e.EventType, e.Summary)
+		}
+		sb.WriteString("</anchored_recent_events>")
+		additional += sb.String()
 	}
 
+	emitSessionStart(additional)
+}
+
+func emitSessionStart(additional string) {
 	outputJSON(map[string]any{
-		"resume_context": resumeContext,
-		"recent_events":  recent,
-		"suggestions":    suggestion,
+		"hookSpecificOutput": map[string]any{
+			"hookEventName":     "SessionStart",
+			"additionalContext": additional,
+		},
 	})
 }

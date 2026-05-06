@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.2] - 2026-05-06
+
+### Added
+
+- **SessionStart + UserPromptSubmit hooks** — the Claude Code plugin now ships `hooks/hooks.json` wired to `anchored hook sessionstart` (injects the `<anchored_memory>` routing block plus a project-scoped recap of recent decisions/events at conversation start) and `anchored hook userpromptsubmit` (re-injects the routing block on every prompt so the reminder survives compaction). Result: the agent calls `anchored_context` / `anchored_search` / `anchored_save` proactively without the user having to ask.
+- **Hook subcommand expansion** — new `anchored hook userpromptsubmit` (Claude Code contract `{hookSpecificOutput:{hookEventName,additionalContext}}`); the existing `anchored hook sessionstart` now emits the same contract instead of an opaque `{resume_context,...}` blob.
+- **Cursor + OpenCode sample configs** — `configs/cursor/{mcp.json,hooks.json}` and `configs/opencode/opencode.json` register the `anchored` MCP server and route SessionStart/UserPromptSubmit/PreCompact equivalents to the same hook subcommands. `configs/README.md` walks through install per IDE.
+
+### Changed
+
+- **`kg_query` → `anchored_kg_query` / `kg_add` → `anchored_kg_add`** — namespaced under the `anchored_` prefix so the knowledge-graph tools sit alongside `anchored_search` / `anchored_save` instead of appearing as orphan top-level tools. The legacy `kg_query` / `kg_add` names still dispatch to the same handlers (no breaking change for older clients), but new clients should use the prefixed names. Tool descriptions and the MCP `initialize.instructions` text were updated accordingly.
+
 ## [0.4.1] - 2026-05-05
 
 ### Added

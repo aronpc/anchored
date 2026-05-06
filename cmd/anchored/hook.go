@@ -8,7 +8,7 @@ import (
 func runHook(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "Usage: anchored hook <subcommand> [options]")
-		fmt.Fprintln(os.Stderr, "Subcommands: pretooluse, posttooluse, precompact, sessionstart")
+		fmt.Fprintln(os.Stderr, "Subcommands: pretooluse, posttooluse, precompact, sessionstart, userpromptsubmit")
 		os.Exit(1)
 	}
 	switch args[0] {
@@ -20,6 +20,8 @@ func runHook(args []string) {
 		runHookPreCompact(args[1:])
 	case "sessionstart":
 		runHookSessionStart(args[1:])
+	case "userpromptsubmit":
+		runHookUserPromptSubmit(args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown hook subcommand: %s\n", args[0])
 		os.Exit(1)

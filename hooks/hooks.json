@@ -1,0 +1,49 @@
+{
+  "description": "Anchored hooks — SessionStart + UserPromptSubmit inject the persistent-memory routing block; PostToolUse / PreCompact capture session events.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook sessionstart"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook userpromptsubmit"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Read|Write|Edit|Grep|Glob|TodoWrite|Skill|Agent|mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook posttooluse"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook precompact"
+          }
+        ]
+      }
+    ]
+  }
+}

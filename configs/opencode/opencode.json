@@ -1,0 +1,27 @@
+{
+  "mcp": {
+    "anchored": {
+      "type": "local",
+      "command": ["anchored"]
+    }
+  },
+  "experimental": {
+    "hook": {
+      "session_compacting": [
+        {
+          "command": ["anchored", "hook", "precompact"]
+        }
+      ],
+      "chat_message": [
+        {
+          "command": ["anchored", "hook", "userpromptsubmit"]
+        }
+      ],
+      "chat_system_transform": [
+        {
+          "command": ["anchored", "hook", "sessionstart"]
+        }
+      ]
+    }
+  }
+}

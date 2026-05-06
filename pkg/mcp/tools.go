@@ -171,8 +171,8 @@ func ToolDefinitions() []Tool {
 			},
 		},
 		{
-			Name:        "kg_query",
-			Description: "Query the knowledge graph for an entity's relationships. Use IN ADDITION to anchored_search whenever the user names a specific project, service, repo, person, API, library, or environment — kg_query returns structured edges (depends_on, deployed_on, owns, uses) that prose search misses. Example triggers: \"how does X integrate with Y?\", \"what's the relationship between A and B?\", \"who owns service X?\", \"what depends on this library?\". Cheap; pair with anchored_search for full picture.",
+			Name:        "anchored_kg_query",
+			Description: "Query the knowledge graph for an entity's relationships. Use IN ADDITION to anchored_search whenever the user names a specific project, service, repo, person, API, library, or environment — anchored_kg_query returns structured edges (depends_on, deployed_on, owns, uses) that prose search misses. Example triggers: \"how does X integrate with Y?\", \"what's the relationship between A and B?\", \"who owns service X?\", \"what depends on this library?\". Cheap; pair with anchored_search for full picture.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -189,7 +189,7 @@ func ToolDefinitions() []Tool {
 			},
 		},
 		{
-			Name:        "kg_add",
+			Name:        "anchored_kg_add",
 			Description: "Capture a relationship into the knowledge graph. CALL PROACTIVELY when the user reveals a structural fact about their stack: \"X depends on Y\", \"service A is deployed on B\", \"repo X uses library Y\", \"team T owns service S\", \"X integrates with Y via Z\". The graph compounds across sessions and complements prose memory — both should be populated as facts emerge. Do not wait for explicit instructions. Subject/predicate/object should be short noun phrases; predicate uses snake_case (uses, depends_on, deployed_on, owns, integrates_with).",
 			InputSchema: map[string]any{
 				"type": "object",
