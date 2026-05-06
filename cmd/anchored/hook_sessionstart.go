@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"github.com/jholhewres/anchored/pkg/mcp"
 )
 
 // runHookSessionStart emits a Claude Code SessionStart hook payload that
@@ -25,7 +27,7 @@ func runHookSessionStart(args []string) {
 	content, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		slog.Error("failed to read stdin", "error", err)
-		emitSessionStart(AnchoredRoutingBlock)
+		emitSessionStart(mcp.AnchoredRoutingBlock)
 		return
 	}
 
@@ -49,7 +51,7 @@ func runHookSessionStart(args []string) {
 		cwdVal = "."
 	}
 
-	additional := AnchoredRoutingBlock
+	additional := mcp.AnchoredRoutingBlock
 
 	_, _, svc, err := initService(*configPath)
 	if err != nil {

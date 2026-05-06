@@ -1,10 +1,19 @@
-package main
+package mcp
 
-// AnchoredRoutingBlock is the system-reminder injected by the SessionStart and
-// UserPromptSubmit hooks so Claude (and every other MCP client that respects
-// `additionalContext`) treats anchored as the persistent memory layer instead
-// of waiting for the user to ask. Mirrors the structure context-mode uses for
-// its own routing block (XML-tagged so it survives compaction-friendly).
+// AnchoredRoutingBlock is the single source of truth for how the agent should
+// treat anchored at runtime. It is consumed in TWO places that need to stay
+// in lockstep:
+//
+//   1. Server.handleInitialize → returned in the MCP `initialize` response as
+//      the `instructions` field, so any MCP-compatible client gets the
+//      guidance during the handshake.
+//   2. cmd/anchored/hook_sessionstart.go and hook_userpromptsubmit.go →
+//      injected via Claude Code's `additionalContext` so the same guidance
+//      survives compaction and is re-applied on every prompt.
+//
+// Mirrors the structure context-mode uses for its <context_window_protection>
+// block: XML-tagged sections so the model can scan them quickly and so the
+// content survives token-trimming better than free prose.
 const AnchoredRoutingBlock = `<anchored_memory>
   <priority_instructions>
     Anchored is the user's persistent cross-tool memory, shared across every IDE and AI tool. Use it silently — don't narrate "let me check memory" or "saving this". The user expects you to remember.
@@ -33,6 +42,10 @@ const AnchoredRoutingBlock = `<anchored_memory>
     - summary — consolidated recap.
     Pick the category explicitly. Skip ephemerals and anything inferable from the codebase.
   </save_triggers>
+
+  <session_continuity>
+    Decisions and preferences saved via anchored_save remain authoritative across sessions and tools. When the user contradicts a stored fact, prefer anchored_update over creating a duplicate; when they revoke one, use anchored_forget. Don't drop these directives as the conversation grows.
+  </session_continuity>
 
   <forbidden>
     NEVER save secrets, credentials, tokens, or PII.

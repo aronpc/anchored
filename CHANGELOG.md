@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.3] - 2026-05-06
+
+### Changed
+
+- **Single source of truth for routing guidance** — the `<anchored_memory>` routing block now lives in `pkg/mcp/routing.go` (`AnchoredRoutingBlock`) and is consumed in two places that used to drift: the MCP `initialize.instructions` field and the SessionStart / UserPromptSubmit hook payloads. Pure-MCP clients (no hook support) and Claude Code-style clients (with `additionalContext`) now receive the same guidance text via different channels — no duplication, no contradictions.
+- **Routing block gained `<session_continuity>`** — explicit reminder that decisions/preferences saved via `anchored_save` remain authoritative across sessions and tools, that contradictions should prefer `anchored_update` over duplicates, and that revocations use `anchored_forget`. Mirrors the equivalent section in context-mode's routing block.
+
 ## [0.4.2] - 2026-05-06
 
 ### Added

@@ -1,6 +1,6 @@
 {
   "name": "anchored",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "Persistent cross-tool memory for AI coding agents. Single binary, zero dependencies, local-first. Shared between every IDE and AI tool you use.",
   "author": {
     "name": "jholhewres",

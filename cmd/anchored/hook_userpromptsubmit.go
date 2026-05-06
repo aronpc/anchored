@@ -3,6 +3,8 @@ package main
 import (
 	"io"
 	"os"
+
+	"github.com/jholhewres/anchored/pkg/mcp"
 )
 
 // runHookUserPromptSubmit re-injects the anchored routing block on every user
@@ -27,7 +29,7 @@ func runHookUserPromptSubmit(args []string) {
 	outputJSON(map[string]any{
 		"hookSpecificOutput": map[string]any{
 			"hookEventName":     "UserPromptSubmit",
-			"additionalContext": AnchoredRoutingBlock,
+			"additionalContext": mcp.AnchoredRoutingBlock,
 		},
 	})
 }
