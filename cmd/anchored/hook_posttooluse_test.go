@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	ctxpkg "github.com/jholhewres/anchored/pkg/context"
+	"github.com/jholhewres/anchored/pkg/debuglog"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -157,6 +158,118 @@ func TestBuildPostToolUseMetadata_TruncatesAt1KB(t *testing.T) {
 	if len(got) > 1024 {
 		t.Fatalf("metadata > 1024 bytes: %d", len(got))
 	}
+}
+
+// TestRecordPostToolUseEvent_EndToEnd feeds a realistic Claude Code stdin
+// payload through the full record pipeline against an in-memory sqlite DB
+// and verifies the resulting row plus the JSON response line.
+func TestRecordPostToolUseEvent_EndToEnd(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctxpkg.MigrationSQL); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if _, err := db.Exec(ctxpkg.MigrationSQL009); err != nil {
+		t.Fatalf("migration 009: %v", err)
+	}
+
+	stdin := strings.NewReader(`{
+		"session_id":      "sess-A",
+		"hook_event_name": "PostToolUse",
+		"cwd":             "/repo",
+		"tool_name":       "Bash",
+		"tool_input":      {"command": "echo hi"},
+		"tool_response":   {"stdout": "hi\n", "exit": 0}
+	}`)
+	var stdout strings.Builder
+
+	deps := PostToolUseDeps{
+		Stdin:          stdin,
+		Stdout:         &stdout,
+		DB:             db,
+		ResolveProject: func(cwd string) string { return "proj-X" },
+		NewID:          func() string { return "evt-1" },
+		Logger:         nilDebugLogger(),
+	}
+	recordPostToolUseEvent(deps)
+
+	if !strings.Contains(stdout.String(), `"recorded":true`) {
+		t.Fatalf("expected recorded=true, got %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `"event_id":"evt-1"`) {
+		t.Fatalf("expected event_id=evt-1, got %q", stdout.String())
+	}
+
+	var (
+		sid, pid, etype, tname, summary string
+		priority                        int
+	)
+	err = db.QueryRow(`SELECT session_id, project_id, event_type, priority, tool_name, summary
+		FROM session_events WHERE id = ?`, "evt-1").Scan(
+		&sid, &pid, &etype, &priority, &tname, &summary,
+	)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if sid != "sess-A" || pid != "proj-X" || etype != "tool_call" || priority != 3 || tname != "Bash" {
+		t.Errorf("row mismatch: sid=%q pid=%q etype=%q pri=%d tool=%q", sid, pid, etype, priority, tname)
+	}
+	if !strings.Contains(summary, `"stdout":"hi\n"`) {
+		t.Errorf("summary missing stdout: %q", summary)
+	}
+}
+
+// TestRecordPostToolUseEvent_MissingSessionID asserts the graceful "no row"
+// path when neither stdin nor flag carry a session_id.
+func TestRecordPostToolUseEvent_MissingSessionID(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctxpkg.MigrationSQL); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if _, err := db.Exec(ctxpkg.MigrationSQL009); err != nil {
+		t.Fatalf("migration 009: %v", err)
+	}
+
+	stdin := strings.NewReader(`{"tool_name":"Read"}`) // no session_id
+	var stdout strings.Builder
+
+	recordPostToolUseEvent(PostToolUseDeps{
+		Stdin:          stdin,
+		Stdout:         &stdout,
+		DB:             db,
+		ResolveProject: func(string) string { return "" },
+		NewID:          func() string { return "evt-1" },
+		Logger:         nilDebugLogger(),
+	})
+
+	if !strings.Contains(stdout.String(), `"recorded":false`) {
+		t.Fatalf("expected recorded=false, got %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "missing session_id") {
+		t.Fatalf("expected reason missing_session_id, got %q", stdout.String())
+	}
+
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM session_events").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("no row should be inserted when session_id is missing, got %d", n)
+	}
+}
+
+// nilDebugLogger returns a *debuglog.Logger whose Event/Close are safe to
+// call without writing anywhere — debug logging is opt-in and tests don't
+// need to assert on emitted events.
+func nilDebugLogger() *debuglog.Logger {
+	return &debuglog.Logger{}
 }
 
 func TestNewHookID_HexLength(t *testing.T) {

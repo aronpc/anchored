@@ -12,7 +12,69 @@ import (
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/importer"
 	"github.com/jholhewres/anchored/pkg/memory"
+	"github.com/jholhewres/anchored/pkg/project"
+
+	_ "github.com/mattn/go-sqlite3"
 )
+
+// HookContext is the lightweight runtime hooks need: just the DB and a
+// project detector. memory.NewService loads the ONNX embedder (~500ms cold
+// start, ~470MB memory map) which the hooks don't use — every PostToolUse
+// firing was paying that cost. This bypass keeps hooks under the latency
+// floor where they don't bottleneck a busy tool-call session.
+type HookContext struct {
+	cfg      *config.Config
+	db       *sql.DB
+	detector *project.Detector
+}
+
+// openHookContext opens the SQLite DB with WAL+busy_timeout and wires a
+// project detector against it. Caller must Close() when done.
+func openHookContext(configPath string) (*HookContext, error) {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
+	if err := config.EnsureDirs(cfg); err != nil {
+		return nil, fmt.Errorf("ensure dirs: %w", err)
+	}
+
+	dsn := cfg.Memory.DatabasePath + "?_journal_mode=WAL&_busy_timeout=5000"
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	// Single connection avoids "database is locked" under WAL when migrations
+	// are in flight from another `anchored` invocation. Hooks are short-lived
+	// so the cap is harmless.
+	db.SetMaxOpenConns(1)
+
+	return &HookContext{
+		cfg:      cfg,
+		db:       db,
+		detector: project.NewDetector(db),
+	}, nil
+}
+
+func (h *HookContext) Close() error {
+	if h == nil || h.db == nil {
+		return nil
+	}
+	return h.db.Close()
+}
+
+// ResolveProject returns the project ID for cwd, or "" when cwd is outside a
+// git repo or the projects table is missing. Mirrors memory.Service.ResolveProject.
+func (h *HookContext) ResolveProject(cwd string) string {
+	if h == nil || h.detector == nil {
+		return ""
+	}
+	p, err := h.detector.Detect(cwd)
+	if err != nil || p == nil {
+		return ""
+	}
+	return p.ID
+}
 
 // openDebugLogger resolves config + env to (maybe) open the NDJSON debug
 // log. Always non-nil and always safe to call Event/Close on, even when

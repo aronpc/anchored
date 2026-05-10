@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jholhewres/anchored/pkg/debuglog"
@@ -24,22 +26,38 @@ const postToolUseInsertSQL = `INSERT INTO session_events
 	(id, session_id, project_id, event_type, priority, tool_name, summary, metadata, created_at)
 	VALUES (?, ?, ?, 'tool_call', 3, ?, ?, ?, datetime('now'))`
 
-// runHookPostToolUse records a `tool_call` row in session_events for every
-// tool invocation Claude Code emits. Claude Code (and other MCP-compatible
-// hooks) deliver the event as JSON on stdin with the canonical fields:
+// PostToolUseDeps wires the IO surface and runtime collaborators of the
+// posttooluse hook so the core can be exercised without touching os.Stdin/
+// os.Stdout or instantiating a HookContext. Production builds wire stdin to
+// os.Stdin, stdout to os.Stdout, and DB+ResolveProject through HookContext;
+// tests pass an in-memory DB and a stub resolver.
+type PostToolUseDeps struct {
+	Stdin           io.Reader
+	Stdout          io.Writer
+	DB              ExecContexter
+	ResolveProject  func(cwd string) string
+	SessionIDFlag   string
+	CwdFlag         string
+	Now             func() time.Time
+	NewID           func() string
+	Logger          *debuglog.Logger
+}
+
+// ExecContexter is the small slice of *sql.DB the hook actually needs;
+// tests can satisfy it with an in-memory DB or a fake.
+type ExecContexter interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// runHookPostToolUse is the production entrypoint: parses flags, opens the
+// debug log + lightweight DB context, and delegates the real work to
+// recordPostToolUseEvent. Splitting the IO wiring from the recording logic
+// lets the latter run end-to-end against a real sqlite3 in tests.
 //
-//	{
-//	  "session_id":       "...",
-//	  "hook_event_name":  "PostToolUse",
-//	  "cwd":              "...",
-//	  "tool_name":        "Read|Bash|...",
-//	  "tool_input":       { ... },
-//	  "tool_response":    { ... }
-//	}
-//
-// Older invocations / manual scripts may pass --session-id / --cwd as flags;
-// those still work as fallbacks. Failures here must NEVER block the upstream
-// tool call: every error path returns exit 0 with a graceful JSON response.
+// Claude Code delivers the event as JSON on stdin with these canonical
+// fields: session_id, hook_event_name, cwd, tool_name, tool_input,
+// tool_response. Manual scripts may pass --session-id / --cwd as flag
+// fallbacks. Failures NEVER block the upstream tool call.
 func runHookPostToolUse(args []string) {
 	fs := newFlagSet("hook posttooluse")
 	sessionIDFlag := fs.String("session-id", "", "session identifier (fallback when stdin lacks one)")
@@ -50,10 +68,37 @@ func runHookPostToolUse(args []string) {
 	dlog := openDebugLogger(*configPath)
 	defer dlog.Close()
 
-	body, err := io.ReadAll(os.Stdin)
+	hc, err := openHookContext(*configPath)
+	if err != nil {
+		slog.Warn("posttooluse: hook context init failed", "error", err)
+		dlog.Event("hook.posttooluse", map[string]any{"stage": "service_init_failed", "error": err.Error()})
+		writePostToolUseResp(os.Stdout, map[string]any{"recorded": false, "reason": "context init failed"})
+		return
+	}
+	defer hc.Close()
+
+	recordPostToolUseEvent(PostToolUseDeps{
+		Stdin:          os.Stdin,
+		Stdout:         os.Stdout,
+		DB:             hc.db,
+		ResolveProject: hc.ResolveProject,
+		SessionIDFlag:  *sessionIDFlag,
+		CwdFlag:        *cwdFlag,
+		Now:            time.Now,
+		NewID:          newHookID,
+		Logger:         dlog,
+	})
+}
+
+// recordPostToolUseEvent is the testable core: read stdin, decide whether
+// to insert, write a JSON status line. All side effects are funneled through
+// `deps`; nothing here touches os globals.
+func recordPostToolUseEvent(deps PostToolUseDeps) {
+	dlog := deps.Logger
+	body, err := io.ReadAll(deps.Stdin)
 	if err != nil {
 		dlog.Event("hook.posttooluse", map[string]any{"stage": "stdin_error", "error": err.Error()})
-		outputJSON(map[string]any{"recorded": false, "error": "stdin read failed"})
+		writePostToolUseResp(deps.Stdout, map[string]any{"recorded": false, "error": "stdin read failed"})
 		return
 	}
 
@@ -68,50 +113,43 @@ func runHookPostToolUse(args []string) {
 	if len(body) > 0 {
 		if err := json.Unmarshal(body, &input); err != nil {
 			dlog.Event("hook.posttooluse", map[string]any{"stage": "parse_error", "error": err.Error()})
-			// Don't return — flag-only invocation is still allowed.
+			// Fall through — flag-only invocation is still allowed.
 		}
 	}
 
 	sessionID := input.SessionID
 	if sessionID == "" {
-		sessionID = *sessionIDFlag
+		sessionID = deps.SessionIDFlag
 	}
 	if sessionID == "" {
 		dlog.Event("hook.posttooluse", map[string]any{"stage": "missing_session_id"})
-		outputJSON(map[string]any{"recorded": false, "reason": "missing session_id"})
+		writePostToolUseResp(deps.Stdout, map[string]any{"recorded": false, "reason": "missing session_id"})
 		return
 	}
 
 	cwdVal := input.Cwd
 	if cwdVal == "" {
-		cwdVal = *cwdFlag
+		cwdVal = deps.CwdFlag
 	}
 	if cwdVal == "" {
 		cwdVal = "."
 	}
 
-	_, _, svc, err := initService(*configPath)
-	if err != nil {
-		slog.Warn("posttooluse: service init failed", "error", err)
-		dlog.Event("hook.posttooluse", map[string]any{"stage": "service_init_failed", "error": err.Error()})
-		outputJSON(map[string]any{"recorded": false, "reason": "service init failed"})
-		return
+	projectID := ""
+	if deps.ResolveProject != nil {
+		projectID = deps.ResolveProject(cwdVal)
 	}
-	defer svc.Close()
-
-	projectID := svc.ResolveProject(cwdVal)
 	summary := summarizeToolEvent(input.ToolResponse, input.ToolInput, 500)
 	metadata := buildPostToolUseMetadata(cwdVal, input.HookEventName, len(body))
-	eventID := newHookID()
-	toolName := input.ToolName
+	eventID := deps.NewID()
 
-	_, err = svc.StoreDB().ExecContext(context.Background(), postToolUseInsertSQL,
-		eventID, sessionID, projectID, toolName, summary, metadata,
+	_, err = deps.DB.ExecContext(context.Background(), postToolUseInsertSQL,
+		eventID, sessionID, projectID, input.ToolName, summary, metadata,
 	)
 	if err != nil {
 		slog.Warn("posttooluse: insert failed", "error", err)
 		dlog.Event("hook.posttooluse", map[string]any{"stage": "insert_failed", "error": err.Error()})
-		outputJSON(map[string]any{"recorded": false, "reason": "db error"})
+		writePostToolUseResp(deps.Stdout, map[string]any{"recorded": false, "reason": "db error"})
 		return
 	}
 
@@ -119,14 +157,26 @@ func runHookPostToolUse(args []string) {
 		"stage":      "recorded",
 		"session_id": sessionID,
 		"project_id": projectID,
-		"tool":       toolName,
+		"tool":       input.ToolName,
 		"event_id":   eventID,
 		"summary":    debuglog.Snippet(summary, 200),
 	})
-	outputJSON(map[string]any{
+	writePostToolUseResp(deps.Stdout, map[string]any{
 		"recorded": true,
 		"event_id": eventID,
 	})
+}
+
+// writePostToolUseResp writes a JSON response line to w. Mirrors outputJSON
+// but takes an explicit Writer for testability. Marshal failure falls back
+// to "{}" so the hook contract (never block) is preserved.
+func writePostToolUseResp(w io.Writer, v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		fmt.Fprintln(w, "{}")
+		return
+	}
+	fmt.Fprintln(w, string(data))
 }
 
 // summarizeToolEvent picks the best human-readable summary for the row.

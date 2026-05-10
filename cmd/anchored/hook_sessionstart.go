@@ -66,18 +66,18 @@ func runHookSessionStart(args []string) {
 		"input_head": debuglog.Snippet(string(content), 200),
 	})
 
-	_, _, svc, err := initService(*configPath)
+	hc, err := openHookContext(*configPath)
 	if err != nil {
 		dlog.Event("hook.sessionstart", map[string]any{"stage": "service_init_failed", "error": err.Error()})
 		// Routing block alone is still useful even if the DB is unavailable.
 		emitSessionStart(additional)
 		return
 	}
-	defer svc.Close()
+	defer hc.Close()
 
-	projectID := svc.ResolveProject(cwdVal)
+	projectID := hc.ResolveProject(cwdVal)
 	ctx := context.Background()
-	db := svc.StoreDB()
+	db := hc.db
 
 	// Recent project-scoped events (decisions, learnings, deployments, etc.).
 	type recentEvent struct {
