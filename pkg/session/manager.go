@@ -191,6 +191,27 @@ func (m *Manager) EndStaleSessions(ctx context.Context, maxAge time.Duration) (i
 	return int(n), nil
 }
 
+// CleanupOldEvents deletes session_events rows older than retention. Returns
+// the number of rows removed. Intended to be called on a long interval
+// (daily) from the serve goroutine — session_events grows fast under
+// PostToolUse pressure (one row per tool call) and accumulates stale rows
+// quickly without a TTL.
+func (m *Manager) CleanupOldEvents(ctx context.Context, retention time.Duration) (int, error) {
+	if retention <= 0 {
+		return 0, nil
+	}
+	modifier := fmt.Sprintf("-%d seconds", int(retention.Seconds()))
+	res, err := m.db.ExecContext(ctx,
+		`DELETE FROM session_events WHERE created_at < datetime('now', ?)`,
+		modifier,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup old events: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // SessionStats returns total and active session counts.
 func (m *Manager) SessionStats(ctx context.Context) (total int, active int, err error) {
 	err = m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions`).Scan(&total)

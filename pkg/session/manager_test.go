@@ -195,3 +195,65 @@ func TestSessionStats_Counts(t *testing.T) {
 		t.Errorf("expected active=1, got %d", active)
 	}
 }
+
+func TestCleanupOldEvents_DropsExpired(t *testing.T) {
+	db := setupTestDB(t)
+	m := NewManager(db, nil)
+
+	// Three rows: 60 days old, 1 day old, fresh. With a 30-day retention only
+	// the oldest should be dropped.
+	insert := func(id, created string) {
+		t.Helper()
+		_, err := db.Exec(`INSERT INTO session_events
+			(id, session_id, project_id, event_type, priority, tool_name, summary, metadata, created_at)
+			VALUES (?, 's1', 'p1', 'tool_call', 3, 'Bash', '', '{}', ?)`,
+			id, created,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("e-old", time.Now().Add(-60*24*time.Hour).UTC().Format("2006-01-02 15:04:05"))
+	insert("e-recent", time.Now().Add(-1*24*time.Hour).UTC().Format("2006-01-02 15:04:05"))
+	insert("e-now", time.Now().UTC().Format("2006-01-02 15:04:05"))
+
+	deleted, err := m.CleanupOldEvents(context.Background(), 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("CleanupOldEvents: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("expected 1 row deleted, got %d", deleted)
+	}
+
+	var ids []string
+	rows, err := db.Query(`SELECT id FROM session_events ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		_ = rows.Scan(&id)
+		ids = append(ids, id)
+	}
+	want := []string{"e-now", "e-recent"}
+	if len(ids) != len(want) || ids[0] != want[0] || ids[1] != want[1] {
+		t.Errorf("rows after cleanup = %v, want %v", ids, want)
+	}
+}
+
+func TestCleanupOldEvents_NoRetentionIsNoOp(t *testing.T) {
+	db := setupTestDB(t)
+	m := NewManager(db, nil)
+
+	_, err := db.Exec(`INSERT INTO session_events
+		(id, session_id, project_id, event_type, priority, tool_name, summary, metadata, created_at)
+		VALUES ('x', 's1', 'p1', 'tool_call', 3, '', '', '{}', datetime('now'))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := m.CleanupOldEvents(context.Background(), 0); err != nil || n != 0 {
+		t.Errorf("retention<=0 must be a no-op, got n=%d err=%v", n, err)
+	}
+}

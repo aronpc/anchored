@@ -59,6 +59,12 @@ func runServe() {
 		Logger:         logger,
 	})
 
+	// session_events grows by ~1 row per tool call (PostToolUse hook). Without
+	// retention the table balloons in long-lived projects. We sweep on serve
+	// startup and once a day after that; default 30-day window keeps recap
+	// queries fast while preserving a useful historical horizon.
+	go runEventCleanup(ctx, memSvc, logger, 30*24*time.Hour, 24*time.Hour)
+
 	if err := serveSTDIO(ctx, memSvc, cfg, logger); err != nil {
 		slog.Error("serve error", "error", err)
 		os.Exit(1)
@@ -130,6 +136,38 @@ func serveSTDIO(ctx context.Context, memSvc *memory.Service, cfg *config.Config,
 	}
 
 	return nil
+}
+
+// runEventCleanup periodically deletes session_events rows older than
+// retention. Runs once on startup, then every interval. Cancellation via ctx
+// stops cleanly. Errors are logged at Warn but never block — the goroutine
+// keeps trying on the next tick.
+func runEventCleanup(ctx context.Context, memSvc *memory.Service, logger *slog.Logger, retention, interval time.Duration) {
+	mgr := session.NewManager(memSvc.StoreDB(), logger)
+	sweep := func() {
+		c, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		n, err := mgr.CleanupOldEvents(c, retention)
+		if err != nil {
+			logger.Warn("session_events cleanup failed", "error", err)
+			return
+		}
+		if n > 0 {
+			logger.Info("session_events cleanup", "deleted", n, "retention_hours", int(retention.Hours()))
+		}
+	}
+	sweep()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
 }
 
 func loadConfig(explicit string) (*config.Config, error) {
