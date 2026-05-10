@@ -8,7 +8,7 @@ func ToolDefinitions() []Tool {
 	return []Tool{
 		{
 			Name:        "anchored_context",
-			Description: "MUST CALL FIRST on every new conversation, before any other tool, before answering anything. Returns the user's identity, project summary, recent decisions, and relevant memories accumulated across every AI tool and IDE they use. This is persistent cross-tool memory — without it you have no context on who the user is, what they're working on, prior decisions, or established preferences. Re-call when the user changes directories or shifts to a different project. The cost is one tool call; the benefit is acting like you remember the user instead of starting fresh every session.",
+			Description: "First call of every new conversation. Returns identity, project summary, recent decisions, and durable memories from this user across every AI tool and IDE. Re-call when project (cwd) changes. Example: user says \"can you help with the auth flow?\" → call anchored_context(cwd=\".\") before reading code.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -26,7 +26,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_search",
-			Description: "Quietly search persistent cross-tool memory before answering domain questions — let results inform your reply without narrating the search. TRIGGERS: user references prior context (\"like we discussed\", \"that bug from last week\"); user asks about a project, service, decision, preference, or convention; you're about to make an architectural/naming choice or recommend a tool (search first to honor existing decisions). Hybrid vector + BM25, results in milliseconds. Don't announce \"let me check memory\" — just search, integrate, answer naturally.",
+			Description: "Search persistent memory before answering. Use silently — never narrate \"let me check memory\". Triggers: user mentions past work (\"like we discussed\", \"how did we...\"), prior decisions, conventions, preferences, or names a project/service/library. Also: any time you're about to recommend a tool/architecture — search first to honor existing decisions. Hybrid vector + BM25, milliseconds. Examples: User \"como decidimos lidar com X?\" → anchored_search(query=\"X\"); User \"add auth to this service\" → anchored_search(query=\"auth convention\").",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

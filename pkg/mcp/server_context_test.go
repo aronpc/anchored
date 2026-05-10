@@ -163,25 +163,18 @@ func TestTruncateContextBundle_KeepsClosingTagAndDropsWholeLines(t *testing.T) {
 	}
 }
 
-func TestFilterRecentCategories(t *testing.T) {
-	in := []memory.Memory{
-		{Category: "decision"},
-		{Category: "summary"}, // dropped
-		{Category: "event"},   // dropped
-		{Category: "learning"},
-		{Category: "preference"},
-		{Category: "plan"},
-		{Category: "fact"},
+func TestRecentBundleCategories_Coverage(t *testing.T) {
+	// Sanity: the bundle's "durable knowledge" set is exactly these five.
+	// summary/event are excluded by design — see comment on the constant.
+	want := map[string]bool{
+		"decision": true, "learning": true, "plan": true, "preference": true, "fact": true,
 	}
-	out := filterRecentCategories(in)
-	if len(out) != 5 {
-		t.Fatalf("want 5, got %d: %v", len(out), out)
+	if len(recentBundleCategories) != len(want) {
+		t.Fatalf("len(recentBundleCategories) = %d, want %d", len(recentBundleCategories), len(want))
 	}
-	for _, m := range out {
-		switch m.Category {
-		case "decision", "learning", "preference", "plan", "fact":
-		default:
-			t.Errorf("unexpected category %q", m.Category)
+	for _, c := range recentBundleCategories {
+		if !want[c] {
+			t.Errorf("unexpected category in bundle set: %q", c)
 		}
 	}
 }

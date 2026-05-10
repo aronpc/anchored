@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -285,24 +286,47 @@ func (s *Server) toolContext(ctx context.Context, args json.RawMessage) (string,
 		_ = s.sessions.RecordActivity(ctx, p.SessionID)
 	}
 
-	identity := readIdentityFile()
+	// projectID is the dependency root for everything else — resolve it
+	// synchronously, then fan out the four follow-up reads in parallel.
 	projectID := s.mem.ResolveProject(p.CWD)
-	projectName, projectPath := s.lookupProjectMeta(ctx, projectID)
-	memCount, byCategory := s.projectScopedStats(ctx, projectID)
 
-	// Pull a wider slice and filter in-Go so projects dominated by
-	// summary/event still surface enough decision/learning rows. SQL-side
-	// filter is on the v0.4.6 wishlist (memory.ListOptions.Categories).
-	recentMems, _ := s.mem.List(ctx, memory.ListOptions{
-		ProjectID: projectID,
-		Limit:     50,
-	})
-	recentMems = filterRecentCategories(recentMems)
-	if len(recentMems) > 5 {
-		recentMems = recentMems[:5]
-	}
+	var (
+		identity                 string
+		projectName, projectPath string
+		memCount                 int
+		byCategory               map[string]int
+		recentMems               []memory.Memory
+		events                   []ctxRecentEvent
+	)
 
-	events := s.recentSessionEvents(ctx, projectID, 5)
+	var wg sync.WaitGroup
+	wg.Add(4)
+
+	go func() {
+		defer wg.Done()
+		identity = readIdentityFile()
+	}()
+	go func() {
+		defer wg.Done()
+		projectName, projectPath = s.lookupProjectMeta(ctx, projectID)
+	}()
+	go func() {
+		defer wg.Done()
+		memCount, byCategory = s.projectScopedStats(ctx, projectID)
+	}()
+	go func() {
+		defer wg.Done()
+		// Two independent reads chained: list of recent memories + recent
+		// session events. Run them sequentially in this goroutine so we
+		// don't fan out beyond what SQLite (with MaxOpenConns=1) handles.
+		recentMems, _ = s.mem.List(ctx, memory.ListOptions{
+			ProjectID:  projectID,
+			Categories: recentBundleCategories,
+			Limit:      5,
+		})
+		events = s.recentSessionEvents(ctx, projectID, 5)
+	}()
+	wg.Wait()
 
 	if identity == "" && projectID == "" && len(recentMems) == 0 && len(events) == 0 {
 		return "No memory context available yet. Save memories with anchored_save.", nil
@@ -380,22 +404,11 @@ func (s *Server) projectScopedStats(ctx context.Context, projectID string) (int,
 	return total, byCategory
 }
 
-func filterRecentCategories(in []memory.Memory) []memory.Memory {
-	keep := map[string]bool{
-		"decision":   true,
-		"learning":   true,
-		"plan":       true,
-		"preference": true,
-		"fact":       true,
-	}
-	var out []memory.Memory
-	for _, m := range in {
-		if keep[m.Category] {
-			out = append(out, m)
-		}
-	}
-	return out
-}
+// recentBundleCategories is the set of "durable knowledge" categories we
+// surface in toolContext's <recent> section. summary/event are excluded:
+// summaries can be long and bloat the bundle, events are usually time-bound
+// and less actionable than decisions/learnings/plans/preferences/facts.
+var recentBundleCategories = []string{"decision", "learning", "plan", "preference", "fact"}
 
 type ctxRecentEvent struct {
 	EventType string
@@ -634,20 +647,39 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	}
 
 	if len(results) == 0 {
-		return "No matching memories found.", nil
+		return "<anchored_search count=\"0\"/>", nil
 	}
 
-	globalMode := p.CWD == ""
-	var lines []string
-	for i, r := range results {
-		line := fmt.Sprintf("%d. [%s] %.3f — %s", i+1, r.Memory.Category, r.Score, r.Memory.Content)
+	return renderSearchResults(p.Query, p.CWD == "", results), nil
+}
+
+// renderSearchResults emits the search hit list as compact XML so an LLM
+// agent can integrate fragments directly into its reply without reformatting.
+// Mirrors the structure of <anchored_context>/<anchored_search_preview>:
+// attribute-level metadata + one entry per result. Score is rendered with
+// three decimals to keep the snippet stable across runs (BM25/RRF jitter at
+// the fourth decimal would create noisy diffs in tests).
+func renderSearchResults(query string, globalMode bool, results []memory.SearchResult) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "<anchored_search query=%q count=%q>\n",
+		truncateRunes(query, 200), fmt.Sprintf("%d", len(results)),
+	)
+	for _, r := range results {
+		content := strings.ReplaceAll(r.Memory.Content, "\n", " ")
+		content = strings.ReplaceAll(content, "\r", " ")
+		var attrs []string
+		attrs = append(attrs,
+			fmt.Sprintf("id=%q", escapeAttr(r.Memory.ID)),
+			fmt.Sprintf("category=%q", escapeAttr(r.Memory.Category)),
+			fmt.Sprintf("score=%q", fmt.Sprintf("%.3f", r.Score)),
+		)
 		if globalMode && r.Memory.ProjectID != nil && *r.Memory.ProjectID != "" {
-			line = fmt.Sprintf("%d. [project:%s] [%s] %.3f — %s", i+1, *r.Memory.ProjectID, r.Memory.Category, r.Score, r.Memory.Content)
+			attrs = append(attrs, fmt.Sprintf("project=%q", escapeAttr(*r.Memory.ProjectID)))
 		}
-		lines = append(lines, line)
+		fmt.Fprintf(&sb, "  <hit %s>%s</hit>\n", strings.Join(attrs, " "), escapeText(content))
 	}
-
-	return fmt.Sprintf("Found %d memories:\n\n%s", len(results), joinLines(lines)), nil
+	sb.WriteString("</anchored_search>")
+	return sb.String()
 }
 
 func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, error) {
