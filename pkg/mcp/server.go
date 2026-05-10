@@ -2,13 +2,18 @@ package mcp
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/kg"
@@ -250,6 +255,20 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	}
 }
 
+// anchoredContextBudget caps the size of the bundle returned by toolContext.
+// Identity is truncated first if budget pressure is hit, then recent items.
+const anchoredContextBudget = 4096
+
+// toolContext returns a structured bundle the model uses as the bootstrap
+// memory snapshot for a conversation:
+//   - identity (~/.anchored/identity.md)
+//   - project summary (resolved from cwd, with category counts)
+//   - recent durable memories (decision/learning/plan/preference/fact)
+//   - recent session_events (priority <= 2, project-scoped or global)
+//
+// All sections are best-effort: missing identity / DB hiccup → that section is
+// omitted, never an error. When everything is empty we keep the historical
+// fallback string so downstream agents can still show something useful.
 func (s *Server) toolContext(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
 		CWD       string `json:"cwd"`
@@ -258,13 +277,333 @@ func (s *Server) toolContext(ctx context.Context, args json.RawMessage) (string,
 	if err := json.Unmarshal(args, &p); err != nil {
 		p.CWD = "."
 	}
+	if p.CWD == "" {
+		p.CWD = "."
+	}
 
-	// Track session activity
 	if s.sessions != nil && p.SessionID != "" {
 		_ = s.sessions.RecordActivity(ctx, p.SessionID)
 	}
 
-	return "No memory context available yet. Save memories with anchored_save.", nil
+	identity := readIdentityFile()
+	projectID := s.mem.ResolveProject(p.CWD)
+	projectName, projectPath := s.lookupProjectMeta(ctx, projectID)
+	memCount, byCategory := s.projectScopedStats(ctx, projectID)
+
+	// Pull a wider slice and filter in-Go so projects dominated by
+	// summary/event still surface enough decision/learning rows. SQL-side
+	// filter is on the v0.4.6 wishlist (memory.ListOptions.Categories).
+	recentMems, _ := s.mem.List(ctx, memory.ListOptions{
+		ProjectID: projectID,
+		Limit:     50,
+	})
+	recentMems = filterRecentCategories(recentMems)
+	if len(recentMems) > 5 {
+		recentMems = recentMems[:5]
+	}
+
+	events := s.recentSessionEvents(ctx, projectID, 5)
+
+	if identity == "" && projectID == "" && len(recentMems) == 0 && len(events) == 0 {
+		return "No memory context available yet. Save memories with anchored_save.", nil
+	}
+
+	return renderContextBundle(identity, projectName, projectPath, projectID, memCount, byCategory, recentMems, events, anchoredContextBudget), nil
+}
+
+func readIdentityFile() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".anchored", "identity.md"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func (s *Server) lookupProjectMeta(ctx context.Context, projectID string) (name, path string) {
+	if projectID == "" {
+		return "", ""
+	}
+	row := s.mem.StoreDB().QueryRowContext(ctx, "SELECT name, path FROM projects WHERE id = ?", projectID)
+	if err := row.Scan(&name, &path); err != nil {
+		// ErrNoRows is expected (race between ResolveProject and this read,
+		// or the project hasn't been persisted yet). Anything else is worth
+		// surfacing to the operator log without blocking the bundle.
+		if !errors.Is(err, sql.ErrNoRows) {
+			s.logger.Warn("toolContext: lookupProjectMeta scan failed", "project_id", projectID, "error", err)
+		}
+		return "", ""
+	}
+	return name, path
+}
+
+// projectScopedStats returns the memory count and per-category breakdown for
+// `projectID` only. The global StoreStats helper would mix every project's
+// counts into byCategory, so we run a narrow SQL aggregation instead.
+func (s *Server) projectScopedStats(ctx context.Context, projectID string) (int, map[string]int) {
+	if projectID == "" || s.mem == nil {
+		return 0, nil
+	}
+	db := s.mem.StoreDB()
+	if db == nil {
+		return 0, nil
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT category, COUNT(*) FROM memories
+		 WHERE project_id = ? AND deleted_at IS NULL
+		 GROUP BY category`,
+		projectID,
+	)
+	if err != nil {
+		s.logger.Warn("toolContext: projectScopedStats query failed", "project_id", projectID, "error", err)
+		return 0, nil
+	}
+	defer rows.Close()
+
+	byCategory := make(map[string]int)
+	total := 0
+	for rows.Next() {
+		var cat string
+		var n int
+		if err := rows.Scan(&cat, &n); err != nil {
+			continue
+		}
+		byCategory[cat] = n
+		total += n
+	}
+	if len(byCategory) == 0 {
+		return 0, nil
+	}
+	return total, byCategory
+}
+
+func filterRecentCategories(in []memory.Memory) []memory.Memory {
+	keep := map[string]bool{
+		"decision":   true,
+		"learning":   true,
+		"plan":       true,
+		"preference": true,
+		"fact":       true,
+	}
+	var out []memory.Memory
+	for _, m := range in {
+		if keep[m.Category] {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+type ctxRecentEvent struct {
+	EventType string
+	Summary   string
+}
+
+// recentSessionEvents returns the latest priority<=2 events for the recap.
+// `tool_call` rows (priority 3) written by hook PostToolUse are excluded by
+// design: they exist for analytics, not for L0 context injection.
+func (s *Server) recentSessionEvents(ctx context.Context, projectID string, limit int) []ctxRecentEvent {
+	if s.mem == nil {
+		return nil
+	}
+	db := s.mem.StoreDB()
+	if db == nil {
+		return nil
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT event_type, summary FROM session_events
+		 WHERE priority <= 2 AND (project_id = ? OR project_id = '')
+		 ORDER BY created_at DESC LIMIT ?`,
+		projectID, limit,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []ctxRecentEvent
+	for rows.Next() {
+		var e ctxRecentEvent
+		if err := rows.Scan(&e.EventType, &e.Summary); err != nil {
+			continue
+		}
+		if strings.TrimSpace(e.Summary) == "" {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func renderContextBundle(identity, projectName, projectPath, projectID string, memCount int, byCategory map[string]int, recent []memory.Memory, events []ctxRecentEvent, budget int) string {
+	const identityCap = 600
+	identity = truncateRunes(strings.TrimSpace(identity), identityCap)
+
+	var sb strings.Builder
+	sb.WriteString("<anchored_context>\n")
+	if identity != "" {
+		sb.WriteString("  <identity>\n")
+		sb.WriteString(indent(escapeText(identity), "    "))
+		sb.WriteString("\n  </identity>\n")
+	}
+	if projectID != "" {
+		fmt.Fprintf(&sb, "  <project id=\"%s\" name=\"%s\" path=\"%s\" memories=\"%d\">\n",
+			escapeAttr(projectID), escapeAttr(projectName), escapeAttr(projectPath), memCount,
+		)
+		if parts := formatCategoryCounts(byCategory); parts != "" {
+			// scope="project" makes it explicit the breakdown is not global —
+			// the byCategory map comes from a project-scoped SQL aggregation.
+			fmt.Fprintf(&sb, "    <by_category scope=\"project\">%s</by_category>\n", escapeText(parts))
+		}
+		sb.WriteString("  </project>\n")
+	}
+	if len(recent) > 0 {
+		sb.WriteString("  <recent>\n")
+		for _, m := range recent {
+			content := strings.ReplaceAll(m.Content, "\n", " ")
+			fmt.Fprintf(&sb, "    [%s] %s — %s\n",
+				escapeText(m.Category), m.CreatedAt.Format("2006-01-02"), escapeText(content),
+			)
+		}
+		sb.WriteString("  </recent>\n")
+	}
+	if len(events) > 0 {
+		sb.WriteString("  <events>\n")
+		for _, e := range events {
+			summary := strings.ReplaceAll(e.Summary, "\n", " ")
+			fmt.Fprintf(&sb, "    [%s] %s\n", escapeText(e.EventType), escapeText(summary))
+		}
+		sb.WriteString("  </events>\n")
+	}
+	sb.WriteString("</anchored_context>")
+
+	out := sb.String()
+	if len(out) <= budget {
+		return out
+	}
+	return truncateContextBundle(out, budget)
+}
+
+func formatCategoryCounts(byCategory map[string]int) string {
+	if len(byCategory) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(byCategory))
+	for k := range byCategory {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", k, byCategory[k]))
+	}
+	return strings.Join(parts, " ")
+}
+
+func indent(text, prefix string) string {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		lines[i] = prefix + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+// escapeAttr escapes characters that would invalidate an XML attribute
+// double-quoted value: &, <, ", and the line breaks XML normalizes away.
+// Single-quote does not need escaping in double-quoted attrs.
+func escapeAttr(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		"\"", "&quot;",
+		"\r", "&#xD;",
+		"\n", "&#xA;",
+		"\t", "&#x9;",
+	)
+	return r.Replace(s)
+}
+
+// escapeText escapes character data: &, <, > are sufficient (and ]]> would
+// only matter inside a CDATA section, which we don't emit). Quotes are left
+// alone so prose stays readable.
+func escapeText(s string) string {
+	r := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+	)
+	return r.Replace(s)
+}
+
+// truncateRunes caps a string at `max` runes (not bytes), preserving valid
+// UTF-8. Used for identity and any user-controllable prose that may contain
+// multibyte characters (PT-BR/EN/CJK) where naive byte slicing would corrupt
+// the trailing rune.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:max]) + "…"
+}
+
+// truncateContextBundle enforces a hard byte budget on the rendered bundle.
+// Strategy:
+//  1. Drop trailing whole lines until what's left + suffix fits, OR
+//  2. If even one line is bigger than the budget (e.g. an identity blob
+//     that's a single 5-KB line), byte-trim the body, then re-align to the
+//     last valid UTF-8 rune so we never emit a half-character.
+//
+// The final string is guaranteed to be ≤ budget.
+func truncateContextBundle(s string, budget int) string {
+	const closing = "</anchored_context>"
+	const truncMarker = "\n  <truncated/>\n"
+	if len(s) <= budget {
+		return s
+	}
+
+	overhead := len(closing) + len(truncMarker)
+	body := strings.TrimSuffix(s, closing)
+	body = strings.TrimRight(body, "\n")
+
+	// Drop whole trailing lines while we have any to drop.
+	for len(body)+overhead > budget {
+		idx := strings.LastIndexByte(body, '\n')
+		if idx < 0 {
+			break
+		}
+		body = body[:idx]
+	}
+
+	// One-line giant case: still over budget after exhausting line breaks.
+	// Hard-cut bytes and re-align to a UTF-8 rune boundary.
+	if len(body)+overhead > budget {
+		cut := budget - overhead
+		if cut < 0 {
+			cut = 0
+		}
+		if cut > len(body) {
+			cut = len(body)
+		}
+		body = body[:cut]
+		for len(body) > 0 && !utf8.ValidString(body) {
+			body = body[:len(body)-1]
+		}
+	}
+
+	out := body + truncMarker + closing
+	if len(out) > budget {
+		// Defensive: should never happen, but if budget is tighter than the
+		// fixed overhead we fall back to the bare closing tag.
+		return closing
+	}
+	return out
 }
 
 func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, error) {
