@@ -125,17 +125,15 @@ func TestDetectPluginDrift(t *testing.T) {
 	}
 }
 
-// TestApplyPluginAutoUpdate_FastForwardsMirrorOnly proves the v0.4.9 contract:
-// the auto-update path does NOT touch the cache directory anymore — only the
-// marketplace git mirror gets a fast-forward. Removing the cache in earlier
-// versions left installed_plugins.json pointing at a deleted path and broke
-// Claude Code's plugin loading.
-func TestApplyPluginAutoUpdate_FastForwardsMirrorOnly(t *testing.T) {
+// TestApplyPluginAutoUpdate_FullSync proves the v0.4.10 contract: when both
+// mirror and cache are behind, the auto-update path (1) fast-forwards the
+// git mirror, (2) copies the new tree into the cache, and (3) updates
+// Claude Code's installed_plugins.json — all without user intervention.
+// Every path is isolated: no real ~/.claude is touched.
+func TestApplyPluginAutoUpdate_FullSync(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available in PATH; skipping fast-forward test")
 	}
-	// Bare-ish upstream + working mirror; upstream gets a new commit and we
-	// verify the mirror fast-forwards to it and the cache stays untouched.
 	upstream := t.TempDir()
 	runGit(t, upstream, "init", "-q", "-b", "main")
 	runGit(t, upstream, "config", "user.email", "test@test")
@@ -154,6 +152,9 @@ func TestApplyPluginAutoUpdate_FastForwardsMirrorOnly(t *testing.T) {
 	cacheDir := t.TempDir()
 	seedPluginCache(t, cacheDir, "0.4.0")
 
+	registryPath := filepath.Join(t.TempDir(), "installed_plugins.json")
+	writeJSON(t, registryPath, map[string]any{"version": 2, "plugins": map[string]any{}})
+
 	d := PluginDrift{
 		BinaryVersion:  "0.4.6",
 		MirrorVersion:  "0.4.0",
@@ -163,38 +164,69 @@ func TestApplyPluginAutoUpdate_FastForwardsMirrorOnly(t *testing.T) {
 		CacheBehind:    true,
 		MarketplaceDir: mirror,
 		CacheDir:       cacheDir,
+		RegistryPath:   registryPath, // isolate from $HOME/.claude
 	}
 	out := applyPluginAutoUpdate(d)
-	if !out.SyncPerformed || out.SyncError != "" {
-		t.Fatalf("sync expected to succeed, got %+v", out)
+	if !out.SyncPerformed || !out.CacheInstalled {
+		t.Fatalf("expected both sync_performed and cache_installed, got %+v", out)
+	}
+	if out.SyncError != "" || out.CacheInstallError != "" {
+		t.Fatalf("expected clean run, got %+v", out)
 	}
 
-	// Cache MUST be preserved — that was the v0.4.7/v0.4.8 regression.
-	if _, err := os.Stat(filepath.Join(cacheDir, "0.4.0")); err != nil {
-		t.Errorf("cache dir should be untouched after auto-update, stat err=%v", err)
-	}
-
-	// Mirror plugin.json must reflect the new version.
+	// Mirror plugin.json reflects new version.
 	if v, _ := pluginManifestVersion(filepath.Join(mirror, ".claude-plugin", "plugin.json")); v != "0.4.6" {
 		t.Errorf("mirror plugin.json version = %q, want 0.4.6", v)
 	}
-	if out.MirrorVersion != "0.4.6" {
-		t.Errorf("returned struct should reflect new mirror version, got %q", out.MirrorVersion)
+	// New cache dir exists with the mirror's plugin.json copied in.
+	if v, _ := pluginManifestVersion(filepath.Join(cacheDir, "0.4.6", ".claude-plugin", "plugin.json")); v != "0.4.6" {
+		t.Errorf("cache plugin.json missing or stale: got %q", v)
+	}
+	// Old cache dir is preserved (we don't sweep prior versions).
+	if _, err := os.Stat(filepath.Join(cacheDir, "0.4.0")); err != nil {
+		t.Errorf("prior cache version should be preserved, stat err=%v", err)
+	}
+	// Registry points at the new install path.
+	var doc map[string]any
+	readJSON(t, registryPath, &doc)
+	entry := doc["plugins"].(map[string]any)["anchored@anchored"].([]any)[0].(map[string]any)
+	if entry["version"] != "0.4.6" {
+		t.Errorf("registry version = %v, want 0.4.6", entry["version"])
+	}
+	if entry["installPath"] != filepath.Join(cacheDir, "0.4.6") {
+		t.Errorf("registry installPath = %v, want %s", entry["installPath"], filepath.Join(cacheDir, "0.4.6"))
 	}
 }
 
-func TestApplyPluginAutoUpdate_CacheBehindOnlyIsNoSync(t *testing.T) {
-	// Mirror is current; only the cache lags. Anchored cannot fix this on
-	// its own — the user has to run /plugin install. applyPluginAutoUpdate
-	// must do nothing and report no sync.
+// TestApplyPluginAutoUpdate_CacheBehindOnly covers the partial-drift case:
+// the mirror is current but the cache lags (e.g., user ran an earlier
+// anchored that wiped the cache without reinstalling). Auto-update must
+// still install from the mirror without trying to git pull.
+func TestApplyPluginAutoUpdate_CacheBehindOnly(t *testing.T) {
+	mirror := t.TempDir()
+	cacheDir := t.TempDir()
+	registryPath := filepath.Join(t.TempDir(), "installed_plugins.json")
+	seedMirrorManifest(t, mirror, "0.4.6")
+	writeJSON(t, registryPath, map[string]any{"version": 2, "plugins": map[string]any{}})
+
 	out := applyPluginAutoUpdate(PluginDrift{
-		HasDrift: true, CacheBehind: true, MirrorBehind: false,
+		HasDrift:       true,
+		CacheBehind:    true,
+		MirrorBehind:   false,
+		BinaryVersion:  "0.4.6",
+		MirrorVersion:  "0.4.6",
+		MarketplaceDir: mirror,
+		CacheDir:       cacheDir,
+		RegistryPath:   registryPath,
 	})
 	if out.SyncPerformed {
-		t.Error("CacheBehind-only must NOT trigger a sync (anchored has nothing to do)")
+		t.Error("CacheBehind-only must NOT run git pull (mirror is current)")
 	}
-	if out.SyncError != "" {
-		t.Errorf("CacheBehind-only must NOT produce an error, got %q", out.SyncError)
+	if !out.CacheInstalled {
+		t.Errorf("CacheBehind-only must install the plugin, got %+v", out)
+	}
+	if out.CacheInstallError != "" {
+		t.Errorf("unexpected install error: %q", out.CacheInstallError)
 	}
 }
 

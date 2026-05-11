@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.10] - 2026-05-11
+
+### Added
+
+- **Zero-click plugin auto-install on SessionStart.** When the SessionStart hook detects `CacheBehind` (cache lags binary), anchored now copies the marketplace mirror tree into `<cache>/<newVersion>/` and rewrites Claude Code's `installed_plugins.json` so the new version is loaded on the next launch. The user only has to restart Claude Code — no `/plugin install` command needed. Combined with the existing `MirrorBehind` auto-sync, the full flow (binary update → mirror fast-forward → cache install → registry rewrite) runs without intervention.
+
+### Safety
+
+- **Registry schema gate.** `installed_plugins.json` rewrites are gated on `version: 2` (the schema we tested against). If Claude Code bumps the schema, anchored aborts the install with a clear notice and falls back to telling the user to run `/plugin install anchored@anchored` manually. Other plugins' entries are never touched.
+- **Atomic file writes.** Cache install copies the mirror into a sibling `.tmp` dir then atomically renames; any pre-existing cache at the target version is backed up to `.bak` before the swap so a botched promotion can be undone. Registry rewrite goes through `tmp+rename`.
+- **`installedAt` preserved.** The user's "first installed" timestamp is inherited from any existing registry entry; only `lastUpdated` and `gitCommitSha` are refreshed.
+- **`.git` excluded from cache copy.** The marketplace mirror's git metadata stays in the mirror; the cache holds only the runtime files Claude Code needs.
+
+### Changed
+
+- **`<anchored_plugin_update>` notice gained `cache_installed="true"`.** When the full auto-install succeeded the notice now reads "Plugin auto-updated to vX (mirror + cache + registry). Restart Claude Code." Fallback paths (schema mismatch, git pull failure) still render their own copy.
+
 ## [0.4.9] - 2026-05-11
 
 ### Fixed

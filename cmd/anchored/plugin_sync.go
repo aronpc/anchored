@@ -38,28 +38,34 @@ func syncLockPath() string {
 // running binary and the user's Claude Code plugin state:
 //
 //   - MirrorBehind: the marketplace git clone has not pulled the commits
-//     that ship the current binary version. Anchored can fix this by itself
-//     with a fast-forward `git pull`.
+//     that ship the current binary version. Anchored fixes this with a
+//     fast-forward `git pull`.
 //   - CacheBehind:  the installed plugin cache directory lags behind the
-//     mirror (or is missing entirely). Anchored CANNOT safely fix this on
-//     its own — installed_plugins.json belongs to Claude Code and rewriting
-//     it without a documented API would be a footgun. Instead we tell the
-//     user to run `/plugin install anchored@anchored`, which is idempotent
-//     and the canonical entry point.
+//     mirror (or is missing entirely). Anchored fixes this by copying the
+//     mirror tree into the version-stamped cache dir AND rewriting Claude
+//     Code's installed_plugins.json so the new version is loaded next
+//     launch. The registry rewrite is gated on a schema check: if the
+//     installed_plugins.json schema isn't the one we know how to write,
+//     CacheInstalled stays false, CacheInstallError is populated, and we
+//     fall back to a manual-fix notice so other plugins' state is never
+//     corrupted.
 //
 // HasDrift = MirrorBehind || CacheBehind. Either implies the user is
 // running with older hooks/skills than the binary expects.
 type PluginDrift struct {
-	BinaryVersion  string // binary's compile-time Version (set via ldflags)
-	MirrorVersion  string // version field of mirror's plugin.json; "" when unreadable
-	CacheVersion   string // newest semver dir under CacheDir; "" when absent
-	HasDrift       bool
-	MirrorBehind   bool // mirror lags binary (anchored can fix via git pull)
-	CacheBehind    bool // cache lags mirror/binary (user must run /plugin install)
-	MarketplaceDir string
-	CacheDir       string
-	SyncPerformed  bool   // git pull was actually run and succeeded
-	SyncError      string // non-empty when AutoUpdate tried and failed
+	BinaryVersion     string // binary's compile-time Version (set via ldflags)
+	MirrorVersion     string // version field of mirror's plugin.json; "" when unreadable
+	CacheVersion      string // newest semver dir under CacheDir; "" when absent
+	HasDrift          bool
+	MirrorBehind      bool   // mirror lags binary (anchored can fix via git pull)
+	CacheBehind       bool   // cache lags mirror/binary
+	MarketplaceDir    string
+	CacheDir          string
+	RegistryPath      string // resolved path to installed_plugins.json (for tests)
+	SyncPerformed     bool   // git pull was actually run and succeeded
+	SyncError         string // non-empty when git pull tried and failed
+	CacheInstalled    bool   // mirror tree was copied to <cache>/<version> AND registry updated
+	CacheInstallError string // non-empty when cache install tried and failed (schema mismatch, IO, etc.)
 }
 
 // detectPluginDrift compares the binary version with (a) the marketplace
@@ -208,30 +214,32 @@ func semverTriple(v string) [3]int {
 	return out
 }
 
-// applyPluginAutoUpdate runs when config.Plugin.AutoUpdate is true and the
-// marketplace mirror is behind the binary. It performs a fast-forward git
-// pull and nothing else — the cache directory and Claude Code's
-// installed_plugins.json registry are intentionally left alone, because
-// they're Claude Code's state and rewriting them without a documented API
-// caused the v0.4.7/v0.4.8 "ghost install at non-existent path" regression.
+// applyPluginAutoUpdate is the workhorse of the v0.4.10 auto-update flow.
+// It performs, in order:
 //
-// After a successful sync the user still has to run
-// `/plugin install anchored@anchored` (idempotent) to pick up the new files,
-// which is exactly what the rendered notice instructs.
+//  1. Acquire an advisory flock so two Claude Code windows don't race.
+//  2. If MirrorBehind: `git pull --ff-only` the marketplace mirror.
+//  3. If CacheBehind: copy the (now-fresh) mirror tree into
+//     <cacheDir>/<mirrorVersion>/ and rewrite Claude Code's
+//     installed_plugins.json to point at it.
+//
+// Step 3 is gated on a schema check (installed_plugins.json must be the
+// version anchored knows how to write). Any failure there populates
+// CacheInstallError and falls back to a manual-fix notice — anchored never
+// corrupts other plugins' registry entries.
 //
 // Safety:
 //   - `git pull --ff-only` runs under a 10s context timeout with
 //     GIT_TERMINAL_PROMPT=0, GIT_ASKPASS=/bin/true, SSH_ASKPASS=/bin/true,
 //     GIT_OPTIONAL_LOCKS=0 — unreachable remote, missing credential, or
 //     askpass GUI cannot hang the SessionStart hook.
-//   - Advisory flock at ~/.anchored/plugin_sync.lock prevents two SessionStart
-//     firings (two Claude Code windows) from racing on the mirror.
-//   - Failures become SyncError on the returned struct; the hook never aborts.
+//   - File writes go through tmp+rename so a crash mid-install cannot leave
+//     either the cache or the registry half-written.
+//   - Existing cache dir at the destination is renamed to `<final>.bak`
+//     before promotion; if promote fails we restore the backup.
+//   - Failures become SyncError or CacheInstallError; the hook never aborts.
 func applyPluginAutoUpdate(d PluginDrift) PluginDrift {
-	if !d.MirrorBehind {
-		// Nothing for anchored to do. CacheBehind without MirrorBehind is
-		// purely a user-side action (/plugin install); we still want the
-		// notice to render so the caller keeps the struct as-is.
+	if !d.MirrorBehind && !d.CacheBehind {
 		return d
 	}
 
@@ -242,15 +250,33 @@ func applyPluginAutoUpdate(d PluginDrift) PluginDrift {
 	}
 	defer unlock()
 
-	if err := gitFastForward(d.MarketplaceDir); err != nil {
-		d.SyncError = "git pull failed: " + err.Error()
-		return d
+	if d.MirrorBehind {
+		if err := gitFastForward(d.MarketplaceDir); err != nil {
+			d.SyncError = "git pull failed: " + err.Error()
+			return d
+		}
+		d.SyncPerformed = true
+		if v := readMirrorPluginVersion(d.MarketplaceDir); v != "" {
+			d.MirrorVersion = v
+		}
 	}
-	d.SyncPerformed = true
-	// Re-read the mirror version so the notice reflects what the user will
-	// actually get when they run /plugin install.
-	if v := readMirrorPluginVersion(d.MarketplaceDir); v != "" {
-		d.MirrorVersion = v
+
+	if d.CacheBehind {
+		registry := d.RegistryPath
+		if registry == "" {
+			registry = pluginRegistryPath()
+		}
+		targetVersion := d.MirrorVersion
+		if targetVersion == "" {
+			d.CacheInstallError = "mirror version unknown; cannot install"
+			return d
+		}
+		if err := installPluginFromMirror(d.MarketplaceDir, d.CacheDir, registry, targetVersion); err != nil {
+			d.CacheInstallError = err.Error()
+			return d
+		}
+		d.CacheInstalled = true
+		d.CacheVersion = targetVersion
 	}
 	return d
 }
@@ -316,20 +342,33 @@ func renderPluginUpdateNotice(d PluginDrift) string {
 	if d.SyncPerformed {
 		sb.WriteString(" mirror_synced=\"true\"")
 	}
+	if d.CacheInstalled {
+		sb.WriteString(" cache_installed=\"true\"")
+	}
 	sb.WriteString(">\n")
 
 	switch {
+	case d.CacheInstalled:
+		// Best case: anchored did everything. User only needs to restart.
+		fmt.Fprintf(&sb, "  Plugin auto-updated to v%s (mirror + cache + registry). ", escapeText(d.MirrorVersion))
+		sb.WriteString("Restart Claude Code to load the new hooks.\n")
+	case d.CacheInstallError != "":
+		// Cache install attempted and refused (schema mismatch, IO error, etc.).
+		// Mirror may already be synced; user finishes with /plugin install.
+		fmt.Fprintf(&sb, "  Auto-install refused: %s\n", escapeText(truncateUTF8(d.CacheInstallError, 200)))
+		sb.WriteString("  Fallback: run `/plugin install anchored@anchored` then restart Claude Code.\n")
 	case d.SyncError != "":
-		// Auto-sync was attempted and failed; fall back to manual.
-		errMsg := truncateUTF8(d.SyncError, 200)
-		fmt.Fprintf(&sb, "  Auto-sync failed: %s\n", escapeText(errMsg))
+		// Git pull failed; user drives the whole flow manually.
+		fmt.Fprintf(&sb, "  Auto-sync failed: %s\n", escapeText(truncateUTF8(d.SyncError, 200)))
 		sb.WriteString("  Manual fix: /plugin marketplace update anchored && /plugin install anchored@anchored — then restart Claude Code.\n")
 	case d.SyncPerformed:
 		// Mirror was just fast-forwarded; cache still needs Claude Code action.
+		// (Only reachable when CacheBehind is false somehow, which shouldn't
+		// happen since a fresh mirror at a new version implies the cache lags.)
 		fmt.Fprintf(&sb, "  Marketplace mirror auto-synced to v%s.\n", escapeText(d.MirrorVersion))
 		sb.WriteString("  Next: run `/plugin install anchored@anchored` then restart Claude Code to load the new hooks.\n")
 	case d.MirrorBehind:
-		// AutoUpdate is off and the mirror is stale; user has to drive both steps.
+		// AutoUpdate is off (or path skipped install entirely).
 		sb.WriteString("  Plugin is out of date. Run: /plugin marketplace update anchored && /plugin install anchored@anchored — then restart Claude Code.\n")
 	default:
 		// Only CacheBehind: mirror is current, cache lags. /plugin install is enough.
