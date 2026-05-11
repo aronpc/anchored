@@ -82,78 +82,119 @@ func TestNewestInstalledVersion_IgnoresVersionDirsWithoutManifest(t *testing.T) 
 }
 
 func TestDetectPluginDrift(t *testing.T) {
-	dir := t.TempDir()
-	seedPluginCache(t, dir, "0.4.0")
+	cacheDir := t.TempDir()
+	mirrorDir := t.TempDir()
+	seedPluginCache(t, cacheDir, "0.4.0")
+	seedMirrorManifest(t, mirrorDir, "0.4.0")
 
 	cfg := &config.Config{}
-	cfg.Plugin.CacheDir = dir
-	cfg.Plugin.MarketplaceDir = "/nonexistent"
+	cfg.Plugin.CacheDir = cacheDir
+	cfg.Plugin.MarketplaceDir = mirrorDir
 
-	// drift: installed 0.4.0, binary 0.4.6
+	// Mirror AND cache behind binary 0.4.6: both flags set.
 	d := detectPluginDrift(cfg, "0.4.6")
-	if !d.HasDrift || d.InstalledVersion != "0.4.0" || d.BinaryVersion != "0.4.6" {
-		t.Fatalf("expected drift 0.4.0 -> 0.4.6, got %+v", d)
+	if !d.HasDrift || !d.MirrorBehind || !d.CacheBehind {
+		t.Fatalf("expected both behind, got %+v", d)
+	}
+	if d.CacheVersion != "0.4.0" || d.MirrorVersion != "0.4.0" || d.BinaryVersion != "0.4.6" {
+		t.Errorf("version fields wrong: %+v", d)
 	}
 
-	// no drift: matching versions
+	// All matching versions: no drift.
 	d2 := detectPluginDrift(cfg, "0.4.0")
 	if d2.HasDrift {
 		t.Fatalf("expected no drift, got %+v", d2)
 	}
 
-	// dev binary: never drifts (placeholder version is meaningless)
+	// Dev binary: never drifts (placeholder version is meaningless).
 	d3 := detectPluginDrift(cfg, "dev")
 	if d3.HasDrift {
 		t.Fatalf("dev binary must never be considered drifting, got %+v", d3)
 	}
+
+	// Cache absent but mirror current: CacheBehind only — anchored cannot
+	// fix this, user must run /plugin install. MirrorBehind must NOT be set.
+	freshMirror := t.TempDir()
+	seedMirrorManifest(t, freshMirror, "0.4.6")
+	cfg2 := &config.Config{}
+	cfg2.Plugin.CacheDir = t.TempDir() // empty
+	cfg2.Plugin.MarketplaceDir = freshMirror
+	d4 := detectPluginDrift(cfg2, "0.4.6")
+	if !d4.CacheBehind || d4.MirrorBehind {
+		t.Fatalf("expected CacheBehind only, got %+v", d4)
+	}
 }
 
-func TestApplyPluginAutoUpdate_RemovesStaleCacheAfterFastForward(t *testing.T) {
+// TestApplyPluginAutoUpdate_FastForwardsMirrorOnly proves the v0.4.9 contract:
+// the auto-update path does NOT touch the cache directory anymore — only the
+// marketplace git mirror gets a fast-forward. Removing the cache in earlier
+// versions left installed_plugins.json pointing at a deleted path and broke
+// Claude Code's plugin loading.
+func TestApplyPluginAutoUpdate_FastForwardsMirrorOnly(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available in PATH; skipping fast-forward test")
 	}
-	// Build a tiny upstream + clone to simulate the marketplace mirror.
+	// Bare-ish upstream + working mirror; upstream gets a new commit and we
+	// verify the mirror fast-forwards to it and the cache stays untouched.
 	upstream := t.TempDir()
 	runGit(t, upstream, "init", "-q", "-b", "main")
 	runGit(t, upstream, "config", "user.email", "test@test")
 	runGit(t, upstream, "config", "user.name", "test")
-	if err := os.WriteFile(filepath.Join(upstream, "README"), []byte("v1"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	seedMirrorManifest(t, upstream, "0.4.0")
 	runGit(t, upstream, "add", ".")
-	runGit(t, upstream, "commit", "-q", "-m", "v1")
+	runGit(t, upstream, "commit", "-q", "-m", "v0.4.0")
 
 	mirror := t.TempDir()
 	runGit(t, "", "clone", "-q", upstream, mirror)
 
-	// Upstream gains a new commit; mirror is one commit behind.
-	if err := os.WriteFile(filepath.Join(upstream, "README"), []byte("v2"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	runGit(t, upstream, "commit", "-aq", "-m", "v2")
+	// Upstream bumps to 0.4.6.
+	seedMirrorManifest(t, upstream, "0.4.6")
+	runGit(t, upstream, "commit", "-aq", "-m", "v0.4.6")
 
 	cacheDir := t.TempDir()
 	seedPluginCache(t, cacheDir, "0.4.0")
 
 	d := PluginDrift{
-		BinaryVersion:    "0.4.6",
-		InstalledVersion: "0.4.0",
-		HasDrift:         true,
-		MarketplaceDir:   mirror,
-		CacheDir:         cacheDir,
+		BinaryVersion:  "0.4.6",
+		MirrorVersion:  "0.4.0",
+		CacheVersion:   "0.4.0",
+		HasDrift:       true,
+		MirrorBehind:   true,
+		CacheBehind:    true,
+		MarketplaceDir: mirror,
+		CacheDir:       cacheDir,
 	}
 	out := applyPluginAutoUpdate(d)
 	if !out.SyncPerformed || out.SyncError != "" {
 		t.Fatalf("sync expected to succeed, got %+v", out)
 	}
-	// Cache version dir is gone.
-	if _, err := os.Stat(filepath.Join(cacheDir, "0.4.0")); !os.IsNotExist(err) {
-		t.Errorf("0.4.0 cache should be removed, stat err=%v", err)
+
+	// Cache MUST be preserved — that was the v0.4.7/v0.4.8 regression.
+	if _, err := os.Stat(filepath.Join(cacheDir, "0.4.0")); err != nil {
+		t.Errorf("cache dir should be untouched after auto-update, stat err=%v", err)
 	}
-	// Mirror was fast-forwarded.
-	readme, _ := os.ReadFile(filepath.Join(mirror, "README"))
-	if string(readme) != "v2" {
-		t.Errorf("mirror README = %q, want v2", string(readme))
+
+	// Mirror plugin.json must reflect the new version.
+	if v, _ := pluginManifestVersion(filepath.Join(mirror, ".claude-plugin", "plugin.json")); v != "0.4.6" {
+		t.Errorf("mirror plugin.json version = %q, want 0.4.6", v)
+	}
+	if out.MirrorVersion != "0.4.6" {
+		t.Errorf("returned struct should reflect new mirror version, got %q", out.MirrorVersion)
+	}
+}
+
+func TestApplyPluginAutoUpdate_CacheBehindOnlyIsNoSync(t *testing.T) {
+	// Mirror is current; only the cache lags. Anchored cannot fix this on
+	// its own — the user has to run /plugin install. applyPluginAutoUpdate
+	// must do nothing and report no sync.
+	out := applyPluginAutoUpdate(PluginDrift{
+		HasDrift: true, CacheBehind: true, MirrorBehind: false,
+	})
+	if out.SyncPerformed {
+		t.Error("CacheBehind-only must NOT trigger a sync (anchored has nothing to do)")
+	}
+	if out.SyncError != "" {
+		t.Errorf("CacheBehind-only must NOT produce an error, got %q", out.SyncError)
 	}
 }
 
@@ -165,31 +206,57 @@ func TestApplyPluginAutoUpdate_NoDriftIsNoOp(t *testing.T) {
 }
 
 func TestRenderPluginUpdateNotice(t *testing.T) {
-	// Drift, manual fix path
-	got := renderPluginUpdateNotice(PluginDrift{HasDrift: true, InstalledVersion: "0.4.0", BinaryVersion: "0.4.6"})
+	// MirrorBehind + AutoUpdate off: user has to drive both steps.
+	manual := renderPluginUpdateNotice(PluginDrift{
+		HasDrift: true, MirrorBehind: true, CacheBehind: true,
+		BinaryVersion: "0.4.6", MirrorVersion: "0.4.0", CacheVersion: "0.4.0",
+	})
 	for _, want := range []string{
-		`<anchored_plugin_update installed="0.4.0" binary="0.4.6">`,
+		`<anchored_plugin_update binary="0.4.6" mirror="0.4.0" cache="0.4.0">`,
 		"/plugin marketplace update anchored",
+		"/plugin install anchored@anchored",
 		"</anchored_plugin_update>",
 	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("manual-fix notice missing %q\n--- output ---\n%s", want, got)
+		if !strings.Contains(manual, want) {
+			t.Errorf("manual notice missing %q\n--- output ---\n%s", want, manual)
 		}
 	}
 
-	// Auto-synced path
-	synced := renderPluginUpdateNotice(PluginDrift{HasDrift: true, InstalledVersion: "0.4.0", BinaryVersion: "0.4.6", SyncPerformed: true})
-	if !strings.Contains(synced, `auto_synced="true"`) || !strings.Contains(synced, "auto-synced") {
-		t.Errorf("expected auto_synced markup, got %q", synced)
+	// MirrorBehind + auto-synced: anchored did the pull, user runs /plugin install.
+	synced := renderPluginUpdateNotice(PluginDrift{
+		HasDrift: true, MirrorBehind: true, CacheBehind: true, SyncPerformed: true,
+		BinaryVersion: "0.4.6", MirrorVersion: "0.4.6", CacheVersion: "0.4.0",
+	})
+	if !strings.Contains(synced, `mirror_synced="true"`) || !strings.Contains(synced, "auto-synced to v0.4.6") {
+		t.Errorf("expected mirror_synced markup, got %q", synced)
+	}
+	if !strings.Contains(synced, "/plugin install anchored@anchored") {
+		t.Errorf("synced notice must still prompt /plugin install, got %q", synced)
 	}
 
-	// Sync-failed path embeds the error
-	failed := renderPluginUpdateNotice(PluginDrift{HasDrift: true, InstalledVersion: "0.4.0", BinaryVersion: "0.4.6", SyncError: "git pull failed: divergent history"})
+	// Sync-failed: embed the truncated error, fall back to manual instructions.
+	failed := renderPluginUpdateNotice(PluginDrift{
+		HasDrift: true, MirrorBehind: true,
+		BinaryVersion: "0.4.6", MirrorVersion: "0.4.0",
+		SyncError: "git pull failed: divergent history",
+	})
 	if !strings.Contains(failed, "git pull failed: divergent history") {
 		t.Errorf("expected sync error in notice, got %q", failed)
 	}
 
-	// No drift = empty string
+	// CacheBehind only: short notice telling user to run /plugin install.
+	cacheOnly := renderPluginUpdateNotice(PluginDrift{
+		HasDrift: true, CacheBehind: true, MirrorBehind: false,
+		BinaryVersion: "0.4.6", MirrorVersion: "0.4.6",
+	})
+	if !strings.Contains(cacheOnly, `cache="absent"`) && !strings.Contains(cacheOnly, `cache=`) {
+		t.Errorf("cache-only notice should expose cache attribute, got %q", cacheOnly)
+	}
+	if !strings.Contains(cacheOnly, "/plugin install anchored@anchored") {
+		t.Errorf("cache-only notice missing /plugin install, got %q", cacheOnly)
+	}
+
+	// No drift = empty string.
 	if got := renderPluginUpdateNotice(PluginDrift{HasDrift: false}); got != "" {
 		t.Errorf("no-drift notice should be empty, got %q", got)
 	}
@@ -230,7 +297,9 @@ func TestSemverTriple_HandlesOverflow(t *testing.T) {
 func TestRenderPluginUpdateNotice_TruncatesLongSyncError(t *testing.T) {
 	long := strings.Repeat("x", 5000)
 	out := renderPluginUpdateNotice(PluginDrift{
-		HasDrift: true, InstalledVersion: "0.4.0", BinaryVersion: "0.4.6", SyncError: long,
+		HasDrift: true, MirrorBehind: true,
+		BinaryVersion: "0.4.6", MirrorVersion: "0.4.0", CacheVersion: "0.4.0",
+		SyncError: long,
 	})
 	// Notice itself stays under ~600 chars even with a 5KB error.
 	if len(out) > 800 {
@@ -295,6 +364,20 @@ func TestPluginManifestVersion(t *testing.T) {
 	}
 	if v != "0.4.6" {
 		t.Errorf("got %q, want 0.4.6", v)
+	}
+}
+
+// seedMirrorManifest writes a minimal `.claude-plugin/plugin.json` under
+// `mirrorDir` with the given version. Used to fake the marketplace mirror
+// without cloning a real git repo.
+func seedMirrorManifest(t *testing.T, mirrorDir, version string) {
+	t.Helper()
+	pj := filepath.Join(mirrorDir, ".claude-plugin", "plugin.json")
+	if err := os.MkdirAll(filepath.Dir(pj), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pj, []byte(`{"name":"anchored","version":"`+version+`"}`), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

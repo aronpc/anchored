@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.9] - 2026-05-11
+
+### Fixed
+
+- **Plugin sync no longer corrupts Claude Code's plugin registry.** v0.4.7/v0.4.8 removed the cache directory as part of auto-sync, but `installed_plugins.json` is Claude Code's state and it keeps pointing at the deleted path — leaving the plugin in a "ghost install" state where Claude Code thinks v0.4.0 is installed at a non-existent directory and refuses to reinstall. `applyPluginAutoUpdate` now only fast-forwards the marketplace git mirror and never touches the cache. The user is told to run `/plugin install anchored@anchored` (idempotent) to pick up the new files.
+- **Drift detection looks at the mirror too.** Previously the hook only compared `cache version` vs `binary version`; when the cache was absent or recently cleared, drift was reported as false and the mirror never caught up to new releases. `PluginDrift` now tracks both signals independently: `MirrorBehind` (mirror lags binary — anchored fixes via git pull) and `CacheBehind` (cache lags mirror/binary — user must run `/plugin install`). The notice text adapts to which signal(s) are set.
+
+### Changed
+
+- **Notice attributes renamed for clarity.** The `<anchored_plugin_update>` element now carries `binary="..." mirror="..." cache="..." [mirror_synced="true"]` instead of the older `installed=... binary=... [auto_synced=...]`. `cache="absent"` is rendered explicitly when no cache version is detected. The four notice paths (auto-synced, sync-failed, manual-fix, cache-only) each get tailored copy.
+
 ## [0.4.8] - 2026-05-11
 
 ### Fixed

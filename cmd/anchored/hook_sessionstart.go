@@ -75,9 +75,12 @@ func runHookSessionStart(args []string) {
 			}
 			dlog.Event("hook.sessionstart", map[string]any{
 				"stage":           "plugin_drift",
-				"installed":       drift.InstalledVersion,
 				"binary":          drift.BinaryVersion,
-				"auto_synced":     drift.SyncPerformed,
+				"mirror":          drift.MirrorVersion,
+				"cache":           drift.CacheVersion,
+				"mirror_behind":   drift.MirrorBehind,
+				"cache_behind":    drift.CacheBehind,
+				"mirror_synced":   drift.SyncPerformed,
 				"sync_error":      drift.SyncError,
 				"marketplace_dir": drift.MarketplaceDir,
 				"cache_dir":       drift.CacheDir,

@@ -34,42 +34,78 @@ func syncLockPath() string {
 	return filepath.Join(home, ".anchored", "plugin_sync.lock")
 }
 
-// PluginDrift is the result of comparing the binary version against what is
-// installed in the Claude Code plugin cache. It is consumed by the
-// SessionStart hook to (a) notify the user via additionalContext, and (b)
-// optionally fast-forward the marketplace mirror + clear the stale cache
-// when config.Plugin.AutoUpdate is true.
+// PluginDrift describes two independent staleness signals between the
+// running binary and the user's Claude Code plugin state:
+//
+//   - MirrorBehind: the marketplace git clone has not pulled the commits
+//     that ship the current binary version. Anchored can fix this by itself
+//     with a fast-forward `git pull`.
+//   - CacheBehind:  the installed plugin cache directory lags behind the
+//     mirror (or is missing entirely). Anchored CANNOT safely fix this on
+//     its own — installed_plugins.json belongs to Claude Code and rewriting
+//     it without a documented API would be a footgun. Instead we tell the
+//     user to run `/plugin install anchored@anchored`, which is idempotent
+//     and the canonical entry point.
+//
+// HasDrift = MirrorBehind || CacheBehind. Either implies the user is
+// running with older hooks/skills than the binary expects.
 type PluginDrift struct {
-	BinaryVersion    string // current binary version (Version var)
-	InstalledVersion string // version under cache dir; "" when missing
-	HasDrift         bool   // true when InstalledVersion < BinaryVersion
-	MarketplaceDir   string // resolved git mirror path
-	CacheDir         string // resolved cache parent path
-	SyncPerformed    bool   // true when AutoUpdate ran a git pull + cache rm
-	SyncError        string // non-empty when AutoUpdate tried and failed
+	BinaryVersion  string // binary's compile-time Version (set via ldflags)
+	MirrorVersion  string // version field of mirror's plugin.json; "" when unreadable
+	CacheVersion   string // newest semver dir under CacheDir; "" when absent
+	HasDrift       bool
+	MirrorBehind   bool // mirror lags binary (anchored can fix via git pull)
+	CacheBehind    bool // cache lags mirror/binary (user must run /plugin install)
+	MarketplaceDir string
+	CacheDir       string
+	SyncPerformed  bool   // git pull was actually run and succeeded
+	SyncError      string // non-empty when AutoUpdate tried and failed
 }
 
-// detectPluginDrift inspects the Claude Code plugin cache and compares the
-// installed plugin version with the binary's compile-time Version. It never
-// errors — failure modes (missing dir, unparseable plugin.json, etc.) are
-// captured as "no drift detected" so the hook stays best-effort.
+// detectPluginDrift compares the binary version with (a) the marketplace
+// mirror's plugin.json and (b) the cache directory contents. Either being
+// behind the binary counts as drift. The hook is best-effort: any IO or
+// parse failure is silently treated as "no signal" rather than propagated.
 func detectPluginDrift(cfg *config.Config, binaryVersion string) PluginDrift {
 	d := PluginDrift{
 		BinaryVersion:  binaryVersion,
 		MarketplaceDir: cfg.Plugin.MarketplaceDir,
 		CacheDir:       cfg.Plugin.CacheDir,
 	}
-	installed := newestInstalledVersion(cfg.Plugin.CacheDir)
-	d.InstalledVersion = installed
-	if installed == "" || binaryVersion == "" || binaryVersion == "dev" {
-		// "dev" placeholder means the binary was built without ldflags
-		// (typical local `go build`). Drift comparison is meaningless then.
+	if binaryVersion == "" || binaryVersion == "dev" {
+		// "dev" placeholder = local `go build` without ldflags. Drift
+		// comparison is meaningless then.
 		return d
 	}
-	if compareSemver(installed, binaryVersion) < 0 {
-		d.HasDrift = true
+
+	d.MirrorVersion = readMirrorPluginVersion(cfg.Plugin.MarketplaceDir)
+	d.CacheVersion = newestInstalledVersion(cfg.Plugin.CacheDir)
+
+	if d.MirrorVersion != "" && compareSemver(d.MirrorVersion, binaryVersion) < 0 {
+		d.MirrorBehind = true
 	}
+	// Cache behind = cache absent OR cache older than binary. We compare to
+	// the binary (not the mirror) because the mirror may itself be stale and
+	// about to be fast-forwarded; the binary is the authoritative target.
+	if d.CacheVersion == "" || compareSemver(d.CacheVersion, binaryVersion) < 0 {
+		d.CacheBehind = true
+	}
+	d.HasDrift = d.MirrorBehind || d.CacheBehind
 	return d
+}
+
+// readMirrorPluginVersion extracts the version from the marketplace mirror's
+// `.claude-plugin/plugin.json`. Returns "" if the mirror dir or file is
+// missing, or if the version field is empty.
+func readMirrorPluginVersion(mirrorDir string) string {
+	if mirrorDir == "" {
+		return ""
+	}
+	v, err := pluginManifestVersion(filepath.Join(mirrorDir, ".claude-plugin", "plugin.json"))
+	if err != nil {
+		return ""
+	}
+	return v
 }
 
 // newestInstalledVersion walks CacheDir for sub-directories whose name parses
@@ -172,30 +208,30 @@ func semverTriple(v string) [3]int {
 	return out
 }
 
-// applyPluginAutoUpdate runs when config.Plugin.AutoUpdate is true and drift
-// was detected. It fast-forwards the marketplace git clone and removes the
-// stale cache directory; Claude Code re-installs from the updated mirror on
-// its next launch. Returns the drift struct with SyncPerformed/SyncError
-// filled in.
+// applyPluginAutoUpdate runs when config.Plugin.AutoUpdate is true and the
+// marketplace mirror is behind the binary. It performs a fast-forward git
+// pull and nothing else — the cache directory and Claude Code's
+// installed_plugins.json registry are intentionally left alone, because
+// they're Claude Code's state and rewriting them without a documented API
+// caused the v0.4.7/v0.4.8 "ghost install at non-existent path" regression.
+//
+// After a successful sync the user still has to run
+// `/plugin install anchored@anchored` (idempotent) to pick up the new files,
+// which is exactly what the rendered notice instructs.
 //
 // Safety:
-//   - Uses `git pull --ff-only` with a 10s timeout and a sanitized env
-//     (GIT_TERMINAL_PROMPT=0, askpass=/bin/true) so a divergent mirror,
-//     auth prompt, or unreachable remote can't hang the SessionStart hook.
-//   - Holds an advisory flock at ~/.anchored/plugin_sync.lock; concurrent
-//     SessionStart firings (two Claude Code windows opening at once) skip
-//     silently rather than racing on the cache dir.
-//   - Only removes the directory that matches the currently installed
-//     version — never wipes the cache root.
-//   - Every step swallows errors into SyncError; the hook never aborts.
-//
-// Caveat: if Claude Code already loaded hooks from the cache dir we are
-// about to delete, in-flight invocations between this rm and the user's
-// restart could fail with ENOENT in the shell wrapper. The window is
-// seconds — the user is instructed to restart immediately. Treat as
-// acceptable.
+//   - `git pull --ff-only` runs under a 10s context timeout with
+//     GIT_TERMINAL_PROMPT=0, GIT_ASKPASS=/bin/true, SSH_ASKPASS=/bin/true,
+//     GIT_OPTIONAL_LOCKS=0 — unreachable remote, missing credential, or
+//     askpass GUI cannot hang the SessionStart hook.
+//   - Advisory flock at ~/.anchored/plugin_sync.lock prevents two SessionStart
+//     firings (two Claude Code windows) from racing on the mirror.
+//   - Failures become SyncError on the returned struct; the hook never aborts.
 func applyPluginAutoUpdate(d PluginDrift) PluginDrift {
-	if !d.HasDrift || d.InstalledVersion == "" {
+	if !d.MirrorBehind {
+		// Nothing for anchored to do. CacheBehind without MirrorBehind is
+		// purely a user-side action (/plugin install); we still want the
+		// notice to render so the caller keeps the struct as-is.
 		return d
 	}
 
@@ -210,13 +246,12 @@ func applyPluginAutoUpdate(d PluginDrift) PluginDrift {
 		d.SyncError = "git pull failed: " + err.Error()
 		return d
 	}
-
-	oldCache := filepath.Join(d.CacheDir, d.InstalledVersion)
-	if err := os.RemoveAll(oldCache); err != nil {
-		d.SyncError = "remove cache failed: " + err.Error()
-		return d
-	}
 	d.SyncPerformed = true
+	// Re-read the mirror version so the notice reflects what the user will
+	// actually get when they run /plugin install.
+	if v := readMirrorPluginVersion(d.MarketplaceDir); v != "" {
+		d.MirrorVersion = v
+	}
 	return d
 }
 
@@ -262,37 +297,56 @@ func gitFastForward(dir string) error {
 // renderPluginUpdateNotice builds an XML snippet for the SessionStart
 // additionalContext when drift is detected. Shape mirrors the rest of the
 // anchored bundle (XML-tagged sections) so the agent can route on a stable
-// element name.
+// element name. The notice tells the user what anchored already did (git
+// pull, when MirrorBehind+AutoUpdate) and what the user still needs to do
+// (/plugin install + restart).
 func renderPluginUpdateNotice(d PluginDrift) string {
 	if !d.HasDrift {
 		return ""
 	}
+
+	cacheAttr := d.CacheVersion
+	if cacheAttr == "" {
+		cacheAttr = "absent"
+	}
+
 	var sb strings.Builder
 	sb.WriteString("<anchored_plugin_update")
-	fmt.Fprintf(&sb, " installed=%q binary=%q", d.InstalledVersion, d.BinaryVersion)
+	fmt.Fprintf(&sb, " binary=%q mirror=%q cache=%q", d.BinaryVersion, d.MirrorVersion, cacheAttr)
 	if d.SyncPerformed {
-		sb.WriteString(" auto_synced=\"true\"")
+		sb.WriteString(" mirror_synced=\"true\"")
 	}
 	sb.WriteString(">\n")
-	if d.SyncPerformed {
-		sb.WriteString("  Plugin cache was auto-synced. Restart Claude Code to load the new hooks.\n")
-	} else if d.SyncError != "" {
-		sb.WriteString("  Plugin is out of date and auto-update failed: ")
-		// Cap SyncError so a verbose git stderr can't blow the bundle.
-		// 200 runes is enough for the meaningful first line of any
-		// realistic error path here.
-		errMsg := d.SyncError
-		if utf8.RuneCountInString(errMsg) > 200 {
-			r := []rune(errMsg)
-			errMsg = string(r[:200]) + "…"
-		}
-		sb.WriteString(escapeText(errMsg))
-		sb.WriteString("\n  Manual fix: /plugin marketplace update anchored && /plugin uninstall anchored@anchored && /plugin install anchored@anchored\n")
-	} else {
-		sb.WriteString("  Plugin is out of date. Run: /plugin marketplace update anchored && /plugin uninstall anchored@anchored && /plugin install anchored@anchored — then restart.\n")
+
+	switch {
+	case d.SyncError != "":
+		// Auto-sync was attempted and failed; fall back to manual.
+		errMsg := truncateUTF8(d.SyncError, 200)
+		fmt.Fprintf(&sb, "  Auto-sync failed: %s\n", escapeText(errMsg))
+		sb.WriteString("  Manual fix: /plugin marketplace update anchored && /plugin install anchored@anchored — then restart Claude Code.\n")
+	case d.SyncPerformed:
+		// Mirror was just fast-forwarded; cache still needs Claude Code action.
+		fmt.Fprintf(&sb, "  Marketplace mirror auto-synced to v%s.\n", escapeText(d.MirrorVersion))
+		sb.WriteString("  Next: run `/plugin install anchored@anchored` then restart Claude Code to load the new hooks.\n")
+	case d.MirrorBehind:
+		// AutoUpdate is off and the mirror is stale; user has to drive both steps.
+		sb.WriteString("  Plugin is out of date. Run: /plugin marketplace update anchored && /plugin install anchored@anchored — then restart Claude Code.\n")
+	default:
+		// Only CacheBehind: mirror is current, cache lags. /plugin install is enough.
+		sb.WriteString("  Plugin cache is stale. Run `/plugin install anchored@anchored` then restart Claude Code.\n")
 	}
 	sb.WriteString("</anchored_plugin_update>")
 	return sb.String()
+}
+
+// truncateUTF8 caps a string at maxRunes runes, appending an ellipsis when
+// truncated. Used on user-visible error messages to keep notices bounded.
+func truncateUTF8(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	r := []rune(s)
+	return string(r[:maxRunes]) + "…"
 }
 
 // pluginManifestVersion reads the version field from a plugin.json. Used by
