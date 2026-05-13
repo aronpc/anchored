@@ -346,7 +346,7 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 		return 0, fmt.Errorf("embedder not available")
 	}
 	if batchSize <= 0 {
-		batchSize = 100
+		batchSize = 200
 	}
 
 	var total int
@@ -363,14 +363,23 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 			break
 		}
 
+		texts := make([]string, len(mems))
+		for i, m := range mems {
+			texts[i] = m.Content
+		}
+
+		vecs, embedErr := s.embedder.Embed(ctx, texts)
+
 		batchOK := 0
-		for _, m := range mems {
-			vecs, err := s.embedder.Embed(ctx, []string{m.Content})
-			if err != nil || len(vecs) == 0 {
-				s.logger.Warn("backfill embedding failed", "id", m.ID, "error", err)
+		for i, m := range mems {
+			if embedErr != nil {
+				s.logger.Warn("backfill embedding failed", "id", m.ID, "error", embedErr)
+				break
+			}
+			if i >= len(vecs) || len(vecs[i]) == 0 {
 				continue
 			}
-			vec := vecs[0]
+			vec := vecs[i]
 			if err := s.cache.Put(ctx, m.Content, s.embedder.Model(), vec, true); err != nil {
 				s.logger.Warn("backfill cache failed", "id", m.ID, "error", err)
 			}
@@ -380,6 +389,16 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 			}
 			batchOK++
 			total++
+		}
+
+		if embedErr != nil {
+			lastTotal = total
+			stuckCount++
+			if stuckCount >= maxStuck {
+				s.logger.Warn("backfill stuck: batch embedding keeps failing, stopping", "attempts", stuckCount)
+				break
+			}
+			continue
 		}
 
 		s.logger.Info("backfill embeddings", "batch", len(mems), "succeeded", batchOK, "total", total)

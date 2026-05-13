@@ -24,6 +24,8 @@ const (
 	legacyModelName    = "all-MiniLM-L6-v2"
 	onnxModelDims      = 384
 	onnxMaxSeqLen      = 128
+	maxEmbedBatchSize = 16
+
 	onnxRuntimeVersion = "1.25.1"
 
 	onnxRuntimeURLTemplate = "https://github.com/microsoft/onnxruntime/releases/download/v%s/onnxruntime-%s-%s-%s.tgz"
@@ -94,7 +96,7 @@ func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error
 		logger.Info("using wordpiece tokenizer (vocab.txt)")
 	}
 
-	shape := ort.NewShape(1, int64(onnxMaxSeqLen))
+	shape := ort.NewShape(maxEmbedBatchSize, int64(onnxMaxSeqLen))
 	inputIDs, err := ort.NewEmptyTensor[int64](shape)
 	if err != nil {
 		return nil, fmt.Errorf("onnx: create input_ids tensor: %w", err)
@@ -108,7 +110,7 @@ func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error
 		return nil, fmt.Errorf("onnx: create token_type_ids tensor: %w", err)
 	}
 
-	outputShape := ort.NewShape(1, int64(onnxMaxSeqLen), int64(onnxModelDims))
+	outputShape := ort.NewShape(maxEmbedBatchSize, int64(onnxMaxSeqLen), int64(onnxModelDims))
 	output, err := ort.NewEmptyTensor[float32](outputShape)
 	if err != nil {
 		return nil, fmt.Errorf("onnx: create output tensor: %w", err)
@@ -149,38 +151,59 @@ func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error
 }
 
 func (e *ONNXEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
-	results := make([][]float32, len(texts))
-	for i, text := range texts {
-		vec, err := e.embedSingle(text)
-		if err != nil {
-			return nil, fmt.Errorf("onnx embed text %d: %w", i, err)
+	results := make([][]float32, 0, len(texts))
+	for i := 0; i < len(texts); i += maxEmbedBatchSize {
+		end := i + maxEmbedBatchSize
+		if end > len(texts) {
+			end = len(texts)
 		}
-		results[i] = vec
+		vecs, err := e.embedBatch(texts[i:end])
+		if err != nil {
+			return nil, fmt.Errorf("onnx embed batch %d-%d: %w", i, end, err)
+		}
+		results = append(results, vecs...)
 	}
 	return results, nil
 }
 
-func (e *ONNXEmbedder) embedSingle(text string) ([]float32, error) {
+func (e *ONNXEmbedder) embedBatch(texts []string) ([][]float32, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	ids, mask, typeIDs := e.tokenizer.Tokenize(text)
+	idsData := e.inputIDs.GetData()
+	maskData := e.attentionMask.GetData()
+	typeData := e.tokenTypeIDs.GetData()
 
-	copy(e.inputIDs.GetData(), ids)
-	copy(e.attentionMask.GetData(), mask)
-	copy(e.tokenTypeIDs.GetData(), typeIDs)
+	clear(idsData)
+	clear(maskData)
+	clear(typeData)
+
+	masks := make([][]int64, len(texts))
+	for i, text := range texts {
+		ids, mask, typeIDs := e.tokenizer.Tokenize(text)
+		masks[i] = mask
+		base := i * onnxMaxSeqLen
+		copy(idsData[base:base+onnxMaxSeqLen], ids)
+		copy(maskData[base:base+onnxMaxSeqLen], mask)
+		copy(typeData[base:base+onnxMaxSeqLen], typeIDs)
+	}
 
 	if err := e.session.Run(); err != nil {
 		return nil, fmt.Errorf("session run: %w", err)
 	}
 
 	raw := e.output.GetData()
-	vec := meanPool(raw, mask, onnxMaxSeqLen, e.dims)
-	l2Normalize(vec)
-
-	result := make([]float32, len(vec))
-	copy(result, vec)
-	return result, nil
+	results := make([][]float32, len(texts))
+	for i := range texts {
+		start := i * onnxMaxSeqLen * e.dims
+		end := start + onnxMaxSeqLen*e.dims
+		vec := meanPool(raw[start:end], masks[i], onnxMaxSeqLen, e.dims)
+		l2Normalize(vec)
+		result := make([]float32, len(vec))
+		copy(result, vec)
+		results[i] = result
+	}
+	return results, nil
 }
 
 func (e *ONNXEmbedder) Dimensions() int { return e.dims }

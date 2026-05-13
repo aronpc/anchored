@@ -94,7 +94,11 @@ func runImport(args []string) {
 			if err != nil {
 				logger.Warn("backfill failed", "error", err)
 			}
-			fmt.Printf("Embeddings backfilled: %d / %d\n", embedded, pending)
+			if embedded < pending {
+					fmt.Printf("Embeddings backfilled: %d / %d (%d remaining)\n", embedded, pending, pending-embedded)
+				} else {
+					fmt.Printf("Embeddings backfilled: %d / %d (complete)\n", embedded, pending)
+				}
 		} else if totalImported > 0 {
 			fmt.Println("\nAll embeddings already up to date.")
 		}
