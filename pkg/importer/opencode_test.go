@@ -10,7 +10,7 @@ import (
 	"sync"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 func createOpenCodeTestDB(t *testing.T, basePath string) string {
@@ -21,7 +21,7 @@ func createOpenCodeTestDB(t *testing.T, basePath string) string {
 	}
 	dbPath := filepath.Join(dbDir, "opencode.db")
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestOpenCodeImporter_ImportSkipsEmpty(t *testing.T) {
 	_ = os.MkdirAll(dbDir, 0o755)
 	dbPath := filepath.Join(dbDir, "opencode.db")
 
-	db, _ := sql.Open("sqlite3", dbPath)
+	db, _ := sql.Open("sqlite", dbPath)
 	db.Exec(`CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT)`)
 	db.Exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, slug TEXT, directory TEXT, title TEXT, version TEXT, time_created INTEGER, time_updated INTEGER)`)
 	db.Exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT)`)
@@ -370,7 +370,7 @@ func TestOpenCodeImporter_ImportConfigFromWorktree(t *testing.T) {
 	os.MkdirAll(dbDir, 0o755)
 	dbPath := filepath.Join(dbDir, "opencode.db")
 
-	db, _ := sql.Open("sqlite3", dbPath)
+	db, _ := sql.Open("sqlite", dbPath)
 	db.Exec(`CREATE TABLE project (id TEXT PRIMARY KEY, name TEXT, worktree TEXT, vcs TEXT, time_created INTEGER, time_updated INTEGER)`)
 	db.Exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, slug TEXT, directory TEXT, title TEXT, version TEXT, time_created INTEGER, time_updated INTEGER)`)
 	db.Exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT)`)

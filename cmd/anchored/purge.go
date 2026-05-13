@@ -48,7 +48,7 @@ func runSoftPurge(dbPath string, yes bool) {
 		return
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open db: %v\n", err)
 		os.Exit(1)
@@ -80,7 +80,7 @@ func runHardPurge(dbPath string, yes bool) {
 
 	// Flush the WAL into the main DB so the copy is self-contained even if
 	// another process holds the DB open.
-	if db, err := sql.Open("sqlite3", dbPath); err == nil {
+	if db, err := sql.Open("sqlite", dbPath); err == nil {
 		_, _ = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 		db.Close()
 	}

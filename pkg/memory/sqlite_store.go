@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 
 	util "github.com/jholhewres/anchored/pkg/util"
 )
@@ -35,7 +35,7 @@ type SQLiteStore struct {
 func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
 	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=30000&_txlock=immediate", dbPath)
 
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db %s: %w", dbPath, err)
 	}

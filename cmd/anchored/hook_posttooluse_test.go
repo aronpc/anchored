@@ -10,7 +10,7 @@ import (
 
 	ctxpkg "github.com/jholhewres/anchored/pkg/context"
 	"github.com/jholhewres/anchored/pkg/debuglog"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // TestPostToolUseInsertSQL_AgainstSchema executes the exact INSERT statement
@@ -18,7 +18,7 @@ import (
 // MigrationSQL009. Catches column-count / column-order regressions
 // (the bug 0.4.5 fixed).
 func TestPostToolUseInsertSQL_AgainstSchema(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestBuildPostToolUseMetadata_TruncatesAt1KB(t *testing.T) {
 // payload through the full record pipeline against an in-memory sqlite DB
 // and verifies the resulting row plus the JSON response line.
 func TestRecordPostToolUseEvent_EndToEnd(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,7 +225,7 @@ func TestRecordPostToolUseEvent_EndToEnd(t *testing.T) {
 // TestRecordPostToolUseEvent_MissingSessionID asserts the graceful "no row"
 // path when neither stdin nor flag carry a session_id.
 func TestRecordPostToolUseEvent_MissingSessionID(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}

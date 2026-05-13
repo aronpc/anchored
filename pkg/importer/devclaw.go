@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 type DevClawImporter struct {
@@ -20,7 +20,7 @@ func (i *DevClawImporter) Name() string { return "devclaw" }
 func (i *DevClawImporter) Path() string { return i.dbPath }
 
 func (i *DevClawImporter) Detect() bool {
-	db, err := sql.Open("sqlite3", i.dbPath)
+	db, err := sql.Open("sqlite", i.dbPath)
 	if err != nil {
 		return false
 	}
@@ -33,7 +33,7 @@ func (i *DevClawImporter) Detect() bool {
 func (i *DevClawImporter) Import(ctx context.Context, store ImportStore) ImportResult {
 	result := ImportResult{Source: i.Name()}
 
-	db, err := sql.Open("sqlite3", i.dbPath)
+	db, err := sql.Open("sqlite", i.dbPath)
 	if err != nil {
 		result.Errors++
 		return result

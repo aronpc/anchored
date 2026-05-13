@@ -11,7 +11,7 @@ import (
 
 	"github.com/jholhewres/anchored/pkg/memory"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 type OpenCodeImporter struct {
@@ -40,7 +40,7 @@ func (i *OpenCodeImporter) Detect() bool {
 	if err != nil {
 		return false
 	}
-	db, err := sql.Open("sqlite3", i.dbPath()+"?_mode=ro")
+	db, err := sql.Open("sqlite", i.dbPath()+"?_mode=ro")
 	if err != nil {
 		return false
 	}
@@ -53,7 +53,7 @@ func (i *OpenCodeImporter) Detect() bool {
 func (i *OpenCodeImporter) Import(ctx context.Context, store ImportStore) ImportResult {
 	result := ImportResult{Source: i.Name()}
 
-	db, err := sql.Open("sqlite3", i.dbPath()+"?_mode=ro")
+	db, err := sql.Open("sqlite", i.dbPath()+"?_mode=ro")
 	if err != nil {
 		result.Errors++
 		return result

@@ -117,7 +117,7 @@ func checkDatabase(dbPath string, expectedDims int) {
 		return
 	}
 
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		printCheck(false, "database open", err.Error(), "")
 		return

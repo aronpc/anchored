@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 func TestMemoryTriggerRE(t *testing.T) {
@@ -87,7 +87,7 @@ func TestRenderPreSearchPreview_FormatsAndEscapes(t *testing.T) {
 // memories schema and verifies the BM25 query returns project-scoped hits
 // in MATCH-ranked order.
 func TestBM25TopHits_EndToEnd(t *testing.T) {
-	db, err := sql.Open("sqlite3", ":memory:")
+	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}

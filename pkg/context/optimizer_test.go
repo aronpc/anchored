@@ -10,7 +10,7 @@ import (
 	"testing"
 
 	"github.com/jholhewres/anchored/pkg/config"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 func testOptimizerConfig() config.ContextOptimizerConfig {
@@ -26,7 +26,7 @@ func testOptimizerConfig() config.ContextOptimizerConfig {
 
 func newTestOptimizer(t *testing.T) *Optimizer {
 	t.Helper()
-	db, err := sql.Open("sqlite3", "file::memory:?cache=shared&_busy_timeout=5000")
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared&_busy_timeout=5000")
 	if err != nil {
 		t.Fatal(err)
 	}

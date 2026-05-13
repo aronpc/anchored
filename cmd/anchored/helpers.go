@@ -14,7 +14,7 @@ import (
 	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/project"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // HookContext is the lightweight runtime hooks need: just the DB and a
@@ -40,7 +40,7 @@ func openHookContext(configPath string) (*HookContext, error) {
 	}
 
 	dsn := cfg.Memory.DatabasePath + "?_journal_mode=WAL&_busy_timeout=5000"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

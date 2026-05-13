@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
@@ -27,6 +26,7 @@ const (
 	onnxModelDims      = 384
 	onnxMaxSeqLen      = 128
 	maxEmbedBatchSize = 16
+	maxEmbedTextLen   = 2000
 
 	onnxRuntimeVersion = "1.25.1"
 
@@ -35,19 +35,24 @@ const (
 	onnxLegacyModelBaseURL = "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main"
 )
 
+type embedRequest struct {
+	texts []string
+	resp  chan embedResponse
+}
+
+type embedResponse struct {
+	vecs [][]float32
+	err  error
+}
+
 type ONNXEmbedder struct {
-	session      *ort.AdvancedSession
-	tokenizer    Tokenizer
-	dims         int
-	logger       *slog.Logger
-	modelName    string
+	session   *ort.DynamicAdvancedSession
+	tokenizer Tokenizer
+	dims      int
+	logger    *slog.Logger
+	modelName string
 
-	inputIDs      *ort.Tensor[int64]
-	attentionMask *ort.Tensor[int64]
-	tokenTypeIDs  *ort.Tensor[int64]
-	output        *ort.Tensor[float32]
-
-	mu sync.Mutex
+	reqCh chan embedRequest
 }
 
 type ONNXPaths struct {
@@ -96,37 +101,8 @@ func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error
 		logger.Info("using wordpiece tokenizer (vocab.txt)")
 	}
 
-	shape := ort.NewShape(maxEmbedBatchSize, int64(onnxMaxSeqLen))
-	inputIDs, err := ort.NewEmptyTensor[int64](shape)
-	if err != nil {
-		return nil, fmt.Errorf("onnx: create input_ids tensor: %w", err)
-	}
-	attentionMask, err := ort.NewEmptyTensor[int64](shape)
-	if err != nil {
-		return nil, fmt.Errorf("onnx: create attention_mask tensor: %w", err)
-	}
-	tokenTypeIDs, err := ort.NewEmptyTensor[int64](shape)
-	if err != nil {
-		return nil, fmt.Errorf("onnx: create token_type_ids tensor: %w", err)
-	}
-
-	outputShape := ort.NewShape(maxEmbedBatchSize, int64(onnxMaxSeqLen), int64(onnxModelDims))
-	output, err := ort.NewEmptyTensor[float32](outputShape)
-	if err != nil {
-		return nil, fmt.Errorf("onnx: create output tensor: %w", err)
-	}
-
-	session, err := ort.NewAdvancedSession(
-		paths.ModelFile,
-		[]string{"input_ids", "attention_mask", "token_type_ids"},
-		[]string{"last_hidden_state"},
-		[]ort.Value{inputIDs, attentionMask, tokenTypeIDs},
-		[]ort.Value{output},
-		nil,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("onnx: create session: %w", err)
-	}
+	inputNames := []string{"input_ids", "attention_mask", "token_type_ids"}
+	outputNames := []string{"last_hidden_state"}
 
 	var activeModel string
 	if strings.Contains(paths.ModelFile, legacyModelName) {
@@ -135,51 +111,116 @@ func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error
 		activeModel = onnxModelName
 	}
 
+	sessionOpts, err := ort.NewSessionOptions()
+	if err != nil {
+		return nil, fmt.Errorf("onnx: create session options: %w", err)
+	}
+	if err := sessionOpts.SetIntraOpNumThreads(1); err != nil {
+		sessionOpts.Destroy()
+		return nil, fmt.Errorf("onnx: set intra threads: %w", err)
+	}
+	if err := sessionOpts.SetInterOpNumThreads(1); err != nil {
+		sessionOpts.Destroy()
+		return nil, fmt.Errorf("onnx: set inter threads: %w", err)
+	}
+
+	session, err := ort.NewDynamicAdvancedSession(
+		paths.ModelFile, inputNames, outputNames, sessionOpts,
+	)
+	sessionOpts.Destroy()
+	if err != nil {
+		return nil, fmt.Errorf("onnx: create session: %w", err)
+	}
+
 	logger.Info("ONNX embedder initialized", "model", activeModel, "dims", onnxModelDims)
 
-	return &ONNXEmbedder{
-		session:       session,
-		tokenizer:     tokenizer,
-		dims:          onnxModelDims,
-		logger:        logger,
-		modelName:     activeModel,
-		inputIDs:      inputIDs,
-		attentionMask: attentionMask,
-		tokenTypeIDs:  tokenTypeIDs,
-		output:        output,
-	}, nil
+	e := &ONNXEmbedder{
+		session:   session,
+		tokenizer: tokenizer,
+		dims:      onnxModelDims,
+		logger:    logger,
+		modelName: activeModel,
+		reqCh:     make(chan embedRequest),
+	}
+
+	go e.worker()
+
+	return e, nil
 }
 
-func (e *ONNXEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
+func (e *ONNXEmbedder) worker() {
+	for req := range e.reqCh {
+		vecs, err := e.embedBatch(req.texts)
+		req.resp <- embedResponse{vecs: vecs, err: err}
+	}
+}
+
+func (e *ONNXEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	results := make([][]float32, 0, len(texts))
 	for i := 0; i < len(texts); i += maxEmbedBatchSize {
 		end := i + maxEmbedBatchSize
 		if end > len(texts) {
 			end = len(texts)
 		}
-		vecs, err := e.embedBatch(texts[i:end])
-		if err != nil {
-			return nil, fmt.Errorf("onnx embed batch %d-%d: %w", i, end, err)
+
+		respCh := make(chan embedResponse, 1)
+		select {
+		case e.reqCh <- embedRequest{texts: texts[i:end], resp: respCh}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		results = append(results, vecs...)
+
+		select {
+		case r := <-respCh:
+			if r.err != nil {
+				return nil, fmt.Errorf("onnx embed batch %d-%d: %w", i, end, r.err)
+			}
+			results = append(results, r.vecs...)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 	return results, nil
 }
 
 func (e *ONNXEmbedder) embedBatch(texts []string) ([][]float32, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	batchSize := int64(len(texts))
+	shape := ort.NewShape(batchSize, int64(onnxMaxSeqLen))
+	outputShape := ort.NewShape(batchSize, int64(onnxMaxSeqLen), int64(onnxModelDims))
 
-	idsData := e.inputIDs.GetData()
-	maskData := e.attentionMask.GetData()
-	typeData := e.tokenTypeIDs.GetData()
+	inputIDs, err := ort.NewEmptyTensor[int64](shape)
+	if err != nil {
+		return nil, fmt.Errorf("create input_ids: %w", err)
+	}
+	defer inputIDs.Destroy()
 
-	clear(idsData)
-	clear(maskData)
-	clear(typeData)
+	attentionMask, err := ort.NewEmptyTensor[int64](shape)
+	if err != nil {
+		return nil, fmt.Errorf("create attention_mask: %w", err)
+	}
+	defer attentionMask.Destroy()
+
+	tokenTypeIDs, err := ort.NewEmptyTensor[int64](shape)
+	if err != nil {
+		return nil, fmt.Errorf("create token_type_ids: %w", err)
+	}
+	defer tokenTypeIDs.Destroy()
+
+	output, err := ort.NewEmptyTensor[float32](outputShape)
+	if err != nil {
+		return nil, fmt.Errorf("create output: %w", err)
+	}
+	defer output.Destroy()
+
+	idsData := inputIDs.GetData()
+	maskData := attentionMask.GetData()
+	typeData := tokenTypeIDs.GetData()
 
 	masks := make([][]int64, len(texts))
 	for i, text := range texts {
+		if len(text) > maxEmbedTextLen {
+			text = text[:maxEmbedTextLen]
+		}
 		ids, mask, typeIDs := e.tokenizer.Tokenize(text)
 		masks[i] = mask
 		base := i * onnxMaxSeqLen
@@ -188,11 +229,14 @@ func (e *ONNXEmbedder) embedBatch(texts []string) ([][]float32, error) {
 		copy(typeData[base:base+onnxMaxSeqLen], typeIDs)
 	}
 
-	if err := e.session.Run(); err != nil {
+	if err := e.session.Run(
+		[]ort.Value{inputIDs, attentionMask, tokenTypeIDs},
+		[]ort.Value{output},
+	); err != nil {
 		return nil, fmt.Errorf("session run: %w", err)
 	}
 
-	raw := e.output.GetData()
+	raw := output.GetData()
 	results := make([][]float32, len(texts))
 	for i := range texts {
 		start := i * onnxMaxSeqLen * e.dims
@@ -211,21 +255,7 @@ func (e *ONNXEmbedder) Name() string   { return "onnx" }
 func (e *ONNXEmbedder) Model() string  { return e.modelName }
 
 func (e *ONNXEmbedder) Close() error {
-	if e.session != nil {
-		e.session.Destroy()
-	}
-	if e.inputIDs != nil {
-		e.inputIDs.Destroy()
-	}
-	if e.attentionMask != nil {
-		e.attentionMask.Destroy()
-	}
-	if e.tokenTypeIDs != nil {
-		e.tokenTypeIDs.Destroy()
-	}
-	if e.output != nil {
-		e.output.Destroy()
-	}
+	close(e.reqCh)
 	return nil
 }
 
