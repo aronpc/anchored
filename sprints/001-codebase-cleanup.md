@@ -62,8 +62,8 @@ Reduzir débito técnico identificado no codebase report. Organizado em 3 times 
 **Estimativa**: 3-5 dias
 
 - [x] **C1**: `pkg/util/*_test.go` — testes para NewID (4), ContentHash (5), CosineSimilarity (7), DefaultLogger (2)
-- [ ] **C2**: `pkg/memory/service_test.go` — Save, SaveWithOptions, embedAsync, BackfillEmbeddings (com mock Store/Embedder)
-- [ ] **C3**: `pkg/memory/sqlite_store_test.go` — CRUD operations, scanMemory, ListWithoutEmbedding, UpdateEmbedding
+- [x] **C2**: `pkg/memory/service_test.go` — Save, SaveWithOptions, embedAsync, BackfillEmbeddings (com mock Store/Embedder) — 30 tests
+- [x] **C3**: `pkg/memory/sqlite_store_test.go` — CRUD operations, scanMemory, ListWithoutEmbedding, UpdateEmbedding — 21 tests
 - [x] **C4**: `pkg/kg/kg_test.go` — AddTriple, QueryEntity, alias resolution, bitemporal logic (9 tests)
 - [x] **C5**: `pkg/mcp/server_test.go` — tool routing, parameter parsing, response formatting (32 tests)
 - [x] **C6**: `pkg/importer/importer_test.go` — RunAll orchestration, error handling, dedup (13 tests)
@@ -90,7 +90,7 @@ Time B (bugfixes)       (independente, roda em paralelo com A)
 - [x] Zero duplicação de UUID/hash/similarity/logger-guard
 - [x] Dead code removido (zero funções sem callers)
 - [x] Bug do ExecuteFile timeout corrigido (Time B)
-- [ ] Coverage mínima de 60% nos packages críticos (memory, mcp, kg)
+- [ ] Coverage mínima de 60% nos packages críticos (memory, mcp, kg) — 127+ tests totais
 
 ## Notas
 
