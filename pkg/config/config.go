@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type Config struct {
@@ -183,25 +185,13 @@ func Load(path string) (*Config, error) {
 }
 
 func expandPaths(cfg *Config) *Config {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return cfg
-	}
-
-	cfg.Memory.StorageDir = expandHome(cfg.Memory.StorageDir, home)
-	cfg.Memory.DatabasePath = expandHome(cfg.Memory.DatabasePath, home)
-	cfg.Embedding.ModelDir = expandHome(cfg.Embedding.ModelDir, home)
-	cfg.Plugin.MarketplaceDir = expandHome(cfg.Plugin.MarketplaceDir, home)
-	cfg.Plugin.CacheDir = expandHome(cfg.Plugin.CacheDir, home)
+	cfg.Memory.StorageDir = util.ExpandHome(cfg.Memory.StorageDir)
+	cfg.Memory.DatabasePath = util.ExpandHome(cfg.Memory.DatabasePath)
+	cfg.Embedding.ModelDir = util.ExpandHome(cfg.Embedding.ModelDir)
+	cfg.Plugin.MarketplaceDir = util.ExpandHome(cfg.Plugin.MarketplaceDir)
+	cfg.Plugin.CacheDir = util.ExpandHome(cfg.Plugin.CacheDir)
 
 	return cfg
-}
-
-func expandHome(path, home string) string {
-	if len(path) >= 2 && path[:2] == "~/" {
-		return filepath.Join(home, path[2:])
-	}
-	return path
 }
 
 func EnsureDirs(cfg *Config) error {

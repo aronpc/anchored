@@ -218,15 +218,6 @@ func (d *EntityDetector) loadSnapshot(ctx context.Context) error {
 	return nil
 }
 
-func (d *EntityDetector) snapshotAge() time.Duration {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.loadedAt.IsZero() {
-		return d.cfg.CacheTTL + 1
-	}
-	return time.Since(d.loadedAt)
-}
-
 func normalizeEntity(s string) string {
 	s = strings.ToLower(s)
 	var buf strings.Builder

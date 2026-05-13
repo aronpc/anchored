@@ -110,7 +110,7 @@ func blobToFloat32s(data []byte) ([]float32, error) {
 	return vec, nil
 }
 
-func float32sToBlob(vec []float32) []byte {
+func Float32sToBlob(vec []float32) []byte {
 	buf := make([]byte, len(vec)*4)
 	for i, v := range vec {
 		bits := math.Float32bits(v)

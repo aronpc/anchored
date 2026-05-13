@@ -464,15 +464,6 @@ func ResourceDefinitions() []Resource {
 	}
 }
 
-func FindTool(name string) *Tool {
-	for _, t := range ToolDefinitions() {
-		if t.Name == name {
-			return &t
-		}
-	}
-	return nil
-}
-
 func SortTools(tools []Tool) {
 	sort.Slice(tools, func(i, j int) bool {
 		return tools[i].Name < tools[j].Name

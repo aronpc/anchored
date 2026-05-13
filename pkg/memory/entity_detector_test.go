@@ -174,25 +174,6 @@ func TestEntityDetector_Detect_SkipsStopWords(t *testing.T) {
 	}
 }
 
-func TestEntityDetector_CacheTTL(t *testing.T) {
-	db := setupEntityTestDB(t)
-
-	d := NewEntityDetector(db, EntityDetectorConfig{CacheTTL: 50 * time.Millisecond}, nil)
-	if err := d.Refresh(context.Background()); err != nil {
-		t.Fatalf("refresh: %v", err)
-	}
-
-	if d.snapshotAge() > 50*time.Millisecond {
-		t.Error("snapshot should be fresh")
-	}
-
-	time.Sleep(60 * time.Millisecond)
-
-	if d.snapshotAge() < 50*time.Millisecond {
-		t.Error("snapshot should be stale after TTL")
-	}
-}
-
 func TestEntityDetector_MaxTokens(t *testing.T) {
 	db := setupEntityTestDB(t)
 

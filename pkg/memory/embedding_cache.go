@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
-	"math"
 
 	util "github.com/jholhewres/anchored/pkg/util"
 )
@@ -54,7 +53,7 @@ func (c *EmbeddingCache) Put(ctx context.Context, text, model string, vec []floa
 		}
 		data = bin
 	} else {
-		data = float32SliceToBytes(vec)
+		data = Float32sToBlob(vec)
 	}
 
 	_, err := c.db.ExecContext(ctx,
@@ -62,18 +61,6 @@ func (c *EmbeddingCache) Put(ctx context.Context, text, model string, vec []floa
 		key, model, data,
 	)
 	return err
-}
-
-func float32SliceToBytes(vec []float32) []byte {
-	buf := make([]byte, len(vec)*4)
-	for i, v := range vec {
-		bits := math.Float32bits(v)
-		buf[i*4] = byte(bits)
-		buf[i*4+1] = byte(bits >> 8)
-		buf[i*4+2] = byte(bits >> 16)
-		buf[i*4+3] = byte(bits >> 24)
-	}
-	return buf
 }
 
 func (c *EmbeddingCache) MigrateFromLegacy(currentModel string) int64 {

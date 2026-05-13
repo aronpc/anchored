@@ -96,7 +96,7 @@ func (s *SQLiteStore) Save(ctx context.Context, m Memory) error {
 
 	var embeddingBlob any
 	if m.Embedding != nil {
-		embeddingBlob = float32sToBlob(m.Embedding)
+		embeddingBlob = Float32sToBlob(m.Embedding)
 	}
 
 	_, err := s.db.ExecContext(ctx,
@@ -278,7 +278,7 @@ func (s *SQLiteStore) List(ctx context.Context, opts ListOptions) ([]Memory, err
 
 	var memories []Memory
 	for rows.Next() {
-		m, err := scanMemoryRow(rows)
+		m, err := scanMemory(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -382,7 +382,7 @@ func (s *SQLiteStore) GetLastImport(source string) (*ImportRecord, error) {
 func (s *SQLiteStore) UpdateEmbedding(ctx context.Context, id string, embedding []float32) error {
 	_, err := s.db.ExecContext(ctx,
 		"UPDATE memories SET embedding = ? WHERE id = ?",
-		float32sToBlob(embedding), id,
+		Float32sToBlob(embedding), id,
 	)
 	if err != nil {
 		return fmt.Errorf("update embedding for %s: %w", id, err)
@@ -391,7 +391,11 @@ func (s *SQLiteStore) UpdateEmbedding(ctx context.Context, id string, embedding 
 	return nil
 }
 
-func scanMemory(row *sql.Row) (*Memory, error) {
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanMemory(row rowScanner) (*Memory, error) {
 	var m Memory
 	var keywordsStr, metadataStr sql.NullString
 	var projectID, sourceID sql.NullString
@@ -415,39 +419,6 @@ func scanMemory(row *sql.Row) (*Memory, error) {
 	if metadataStr.Valid {
 		if err := json.Unmarshal([]byte(metadataStr.String), &m.Metadata); err != nil {
 			slog.Warn("failed to unmarshal metadata", "error", err)
-		}
-	}
-	if len(embeddingBlob) > 0 {
-		m.Embedding, _ = blobToFloat32s(embeddingBlob)
-	}
-
-	return &m, nil
-}
-
-func scanMemoryRow(rows *sql.Rows) (*Memory, error) {
-	var m Memory
-	var keywordsStr, metadataStr sql.NullString
-	var projectID, sourceID sql.NullString
-	var lastAccessed sql.NullTime
-	var embeddingBlob []byte
-	var contentHash sql.NullString
-
-	err := rows.Scan(
-		&m.ID, &projectID, &m.Category, &m.Content, &contentHash, &keywordsStr, &embeddingBlob, &m.Source, &sourceID,
-		&m.CreatedAt, &m.UpdatedAt, &m.AccessCount, &lastAccessed, &metadataStr,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("scan memory row: %w", err)
-	}
-
-	m.ProjectID = nilIfNull(projectID)
-	m.SourceID = nilIfNull(sourceID)
-	m.ContentHash = contentHash.String
-	m.Keywords = unmarshalKeywords(keywordsStr)
-	m.LastAccessed = nilTimeIfZero(lastAccessed)
-	if metadataStr.Valid {
-		if err := json.Unmarshal([]byte(metadataStr.String), &m.Metadata); err != nil {
-			slog.Warn("failed to unmarshal metadata in row scan", "error", err)
 		}
 	}
 	if len(embeddingBlob) > 0 {
@@ -499,7 +470,7 @@ func (s *SQLiteStore) ListWithoutEmbedding(ctx context.Context, limit int) ([]Me
 
 	var memories []Memory
 	for rows.Next() {
-		m, err := scanMemoryRow(rows)
+		m, err := scanMemory(rows)
 		if err != nil {
 			return nil, err
 		}

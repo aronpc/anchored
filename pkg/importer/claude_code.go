@@ -300,8 +300,6 @@ func (i *ClaudeCodeImporter) importJSONL(ctx context.Context, store ImportStore,
 			count += i.processAssistantEntry(ctx, store, &entry, cwd, isSubagent)
 		case "summary":
 			count += i.processSummaryEntry(ctx, store, &entry, cwd)
-		case "attachment":
-			count += i.processAttachmentEntry(ctx, store, json.RawMessage(line), cwd)
 		}
 
 		if count > 0 && count%50 == 0 {
@@ -342,9 +340,6 @@ func (i *ClaudeCodeImporter) processSummaryEntry(ctx context.Context, store Impo
 	return saveImport(ctx, store, text, "summary", "claude-code", cwd, i.log)
 }
 
-func (i *ClaudeCodeImporter) processAttachmentEntry(ctx context.Context, store ImportStore, raw json.RawMessage, cwd string) int {
-	return 0
-}
 
 func isUsefulClaudeMemory(text string, assistant bool) bool {
 	text = strings.TrimSpace(text)
@@ -448,34 +443,6 @@ func extractTexts(raw json.RawMessage) []string {
 	}
 
 	return nil
-}
-
-type toolCall struct {
-	Name  string
-	Input json.RawMessage
-}
-
-func extractToolCalls(raw json.RawMessage) []toolCall {
-	if len(raw) == 0 {
-		return nil
-	}
-
-	var blocks []contentBlock
-	if err := json.Unmarshal(raw, &blocks); err != nil {
-		return nil
-	}
-
-	var calls []toolCall
-	for _, b := range blocks {
-		if b.Type == "tool_use" && b.Name != "" {
-			input := b.Input
-			if len(input) == 0 {
-				input = json.RawMessage("{}")
-			}
-			calls = append(calls, toolCall{Name: b.Name, Input: input})
-		}
-	}
-	return calls
 }
 
 func saveImport(ctx context.Context, store ImportStore, content, category, source, cwd string, log func(string, ...any)) int {

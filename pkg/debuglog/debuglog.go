@@ -27,6 +27,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/jholhewres/anchored/pkg/config"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 // Logger is a single-file NDJSON appender. The zero value is a valid no-op
@@ -108,18 +110,7 @@ func resolve(cfg *config.Config) (bool, string) {
 		}
 	}
 
-	return enabled, expandHome(path)
-}
-
-func expandHome(p string) string {
-	if !strings.HasPrefix(p, "~/") {
-		return p
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return p
-	}
-	return filepath.Join(home, p[2:])
+	return enabled, util.ExpandHome(path)
 }
 
 // Path returns the resolved log path, or "" when disabled.

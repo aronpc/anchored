@@ -83,31 +83,6 @@ func TestExtractTexts_StringInput(t *testing.T) {
 	}
 }
 
-func TestExtractToolCalls(t *testing.T) {
-	raw := json.RawMessage(`[
-		{"type":"text","text":"some text"},
-		{"type":"tool_use","name":"Read","input":{"file_path":"/tmp/test.go"}},
-		{"type":"tool_use","name":"Bash","input":{"command":"ls"}}
-	]`)
-	calls := extractToolCalls(raw)
-	if len(calls) != 2 {
-		t.Fatalf("expected 2 tool calls, got %d", len(calls))
-	}
-	if calls[0].Name != "Read" {
-		t.Errorf("expected Read, got %s", calls[0].Name)
-	}
-	if calls[1].Name != "Bash" {
-		t.Errorf("expected Bash, got %s", calls[1].Name)
-	}
-}
-
-func TestExtractToolCalls_Empty(t *testing.T) {
-	calls := extractToolCalls(json.RawMessage(`"just a string"`))
-	if len(calls) != 0 {
-		t.Errorf("expected 0 tool calls from string content, got %d", len(calls))
-	}
-}
-
 func TestContentHash_Deduplication(t *testing.T) {
 	h1 := util.ContentHash("same content")
 	h2 := util.ContentHash("same content")

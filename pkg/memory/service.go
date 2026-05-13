@@ -277,16 +277,6 @@ func (s *Service) ResolveProject(cwd string) string {
 	return proj.ID
 }
 
-func (s *Service) SaveMemory(ctx context.Context, content, category, source string, cwd string) error {
-	_, err := s.SaveWithOptions(ctx, SaveOptions{
-		Content:  content,
-		Category: category,
-		Source:   source,
-		CWD:      cwd,
-	})
-	return err
-}
-
 func (s *Service) SaveRaw(ctx context.Context, content, category, source string, cwd string) error {
 	_, err := s.SaveWithOptions(ctx, SaveOptions{
 		Content:  content,
