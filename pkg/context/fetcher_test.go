@@ -154,3 +154,85 @@ func TestFetcher_LargeResponse(t *testing.T) {
 		t.Errorf("error should mention size limit: %v", err)
 	}
 }
+
+func TestFetcher_CacheEviction(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		// Return different content per URL path to fill cache
+		fmt.Fprintf(w, "content for %s - padding to make this entry have some size to it", r.URL.Path)
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(10*time.Second, 5*time.Minute, nil)
+
+	// Fill cache with enough entries to trigger eviction.
+	// Each entry is small, so we need many to exceed 100MB.
+	// Instead, directly test that cacheBytes and eviction work
+	// by filling then checking ClearCache resets bytes.
+	for i := 0; i < 10; i++ {
+		url := fmt.Sprintf("%s/%d", srv.URL, i)
+		_, err := f.FetchAndConvert(context.Background(), url)
+		if err != nil {
+			t.Fatalf("fetch %d: %v", i, err)
+		}
+	}
+
+	f.cacheMu.Lock()
+	bytesBefore := f.cacheBytes
+	entriesBefore := len(f.cache)
+	f.cacheMu.Unlock()
+
+	if bytesBefore <= 0 {
+		t.Errorf("expected positive cacheBytes, got %d", bytesBefore)
+	}
+	if entriesBefore != 10 {
+		t.Errorf("expected 10 cache entries, got %d", entriesBefore)
+	}
+
+	// ClearCache should reset bytes
+	f.ClearCache()
+	f.cacheMu.Lock()
+	bytesAfter := f.cacheBytes
+	entriesAfter := len(f.cache)
+	f.cacheMu.Unlock()
+
+	if bytesAfter != 0 {
+		t.Errorf("expected 0 cacheBytes after ClearCache, got %d", bytesAfter)
+	}
+	if entriesAfter != 0 {
+		t.Errorf("expected 0 entries after ClearCache, got %d", entriesAfter)
+	}
+}
+
+func TestFetcher_InvalidateReducesBytes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, "some content for cache")
+	}))
+	defer srv.Close()
+
+	f := NewFetcher(10*time.Second, 5*time.Minute, nil)
+
+	_, err := f.FetchAndConvert(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+
+	f.cacheMu.Lock()
+	bytesBefore := f.cacheBytes
+	f.cacheMu.Unlock()
+
+	if bytesBefore <= 0 {
+		t.Fatalf("expected positive cacheBytes, got %d", bytesBefore)
+	}
+
+	f.Invalidate(srv.URL)
+
+	f.cacheMu.Lock()
+	bytesAfter := f.cacheBytes
+	f.cacheMu.Unlock()
+
+	if bytesAfter != 0 {
+		t.Errorf("expected 0 cacheBytes after invalidating the only entry, got %d", bytesAfter)
+	}
+}

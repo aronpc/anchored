@@ -12,6 +12,8 @@ import (
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/project"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type Service struct {
@@ -29,9 +31,7 @@ type Service struct {
 }
 
 func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 
 	store, err := NewSQLiteStore(cfg.Memory.DatabasePath, logger)
 	if err != nil {
@@ -111,7 +111,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 		}
 	}
 
-	hash := contentHash(opts.Content)
+	hash := util.ContentHash(opts.Content)
 	existing, err := s.store.FindByContentHash(ctx, hash, projectID)
 	if err != nil {
 		s.logger.Warn("content hash lookup failed, proceeding with save", "error", err)

@@ -2,13 +2,13 @@ package kg
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type KG struct {
@@ -17,9 +17,7 @@ type KG struct {
 }
 
 func New(db *sql.DB, logger *slog.Logger) *KG {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &KG{db: db, logger: logger}
 }
 
@@ -72,7 +70,7 @@ func (k *KG) AddTriple(ctx context.Context, subject, predicate, object string, p
 		)
 	}
 
-	id := newID()
+	id := util.NewID()
 	_, err = tx.ExecContext(ctx,
 		`INSERT INTO kg_triples (id, subject_id, predicate_id, object_id, confidence, project_id)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
@@ -87,16 +85,20 @@ func (k *KG) AddTriple(ctx context.Context, subject, predicate, object string, p
 	}
 
 	return &Triple{
-		ID:        id,
-		Subject:   subject,
-		Predicate: predicate,
-		Object:    object,
+		ID:         id,
+		Subject:    subject,
+		Predicate:  predicate,
+		Object:     object,
 		Confidence: 1.0,
-		ValidFrom: time.Now().UTC(),
+		ValidFrom:  time.Now().UTC(),
 	}, nil
 }
 
 func (k *KG) Query(ctx context.Context, entityName string, projectID *string) ([]Triple, error) {
+	if strings.TrimSpace(entityName) == "" {
+		return nil, nil
+	}
+
 	var rows *sql.Rows
 	var err error
 
@@ -175,7 +177,7 @@ func (k *KG) ensureEntity(ctx context.Context, tx *sql.Tx, name string, projectI
 		return id, nil
 	}
 
-	id = newID()
+	id = util.NewID()
 	_, err = tx.ExecContext(ctx,
 		"INSERT INTO kg_entities (id, name, project_id) VALUES (?, ?, ?)",
 		id, name, projectID,
@@ -202,16 +204,10 @@ func (k *KG) ensurePredicate(ctx context.Context, tx *sql.Tx, name string) (stri
 		return "", err
 	}
 
-	id = newID()
+	id = util.NewID()
 	_, err = tx.ExecContext(ctx,
 		"INSERT INTO kg_predicates (id, name) VALUES (?, ?)",
 		id, name,
 	)
 	return id, err
-}
-
-func newID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }

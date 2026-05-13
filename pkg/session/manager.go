@@ -2,13 +2,12 @@ package session
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"time"
 
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type Session struct {
@@ -32,16 +31,8 @@ type Manager struct {
 }
 
 func NewManager(db *sql.DB, logger *slog.Logger) *Manager {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &Manager{db: db, logger: logger}
-}
-
-func newUUID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // StartSession creates a new live session or resumes an existing active one
@@ -71,7 +62,7 @@ func (m *Manager) StartSession(ctx context.Context, sourceTool, sourceSessionID,
 		// errNoRows → fall through to create new.
 	}
 
-	id := newUUID()
+	id := util.NewID()
 
 	var pid *string
 	if projectID != "" {
@@ -224,4 +215,3 @@ func (m *Manager) SessionStats(ctx context.Context) (total int, active int, err 
 	}
 	return total, active, nil
 }
-

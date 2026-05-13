@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 
@@ -129,5 +130,28 @@ func TestCtxSearch_NoResults(t *testing.T) {
 	})
 	if !strings.Contains(result, "no results") && !strings.Contains(result, "No results") {
 		t.Errorf("expected no results message, got: %s", result)
+	}
+}
+
+func TestCtxExecuteFile_Timeout(t *testing.T) {
+	s := newTestServerWithOptimizer(t)
+
+	// Create a temp file to reference (ExecuteFile needs a real file path).
+	tmpFile, err := os.CreateTemp("", "anchored-test-*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(tmpFile.Name()) })
+	tmpFile.WriteString("test content")
+	tmpFile.Close()
+
+	result := callToolJSON(t, s, "anchored_execute_file", map[string]any{
+		"path":     tmpFile.Name(),
+		"language": "shell",
+		"code":     "sleep 60",
+		"timeout":  1000,
+	})
+	if !strings.Contains(result, "TIMEOUT") {
+		t.Errorf("expected timeout for ExecuteFile with short timeout, got: %s", result)
 	}
 }

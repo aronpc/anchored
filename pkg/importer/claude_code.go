@@ -3,8 +3,6 @@ package importer
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -478,11 +476,6 @@ func extractToolCalls(raw json.RawMessage) []toolCall {
 		}
 	}
 	return calls
-}
-
-func contentHash(content string) string {
-	h := sha256.Sum256([]byte(content))
-	return hex.EncodeToString(h[:])
 }
 
 func saveImport(ctx context.Context, store ImportStore, content, category, source, cwd string, log func(string, ...any)) int {

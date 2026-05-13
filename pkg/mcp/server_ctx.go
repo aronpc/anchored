@@ -35,12 +35,16 @@ func (c *ctxOptimizer) Execute(ctx context.Context, code string, language string
 
 func (c *ctxOptimizer) ExecuteFile(ctx context.Context, path string, language string, code string, timeoutMs int, projectID string) (string, string, int, string, bool, bool, error) {
 	timeoutSec := timeoutMs / 1000
+	if timeoutSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		defer cancel()
+	}
+	_ = projectID
 	r, err := c.inner.ExecuteFile(ctx, path, language, code)
 	if err != nil {
 		return "", "", 0, "", false, false, err
 	}
-	_ = timeoutSec
-	_ = projectID
 	return r.Stdout, r.Stderr, r.ExitCode, r.Duration.Round(time.Millisecond).String(), r.TimedOut, r.Truncated, nil
 }
 

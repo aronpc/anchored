@@ -1,11 +1,8 @@
 package memory
 
 import (
-	"bufio"
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -16,6 +13,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 // MemoryIndexer watches directories and incrementally indexes markdown/jsonl files.
@@ -45,9 +44,7 @@ const (
 var headingRe = regexp.MustCompile(`(?m)^#{1,6}\s+`)
 
 func NewMemoryIndexer(svc *Service, paths []string, logger *slog.Logger) *MemoryIndexer {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	if len(paths) == 0 {
 		paths = []string{}
 	}
@@ -175,7 +172,7 @@ func (idx *MemoryIndexer) maybeIndexFile(ctx context.Context, path string, fi os
 	idx.lastMod[path] = fi.ModTime()
 	idx.mu.Unlock()
 
-	hash, err := calculateSHA256(path)
+	hash, err := util.FileHash(path)
 	if err != nil {
 		return fmt.Errorf("sha256 %s: %w", path, err)
 	}
@@ -342,29 +339,6 @@ func chunkJSONL(content string, maxLines int) []string {
 		return nil
 	}
 	return []string{strings.Join(kept, "\n")}
-}
-
-func calculateSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	reader := bufio.NewReader(f)
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			h.Write(buf[:n])
-		}
-		if err != nil {
-			break
-		}
-	}
-
-	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func isSupportedExt(path string) bool {

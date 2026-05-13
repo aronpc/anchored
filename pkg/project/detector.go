@@ -1,12 +1,12 @@
 package project
 
 import (
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type Project struct {
@@ -49,7 +49,7 @@ func (d *Detector) Detect(cwd string) (*Project, error) {
 	}
 
 	name := filepath.Base(gitRoot)
-	id := newID()
+	id := util.NewID()
 
 	_, err = d.db.Exec(
 		"INSERT INTO projects (id, name, path) VALUES (?, ?, ?)",
@@ -82,10 +82,4 @@ func gitRoot(dir string) (string, error) {
 		return "", nil
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-func newID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }

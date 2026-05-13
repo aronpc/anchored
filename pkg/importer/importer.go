@@ -2,11 +2,11 @@ package importer
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log/slog"
 	"os"
 	"time"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type ImportResult struct {
@@ -36,9 +36,9 @@ type ImportTracker interface {
 }
 
 type ImportRecordInfo struct {
-	Source    string
-	Path      string
-	Status    string
+	Source     string
+	Path       string
+	Status     string
 	FinishedAt *time.Time
 }
 
@@ -80,7 +80,7 @@ func RunAll(ctx context.Context, sources []Source, store ImportStore, logger *sl
 
 		var importID string
 		if tracker != nil {
-			importID = newImportID()
+			importID = util.NewID()
 			if err := tracker.CreateImport(importID, sourceName, sourcePath); err != nil {
 				logger.Warn("failed to create import record", "source", sourceName, "error", err)
 				importID = ""
@@ -121,10 +121,4 @@ func RunAll(ctx context.Context, sources []Source, store ImportStore, logger *sl
 	}
 
 	return results
-}
-
-func newImportID() string {
-	b := make([]byte, 12)
-	rand.Read(b)
-	return hex.EncodeToString(b)
 }

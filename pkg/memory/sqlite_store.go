@@ -2,10 +2,7 @@ package memory
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -13,6 +10,8 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type ImportRecord struct {
@@ -49,9 +48,7 @@ func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 
 	cache := NewVectorCache(logger)
 	if err := cache.Load(db); err != nil {
@@ -64,22 +61,11 @@ func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
 func (s *SQLiteStore) DB() *sql.DB               { return s.db }
 func (s *SQLiteStore) VectorCache() *VectorCache { return s.cache }
 
-func newUUID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
-func contentHash(content string) string {
-	h := sha256.Sum256([]byte(content))
-	return hex.EncodeToString(h[:])
-}
-
 func (s *SQLiteStore) Save(ctx context.Context, m Memory) error {
 	now := time.Now().UTC()
 
 	if m.ID == "" {
-		m.ID = newUUID()
+		m.ID = util.NewID()
 	}
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = now
@@ -87,7 +73,7 @@ func (s *SQLiteStore) Save(ctx context.Context, m Memory) error {
 	m.UpdatedAt = now
 
 	if m.ContentHash == "" && m.Content != "" {
-		m.ContentHash = contentHash(m.Content)
+		m.ContentHash = util.ContentHash(m.Content)
 	}
 
 	var keywordsJSON any
@@ -215,7 +201,9 @@ func (s *SQLiteStore) Search(ctx context.Context, query string, opts SearchOptio
 		m.Keywords = unmarshalKeywords(keywordsStr)
 		m.LastAccessed = nilTimeIfZero(lastAccessedTime)
 		if metadataStr.Valid {
-			json.Unmarshal([]byte(metadataStr.String), &m.Metadata)
+			if err := json.Unmarshal([]byte(metadataStr.String), &m.Metadata); err != nil {
+				slog.Warn("failed to unmarshal metadata in search result", "error", err)
+			}
 		}
 
 		// BM25 rank is negative (more negative = better match).
@@ -425,7 +413,9 @@ func scanMemory(row *sql.Row) (*Memory, error) {
 	m.Keywords = unmarshalKeywords(keywordsStr)
 	m.LastAccessed = nilTimeIfZero(lastAccessed)
 	if metadataStr.Valid {
-		json.Unmarshal([]byte(metadataStr.String), &m.Metadata)
+		if err := json.Unmarshal([]byte(metadataStr.String), &m.Metadata); err != nil {
+			slog.Warn("failed to unmarshal metadata", "error", err)
+		}
 	}
 	if len(embeddingBlob) > 0 {
 		m.Embedding, _ = blobToFloat32s(embeddingBlob)
@@ -456,7 +446,9 @@ func scanMemoryRow(rows *sql.Rows) (*Memory, error) {
 	m.Keywords = unmarshalKeywords(keywordsStr)
 	m.LastAccessed = nilTimeIfZero(lastAccessed)
 	if metadataStr.Valid {
-		json.Unmarshal([]byte(metadataStr.String), &m.Metadata)
+		if err := json.Unmarshal([]byte(metadataStr.String), &m.Metadata); err != nil {
+			slog.Warn("failed to unmarshal metadata in row scan", "error", err)
+		}
 	}
 	if len(embeddingBlob) > 0 {
 		m.Embedding, _ = blobToFloat32s(embeddingBlob)
@@ -517,11 +509,15 @@ func (s *SQLiteStore) ListWithoutEmbedding(ctx context.Context, limit int) ([]Me
 }
 
 func (s *SQLiteStore) Update(ctx context.Context, id string, content string, category string) error {
-	hash := contentHash(content)
+	hash := util.ContentHash(content)
 	keywords := ExtractKeywords(content)
-	keywordsJSON, _ := json.Marshal(keywords)
+	keywordsJSON, err := json.Marshal(keywords)
+	if err != nil {
+		s.logger.Warn("failed to marshal keywords, using empty array", "error", err)
+		keywordsJSON = []byte("[]")
+	}
 
-	_, err := s.db.ExecContext(ctx,
+	_, err = s.db.ExecContext(ctx,
 		`UPDATE memories SET content = ?, category = ?, content_hash = ?, keywords = ?, updated_at = CURRENT_TIMESTAMP
 		 WHERE id = ? AND deleted_at IS NULL`,
 		content, category, hash, string(keywordsJSON), id,
@@ -625,7 +621,7 @@ func (s *SQLiteStore) BackfillContentHash(ctx context.Context) (int, error) {
 		if err := rows.Scan(&id, &content); err != nil {
 			continue
 		}
-		hash := contentHash(content)
+		hash := util.ContentHash(content)
 		if _, err := s.db.ExecContext(ctx,
 			"UPDATE memories SET content_hash = ? WHERE id = ?", hash, id,
 		); err != nil {

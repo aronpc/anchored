@@ -83,9 +83,15 @@ type MemoryConfig struct {
 }
 
 type EmbeddingConfig struct {
-	Provider   string `yaml:"provider"`
-	Model      string `yaml:"model"`
+	// TODO: Provider is accepted in config.yaml but never read by the embedder
+	// (the ONNX embedder is always used). Connect or remove in a future sprint.
+	Provider string `yaml:"provider"`
+	// TODO: Model is accepted in config.yaml but the ONNX embedder uses a
+	// hardcoded model name. Connect or remove in a future sprint.
+	Model string `yaml:"model"`
 	ModelDir   string `yaml:"model_dir"`
+	// TODO: Quantize is accepted in config.yaml but never read by the ONNX
+	// embedder. Connect or remove in a future sprint.
 	Quantize   bool   `yaml:"quantize"`
 	Dimensions int    `yaml:"dimensions"`
 }
@@ -102,6 +108,8 @@ type SearchConfig struct {
 
 type SanitizerConfig struct {
 	Enabled  bool     `yaml:"enabled"`
+	// TODO: Patterns is accepted in config.yaml but never read by the Sanitizer
+	// (it uses hardcoded patterns internally). Connect or remove in a future sprint.
 	Patterns []string `yaml:"patterns"`
 }
 

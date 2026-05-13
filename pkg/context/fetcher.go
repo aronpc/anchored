@@ -17,18 +17,21 @@ import (
 )
 
 const maxResponseBodySize = 10 * 1024 * 1024 // 10MB
+const maxCacheSize = 100 * 1024 * 1024         // 100MB
 
 type cacheEntry struct {
 	result    *FetchResult
 	fetchedAt time.Time
+	size      int
 }
 
 type Fetcher struct {
-	client  *http.Client
-	cache   map[string]cacheEntry
-	cacheMu sync.RWMutex
-	cacheTTL time.Duration
-	logger  *slog.Logger
+	client      *http.Client
+	cache       map[string]cacheEntry
+	cacheMu     sync.Mutex
+	cacheTTL    time.Duration
+	cacheBytes  int
+	logger      *slog.Logger
 }
 
 func NewFetcher(timeout, cacheTTL time.Duration, logger *slog.Logger) *Fetcher {
@@ -53,14 +56,14 @@ func NewFetcher(timeout, cacheTTL time.Duration, logger *slog.Logger) *Fetcher {
 
 func (f *Fetcher) FetchAndConvert(ctx context.Context, url string) (*FetchResult, error) {
 	// 1. Check cache
-	f.cacheMu.RLock()
+	f.cacheMu.Lock()
 	if entry, ok := f.cache[url]; ok && time.Since(entry.fetchedAt) < f.cacheTTL {
 		cached := *entry.result
 		cached.FromCache = true
-		f.cacheMu.RUnlock()
+		f.cacheMu.Unlock()
 		return &cached, nil
 	}
-	f.cacheMu.RUnlock()
+	f.cacheMu.Unlock()
 
 	// 2. Build request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -123,9 +126,24 @@ func (f *Fetcher) FetchAndConvert(ctx context.Context, url string) (*FetchResult
 		FromCache:   false,
 	}
 
-	// 6. Store in cache
+	// 6. Store in cache with size tracking and eviction
+	entrySize := len(markdown) + len(url)
 	f.cacheMu.Lock()
-	f.cache[url] = cacheEntry{result: result, fetchedAt: time.Now()}
+	// Evict oldest entries if we would exceed the max cache size.
+	for f.cacheBytes+entrySize > maxCacheSize && len(f.cache) > 0 {
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range f.cache {
+			if oldestKey == "" || v.fetchedAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.fetchedAt
+			}
+		}
+		f.cacheBytes -= f.cache[oldestKey].size
+		delete(f.cache, oldestKey)
+	}
+	f.cache[url] = cacheEntry{result: result, fetchedAt: time.Now(), size: entrySize}
+	f.cacheBytes += entrySize
 	f.cacheMu.Unlock()
 
 	return result, nil
@@ -134,6 +152,7 @@ func (f *Fetcher) FetchAndConvert(ctx context.Context, url string) (*FetchResult
 func (f *Fetcher) ClearCache() {
 	f.cacheMu.Lock()
 	f.cache = make(map[string]cacheEntry)
+	f.cacheBytes = 0
 	f.cacheMu.Unlock()
 }
 
@@ -141,7 +160,10 @@ func (f *Fetcher) ClearCache() {
 // call to hit the network.
 func (f *Fetcher) Invalidate(url string) {
 	f.cacheMu.Lock()
-	delete(f.cache, url)
+	if entry, ok := f.cache[url]; ok {
+		f.cacheBytes -= entry.size
+		delete(f.cache, url)
+	}
 	f.cacheMu.Unlock()
 }
 

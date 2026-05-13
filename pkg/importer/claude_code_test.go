@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type ccMockStore struct {
@@ -107,9 +109,9 @@ func TestExtractToolCalls_Empty(t *testing.T) {
 }
 
 func TestContentHash_Deduplication(t *testing.T) {
-	h1 := contentHash("same content")
-	h2 := contentHash("same content")
-	h3 := contentHash("different content")
+	h1 := util.ContentHash("same content")
+	h2 := util.ContentHash("same content")
+	h3 := util.ContentHash("different content")
 	if h1 != h2 {
 		t.Error("same content should produce same hash")
 	}
