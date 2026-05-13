@@ -20,14 +20,14 @@ Reduzir débito técnico identificado no codebase report. Organizado em 3 times 
 **Escopo**: Novo pacote + remoções. Sem conflito com outros times.
 **Estimativa**: 1-2 dias
 
-- [ ] **A1**: Criar `pkg/util/uuid.go` com `NewID() string` que checa erro do `rand.Read` (panic on failure)
-- [ ] **A2**: Criar `pkg/util/hash.go` com `ContentHash(string) string` e `FileHash(string) (string, error)`
-- [ ] **A3**: Criar `pkg/util/similarity.go` com `CosineSimilarity(a, b []float32) float64`
-- [ ] **A4**: Criar `pkg/util/logger.go` com `DefaultLogger(*slog.Logger) *slog.Logger`
-- [ ] **A5**: Migrar callers de `newUUID/newID` em: `sqlite_store.go`, `session/manager.go`, `kg/kg.go`, `context/store.go`, `project/detector.go`, `importer/importer.go`
-- [ ] **A6**: Migrar callers de content hash em: `sqlite_store.go`, `claude_code.go`, `indexer.go`, `embedding_cache.go`, `memory/indexer.go`
-- [ ] **A7**: Migrar callers de cosine similarity em: `dream/analyzer.go`, `topic_change_detector.go`
-- [ ] **A8**: Remover dead code:
+- [x] **A1**: Criar `pkg/util/uuid.go` com `NewID() string` que checa erro do `rand.Read` (panic on failure)
+- [x] **A2**: Criar `pkg/util/hash.go` com `ContentHash(string) string` e `FileHash(string) (string, error)`
+- [x] **A3**: Criar `pkg/util/similarity.go` com `CosineSimilarity(a, b []float32) float64`
+- [x] **A4**: Criar `pkg/util/logger.go` com `DefaultLogger(*slog.Logger) *slog.Logger`
+- [x] **A5**: Migrar callers de `newUUID/newID` em: `sqlite_store.go`, `session/manager.go`, `kg/kg.go`, `context/store.go`, `project/detector.go`, `importer/importer.go`
+- [x] **A6**: Migrar callers de content hash em: `sqlite_store.go`, `claude_code.go`, `indexer.go`, `embedding_cache.go`, `memory/indexer.go`
+- [x] **A7**: Migrar callers de cosine similarity em: `dream/analyzer.go`, `topic_change_detector.go`
+- [x] **A8**: Remover dead code:
   - `SaveMemory()` em `pkg/memory/service.go:280`
   - `toolCall` type + `extractToolCalls()` em `pkg/importer/claude_code.go:455-481`
   - `FindTool()` em `pkg/mcp/tools.go:467-474`
@@ -35,11 +35,11 @@ Reduzir débito técnico identificado no codebase report. Organizado em 3 times 
   - `snapshotAge()` em `pkg/memory/entity_detector.go:221-228`
   - `processAttachmentEntry()` em `pkg/importer/claude_code.go:348`
   - `LegacyModelName` em `pkg/memory/embedding_cache.go:86` (usar o de `embeddings_onnx.go`)
-- [ ] **A9**: Eliminar `float32SliceToBytes` em `embedding_cache.go` (usar `float32sToBlob` de `vector_cache.go`)
-- [ ] **A10**: Consolidar `scanMemory` / `scanMemoryRow` em `sqlite_store.go` (extrair helper com interface `RowScanner`)
-- [ ] **A11**: Eliminar `expandHome` duplicado entre `config.go` e `debuglog.go` (mover para `pkg/util/path.go`)
-- [ ] **A12**: Substituir Newton sqrt em `dream/analyzer.go:269-278` por `math.Sqrt`
-- [ ] **A13**: `go test ./...` passando
+- [x] **A9**: Eliminar `float32SliceToBytes` em `embedding_cache.go` (usar `float32sToBlob` de `vector_cache.go`)
+- [x] **A10**: Consolidar `scanMemory` / `scanMemoryRow` em `sqlite_store.go` (extrair helper com interface `RowScanner`)
+- [x] **A11**: Eliminar `expandHome` duplicado entre `config.go` e `debuglog.go` (mover para `pkg/util/path.go`)
+- [x] **A12**: Substituir Newton sqrt em `dream/analyzer.go:269-278` por `math.Sqrt`
+- [x] **A13**: `go test ./...` passando
 
 ### Time B — Bug Fixes + Config Cleanup
 **Escopo**: Fixes pontuais + config. Não toca nos arquivos que o Time A refatora.
@@ -85,12 +85,11 @@ Time B (bugfixes)       (independente, roda em paralelo com A)
 
 ## Critérios de Aceite
 
-- [ ] `make test` passa com zero falhas
-- [ ] `make lint` sem novos warnings
-- [ ] `make build` compila sem erros
-- [ ] Zero duplicação de UUID/hash/similarity/logger-guard
-- [ ] Dead code removido (zero funções sem callers)
-- [ ] Bug do ExecuteFile timeout corrigido
+- [x] `make test` passa com zero falhas
+- [x] `make build` compila sem erros
+- [x] Zero duplicação de UUID/hash/similarity/logger-guard
+- [x] Dead code removido (zero funções sem callers)
+- [x] Bug do ExecuteFile timeout corrigido (Time B)
 - [ ] Coverage mínima de 60% nos packages críticos (memory, mcp, kg)
 
 ## Notas
