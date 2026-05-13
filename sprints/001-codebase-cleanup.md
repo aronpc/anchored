@@ -61,14 +61,14 @@ Reduzir débito técnico identificado no codebase report. Organizado em 3 times 
 **Escopo**: Testes para módulos críticos sem cobertura. Roda após Time A concluir migrações.
 **Estimativa**: 3-5 dias
 
-- [ ] **C1**: `pkg/util/*_test.go` — testes para NewID, ContentHash, CosineSimilarity, DefaultLogger
+- [x] **C1**: `pkg/util/*_test.go` — testes para NewID (4), ContentHash (5), CosineSimilarity (7), DefaultLogger (2)
 - [ ] **C2**: `pkg/memory/service_test.go` — Save, SaveWithOptions, embedAsync, BackfillEmbeddings (com mock Store/Embedder)
 - [ ] **C3**: `pkg/memory/sqlite_store_test.go` — CRUD operations, scanMemory, ListWithoutEmbedding, UpdateEmbedding
-- [ ] **C4**: `pkg/kg/kg_test.go` — AddTriple, QueryEntity, alias resolution, bitemporal logic
-- [ ] **C5**: `pkg/mcp/server_test.go` — tool routing, parameter parsing, response formatting (pelo menos os 5 tools principais: context, search, save, execute, kg_query)
-- [ ] **C6**: `pkg/importer/importer_test.go` — RunAll orchestration, error handling, dedup
-- [ ] **C7**: `pkg/config/config_test.go` — YAML loading, path expansion, defaults
-- [ ] **C8**: `go test ./...` passando com coverage report
+- [x] **C4**: `pkg/kg/kg_test.go` — AddTriple, QueryEntity, alias resolution, bitemporal logic (9 tests)
+- [x] **C5**: `pkg/mcp/server_test.go` — tool routing, parameter parsing, response formatting (32 tests)
+- [x] **C6**: `pkg/importer/importer_test.go` — RunAll orchestration, error handling, dedup (13 tests)
+- [x] **C7**: `pkg/config/config_test.go` — YAML loading, path expansion, defaults (4 tests)
+- [x] **C8**: `go test ./...` passando com coverage report (12/12 packages OK)
 
 ---
 
