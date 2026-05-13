@@ -110,7 +110,7 @@ func (s *Store) InsertChunk(ctx context.Context, chunk *Chunk) error {
 	_, err := s.stmtInsertChunk.ExecContext(ctx,
 		chunk.ID, chunk.SessionID, chunk.ProjectID, chunk.Source, chunk.Label,
 		chunk.Content, chunk.Metadata, chunk.ContentType,
-		chunk.IndexedAt, chunk.TTLHours,
+		chunk.IndexedAt.UTC().Format("2006-01-02 15:04:05"), chunk.TTLHours,
 	)
 	if err != nil {
 		return fmt.Errorf("insert chunk: %w", err)
