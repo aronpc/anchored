@@ -20,6 +20,8 @@ import (
 	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/session"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 // OptimizerFacade decouples pkg/mcp from pkg/context (which has a !windows build tag).
@@ -112,9 +114,7 @@ func (s *Server) resetSearchThrottle() { s.searchCalls.Store(0) }
 func (s *Server) nextSearchCall() int32 { return s.searchCalls.Add(1) }
 
 func NewServer(mem *memory.Service, kg *kg.KG, sessions *session.Manager, optimizer OptimizerFacade, version string, logger *slog.Logger) *Server {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &Server{mem: mem, kg: kg, sessions: sessions, optimizer: optimizer, logger: logger, version: version}
 }
 

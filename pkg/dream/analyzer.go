@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/jholhewres/anchored/pkg/memory"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type DreamReport struct {
@@ -36,9 +38,7 @@ type DreamAnalyzer struct {
 }
 
 func NewAnalyzer(db *sql.DB, vectorCache *memory.VectorCache, cfg DreamConfig, logger *slog.Logger) *DreamAnalyzer {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &DreamAnalyzer{db: db, vectorCache: vectorCache, config: cfg, logger: logger}
 }
 
@@ -144,7 +144,7 @@ func (a *DreamAnalyzer) Analyze(ctx context.Context) (*DreamReport, error) {
 			}
 			for j := i + 1; j < end && compareCount < maxComps; j++ {
 				compareCount++
-				score := cosineSimilarity(entries[i].vec, entries[j].vec)
+				score := util.CosineSimilarity(entries[i].vec, entries[j].vec)
 				if score >= a.config.DedupThreshold {
 					idA := entries[i].id
 					idB := entries[j].id
@@ -208,7 +208,7 @@ func (a *DreamAnalyzer) Analyze(ctx context.Context) (*DreamReport, error) {
 			}
 			for j := i + 1; j < end && compareCount < maxComps; j++ {
 				compareCount++
-				score := cosineSimilarity(entries[i].vec, entries[j].vec)
+				score := util.CosineSimilarity(entries[i].vec, entries[j].vec)
 
 				if score >= 0.7 && score < a.config.DedupThreshold {
 					contentA := contentMap[entries[i].id]
@@ -248,33 +248,6 @@ func (a *DreamAnalyzer) Analyze(ctx context.Context) (*DreamReport, error) {
 	})
 
 	return report, nil
-}
-
-func cosineSimilarity(a, b []float32) float64 {
-	if len(a) != len(b) || len(a) == 0 {
-		return 0
-	}
-	var dot, normA, normB float64
-	for i := range a {
-		dot += float64(a[i]) * float64(b[i])
-		normA += float64(a[i]) * float64(a[i])
-		normB += float64(b[i]) * float64(b[i])
-	}
-	if normA == 0 || normB == 0 {
-		return 0
-	}
-	return dot / (sqrt(normA) * sqrt(normB))
-}
-
-func sqrt(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	z := x
-	for i := 0; i < 10; i++ {
-		z = (z + x/z) / 2
-	}
-	return z
 }
 
 func truncate(s string, n int) string {

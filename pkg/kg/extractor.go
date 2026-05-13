@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type TripleCandidate struct {
@@ -30,9 +32,7 @@ type PatternExtractor struct {
 }
 
 func NewPatternExtractor(kg *KG, logger *slog.Logger) *PatternExtractor {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 
 	p := &PatternExtractor{
 		kg:        kg,

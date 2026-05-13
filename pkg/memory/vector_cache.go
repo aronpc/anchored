@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"math"
 	"sync"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 // VectorCache is a thread-safe in-memory cache of memory embeddings keyed by memory ID.
@@ -16,9 +18,7 @@ type VectorCache struct {
 }
 
 func NewVectorCache(logger *slog.Logger) *VectorCache {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &VectorCache{
 		byID:   make(map[string][]float32),
 		logger: logger,

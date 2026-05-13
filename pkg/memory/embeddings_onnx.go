@@ -17,6 +17,8 @@ import (
 	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 const (
@@ -56,9 +58,7 @@ type ONNXPaths struct {
 }
 
 func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error) {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	logger = logger.With("component", "onnx-embedder")
 
 	paths := resolveONNXPaths(modelDir)

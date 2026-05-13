@@ -2,12 +2,12 @@ package memory
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"math"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type EmbeddingCache struct {
@@ -16,14 +16,12 @@ type EmbeddingCache struct {
 }
 
 func NewEmbeddingCache(db *sql.DB, logger *slog.Logger) *EmbeddingCache {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &EmbeddingCache{db: db, logger: logger}
 }
 
 func (c *EmbeddingCache) Get(ctx context.Context, text, model string) ([]float32, bool) {
-	key := hashText(text)
+	key := util.ContentHash(text)
 
 	var data []byte
 	err := c.db.QueryRowContext(ctx,
@@ -45,7 +43,7 @@ func (c *EmbeddingCache) Get(ctx context.Context, text, model string) ([]float32
 }
 
 func (c *EmbeddingCache) Put(ctx context.Context, text, model string, vec []float32, quantize bool) error {
-	key := hashText(text)
+	key := util.ContentHash(text)
 
 	var data []byte
 	if quantize {
@@ -66,11 +64,6 @@ func (c *EmbeddingCache) Put(ctx context.Context, text, model string, vec []floa
 	return err
 }
 
-func hashText(text string) string {
-	h := sha256.Sum256([]byte(text))
-	return hex.EncodeToString(h[:])
-}
-
 func float32SliceToBytes(vec []float32) []byte {
 	buf := make([]byte, len(vec)*4)
 	for i, v := range vec {
@@ -83,13 +76,11 @@ func float32SliceToBytes(vec []float32) []byte {
 	return buf
 }
 
-const LegacyModelName = "all-MiniLM-L6-v2"
-
 func (c *EmbeddingCache) MigrateFromLegacy(currentModel string) int64 {
 	var count int64
 	err := c.db.QueryRow(
 		"SELECT COUNT(*) FROM embedding_cache WHERE model = ?",
-		LegacyModelName,
+		legacyModelName,
 	).Scan(&count)
 	if err != nil || count == 0 {
 		return 0
@@ -97,7 +88,7 @@ func (c *EmbeddingCache) MigrateFromLegacy(currentModel string) int64 {
 
 	res, err := c.db.Exec(
 		"DELETE FROM embedding_cache WHERE model = ?",
-		LegacyModelName,
+		legacyModelName,
 	)
 	if err != nil {
 		c.logger.Warn("failed to migrate legacy embedding cache", "error", err)
@@ -106,7 +97,7 @@ func (c *EmbeddingCache) MigrateFromLegacy(currentModel string) int64 {
 	deleted, _ := res.RowsAffected()
 	c.logger.Info("Model updated. Re-generating embeddings in background...",
 		"deleted_cache_entries", deleted,
-		"old_model", LegacyModelName,
+		"old_model", legacyModelName,
 		"new_model", currentModel,
 	)
 	return deleted

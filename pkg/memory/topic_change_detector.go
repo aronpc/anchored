@@ -2,8 +2,9 @@ package memory
 
 import (
 	"context"
-	"math"
 	"sync"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type TopicChangeDetector struct {
@@ -55,7 +56,7 @@ func (d *TopicChangeDetector) Check(ctx context.Context, currentQuery string) (c
 			return true, nil
 		}
 		if len(vecs) > 0 && len(vecs[0]) > 0 && len(lastEmbedding) > 0 {
-			sim := cosineSimilarityFloat32(vecs[0], lastEmbedding)
+			sim := util.CosineSimilarity(vecs[0], lastEmbedding)
 			if sim >= float64(d.cosineThresh) {
 				d.updateState(currentQuery, currentEntities, vecs[0])
 				return false, nil
@@ -124,21 +125,3 @@ func entityOverlapRatio(a, b map[string]bool) float32 {
 	return float32(intersection) / float32(union)
 }
 
-func cosineSimilarityFloat32(a, b []float32) float64 {
-	if len(a) == 0 || len(b) == 0 || len(a) != len(b) {
-		return 0
-	}
-	var dot, normA, normB float64
-	for i := range a {
-		fa := float64(a[i])
-		fb := float64(b[i])
-		dot += fa * fb
-		normA += fa * fa
-		normB += fb * fb
-	}
-	denom := math.Sqrt(normA) * math.Sqrt(normB)
-	if denom == 0 {
-		return 0
-	}
-	return dot / denom
-}

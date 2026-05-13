@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type ConsolidationResult struct {
@@ -19,9 +21,7 @@ type DreamConsolidator struct {
 }
 
 func NewConsolidator(db *sql.DB, logger *slog.Logger) *DreamConsolidator {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &DreamConsolidator{db: db, logger: logger}
 }
 

@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type HybridSearchConfig struct {
@@ -45,9 +47,7 @@ type HybridSearcher struct {
 }
 
 func NewHybridSearcher(store Store, embedder EmbeddingProvider, cache *EmbeddingCache, vectorCache *VectorCache, cfg HybridSearchConfig, entityDetector *EntityDetector, topicChangeDetector *TopicChangeDetector, logger *slog.Logger) *HybridSearcher {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &HybridSearcher{store: store, embedder: embedder, cache: cache, vectorCache: vectorCache, config: cfg, entityDetector: entityDetector, topicChangeDetector: topicChangeDetector, logger: logger}
 }
 

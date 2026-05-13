@@ -10,6 +10,8 @@ import (
 
 	"github.com/jholhewres/anchored/pkg/memory"
 	_ "github.com/mattn/go-sqlite3"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 func float32sToBytes(vec []float32) []byte {
@@ -239,7 +241,7 @@ func TestCosineSimilarity(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			score := cosineSimilarity(tt.a, tt.b)
+			score := util.CosineSimilarity(tt.a, tt.b)
 			if score < tt.expect-0.01 || score > tt.expect+0.01 {
 				t.Errorf("cosine(%v, %v) = %f, want ~%f", tt.a, tt.b, score, tt.expect)
 			}

@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 // entityTokenRe matches Unicode word tokens >= 3 chars (allows hyphens, underscores).
@@ -54,9 +56,7 @@ type EntityDetector struct {
 }
 
 func NewEntityDetector(db *sql.DB, cfg EntityDetectorConfig, logger *slog.Logger) *EntityDetector {
-	if logger == nil {
-		logger = slog.Default()
-	}
+	logger = util.DefaultLogger(logger)
 	return &EntityDetector{
 		db:       db,
 		cfg:      cfg.withDefaults(),
