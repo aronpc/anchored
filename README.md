@@ -1,14 +1,16 @@
 # Anchored
 
-> Persistent cross-tool memory for AI coding agents. Single binary. Zero dependencies.
+> Persistent cross-tool memory for AI coding agents. Local-first, single binary, zero dependencies.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.24+-00ADD8?style=for-the-badge&logo=go)]
 [![Release](https://img.shields.io/github/v/release/jholhewres/anchored?style=for-the-badge)](https://github.com/jholhewres/anchored/releases)
 
-Anchored is an MCP memory server that gives every AI coding agent and IDE you use a shared, persistent memory. Install once, and Claude Code, Cursor, OpenCode, Gemini CLI, and any other MCP-compatible tool read, write, and search the same knowledge base.
+Anchored is a local-first MCP memory server that gives every AI coding agent and IDE you use a shared, persistent memory on your machine. Install once, and Claude Code, Cursor, OpenCode, Gemini CLI, and any other MCP-compatible tool read, write, and search the same knowledge base.
 
 No API keys. No daemon. All embeddings run locally.
+
+For team-shared project memory, the planned self-hosted/open distribution lives in [`anchored_oss`](../anchored_oss): organization-owned projects, team permissions, remote sync, privacy guardrails, and a future cloud-compatible protocol.
 
 ## Features
 
@@ -23,6 +25,7 @@ No API keys. No daemon. All embeddings run locally.
 - **Background auto-updater** — checks GitHub releases on startup; new binary atomically replaced, current process unaffected
 - **Credential redaction** — regex-based secret sanitization before storage
 - **Multi-source import** — Claude Code (JSONL), OpenCode (SQLite), Cursor (.mdc rules), DevClaw
+- **Team sync ready** — design work for self-hosted and cloud-compatible shared project memory lives in `docs/team-sync.md` and the sibling `anchored_oss` repo
 
 ## Install
 
@@ -102,7 +105,7 @@ anchored list               List memories
 
 anchored import [sources]   Import memories from detected sources
 anchored identity [edit]    View or edit identity file
-anchored config [show|set]  View or modify configuration
+anchored config [show|set|wizard] View or modify configuration
 
 anchored dream              Analyze and consolidate duplicate memories
 anchored precompact         Pre-compact memory context
@@ -167,7 +170,13 @@ No daemon. No ports. The binary runs on demand via MCP STDIO.
 - [Architecture](docs/architecture.md) — project structure and implementation details
 - [Embedding Model](docs/embedding-model.md) — model choice, quantization, inference pipeline
 - [Import Sources](docs/import-sources.md) — how each tool's data is parsed
+- [Team Sync](docs/team-sync.md) — planned local + remote architecture for team-shared memory via `anchored_oss`
+- [Improvements Roadmap](docs/improvements-roadmap.md) — local-first roadmap before/alongside Team Sync and Cloud
 - [Changelog](CHANGELOG.md) — version history
+
+## Related Projects
+
+- [`anchored_oss`](../anchored_oss) — planned self-hosted/open team sync server for organizations, teams, project memory, policies, and remote guardrails.
 
 ## License
 

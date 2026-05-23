@@ -41,7 +41,7 @@ Dev A (Claude Code)              Dev B (Cursor)
          └────────────┬───────────────────┘
                       │
              ┌────────▼────────┐
-             │ anchored-server │  (team infra)
+             │  anchored_oss   │  (team infra)
              │ (Postgres)      │
              │                 │
              │ Project X       │
@@ -56,9 +56,9 @@ Dev A (Claude Code)              Dev B (Cursor)
 
 ## Two Projects
 
-### `anchored-server` (new repo, independent binary)
+### [`anchored_oss`](../../anchored_oss) (sibling repo, independent binary)
 
-Self-hosted HTTP server that teams deploy on their own infrastructure. Acts as the central hub for project-scoped knowledge. Teams run it wherever they run their internal tools.
+Self-hosted/open team sync distribution that teams deploy on their own infrastructure. Acts as the central hub for organization-owned, project-scoped knowledge. Teams run it wherever they run their internal tools. The same protocol/model should be reusable by the future Anchored Cloud service.
 
 ### `anchored` (this repo, extension)
 
@@ -266,12 +266,12 @@ If a dev wants to share personal preferences for a specific project, they set `s
 
 ---
 
-## `anchored-server` Design
+## `anchored_oss` Design
 
 ### Directory Structure
 
 ```
-anchored-server/
+anchored_oss/
 ├── cmd/
 │   └── server/
 │       └── main.go
@@ -447,7 +447,7 @@ If the organization allows auto-create, the project is created under the organiz
 ### Onboarding Flow
 
 ```
-1. Team admin deploys anchored-server (docker-compose up)
+1. Team admin deploys `anchored_oss` (docker-compose up)
 2. Admin creates project:  POST /v1/projects  (with admin secret)
 3. Admin generates invite keys:  POST /v1/projects/{id}/invites
 4. Admin shares invite keys with team
