@@ -86,13 +86,13 @@ type OptimizerExecResult struct {
 }
 
 type Server struct {
-	mem      *memory.Service
-	kg       *kg.KG
-	sessions *session.Manager
+	mem       *memory.Service
+	kg        *kg.KG
+	sessions  *session.Manager
 	optimizer OptimizerFacade
-	logger   *slog.Logger
-	dlog     *debuglog.Logger
-	version  string
+	logger    *slog.Logger
+	dlog      *debuglog.Logger
+	version   string
 
 	// searchCalls counts anchored_ctx_search invocations within the current
 	// indexing scope. Reset by anchored_batch_execute, anchored_index, and
@@ -637,9 +637,9 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	}
 
 	results, err := s.mem.Search(ctx, p.Query, memory.SearchOptions{
-		MaxResults:    p.MaxResults,
-		Category:      p.Category,
-		ProjectID:     projectID,
+		MaxResults:     p.MaxResults,
+		Category:       p.Category,
+		ProjectID:      projectID,
 		BoostProjectID: boostProjectID,
 	})
 	if err != nil {
@@ -687,6 +687,7 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		Content  string `json:"content"`
 		Category string `json:"category"`
 		CWD      string `json:"cwd"`
+		Scope    string `json:"scope"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
@@ -696,7 +697,13 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		p.CWD = "."
 	}
 
-	m, err := s.mem.Save(ctx, p.Content, p.Category, "mcp", p.CWD)
+	m, err := s.mem.SaveWithOptions(ctx, memory.SaveOptions{
+		Content:         p.Content,
+		Category:        p.Category,
+		Source:          "mcp",
+		CWD:             p.CWD,
+		PreferenceScope: p.Scope,
+	})
 	if err != nil {
 		return "", err
 	}
@@ -742,9 +749,9 @@ func (s *Server) toolList(ctx context.Context, args json.RawMessage) (string, er
 
 func (s *Server) toolForget(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
-		ID  string `json:"id"`
-		Hard bool  `json:"hard"`
-		CWD string `json:"cwd"`
+		ID   string `json:"id"`
+		Hard bool   `json:"hard"`
+		CWD  string `json:"cwd"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
@@ -1179,9 +1186,9 @@ func (s *Server) toolCtxFetchAndIndex(ctx context.Context, args json.RawMessage)
 		return "Context optimizer not enabled. Set context_optimizer.enabled: true in config.", nil
 	}
 	var p struct {
-		URL         string `json:"url"`
-		Source      string `json:"source"`
-		Requests    []struct {
+		URL      string `json:"url"`
+		Source   string `json:"source"`
+		Requests []struct {
 			URL    string `json:"url"`
 			Source string `json:"source"`
 		} `json:"requests"`

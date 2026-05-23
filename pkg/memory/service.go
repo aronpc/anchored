@@ -15,17 +15,17 @@ import (
 )
 
 type Service struct {
-	store        Store
-	searcher     *HybridSearcher
-	sanitizer    *Sanitizer
-	projDet      *project.Detector
-	embedder     EmbeddingProvider
-	cache        *EmbeddingCache
-	logger       *slog.Logger
-	embedSem     chan struct{}
-	kgExtractor  *kg.PatternExtractor
-	shutdown     chan struct{}
-	wg           sync.WaitGroup
+	store       Store
+	searcher    *HybridSearcher
+	sanitizer   *Sanitizer
+	projDet     *project.Detector
+	embedder    EmbeddingProvider
+	cache       *EmbeddingCache
+	logger      *slog.Logger
+	embedSem    chan struct{}
+	kgExtractor *kg.PatternExtractor
+	shutdown    chan struct{}
+	wg          sync.WaitGroup
 }
 
 func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
@@ -100,6 +100,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 	if opts.Category == "" {
 		opts.Category = Categorize(opts.Content)
 	}
+	metadata := WithPreferenceScope(nil, opts.Category, opts.PreferenceScope)
 
 	var projectID *string
 	if opts.CWD != "" {
@@ -116,6 +117,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 	if err != nil {
 		s.logger.Warn("content hash lookup failed, proceeding with save", "error", err)
 	} else if existing != nil {
+		metadata = WithPreferenceScope(existing.Metadata, opts.Category, opts.PreferenceScope)
 		upd := Memory{
 			ID:          existing.ID,
 			Content:     opts.Content,
@@ -126,6 +128,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 			ContentHash: hash,
 			Keywords:    ExtractKeywords(opts.Content),
 			CreatedAt:   existing.CreatedAt,
+			Metadata:    metadata,
 		}
 		if err := s.store.Save(ctx, upd); err != nil {
 			return nil, fmt.Errorf("save: %w", err)
@@ -141,6 +144,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 		ProjectID:   projectID,
 		ContentHash: hash,
 		Keywords:    ExtractKeywords(opts.Content),
+		Metadata:    metadata,
 	}
 
 	if err := s.store.Save(ctx, m); err != nil {

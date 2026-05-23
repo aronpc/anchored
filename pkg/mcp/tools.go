@@ -53,7 +53,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_save",
-			Description: "Capture durable knowledge into persistent cross-tool memory. CALL PROACTIVELY when high-signal information emerges; do not wait for the user to say \"remember this\". You MUST pick a category — picking wrong is better than skipping, and quality categorization beats keyword auto-detect. Categories:\n• fact — stable truth about user/team/stack/system (\"we run Go 1.22 on ARM\", \"the API lives at api.example.com\")\n• preference — recurring choice the user makes (\"I always pin deps\", \"prefer small PRs\")\n• decision — architectural or directional choice (\"settled on Postgres\", \"going forward, no co-author trailers\")\n• event — something that happened at a point in time (\"deployed v2 today\", \"merged #421\", \"meeting at 14h\")\n• learning — non-obvious lesson or post-mortem insight (\"TIL X\", \"got bit by Y\", \"causa raiz foi Z\")\n• plan — intent to do something (\"TODO: migrate\", \"next up: refactor\")\n• summary — consolidated recap (\"daily recap\", \"sprint summary\")\n\nDO NOT save: ephemeral task state, basic engineering trivia, anything inferable from the codebase, secrets/credentials. Auto-detects project from cwd. Content is sanitized for tokens/keys before storage.",
+			Description: "Capture durable knowledge into persistent cross-tool memory. CALL PROACTIVELY when high-signal information emerges; do not wait for the user to say \"remember this\". You MUST pick a category — picking wrong is better than skipping, and quality categorization beats keyword auto-detect. Categories:\n• fact — stable truth about user/team/stack/system (\"we run Go 1.22 on ARM\", \"the API lives at api.example.com\")\n• preference — recurring choice. Defaults to scope=user (personal/local); use scope=project for project conventions and scope=team only when explicitly shared by the user/team.\n• decision — architectural or directional choice (\"settled on Postgres\", \"going forward, no co-author trailers\")\n• event — something that happened at a point in time (\"deployed v2 today\", \"merged #421\", \"meeting at 14h\")\n• learning — non-obvious lesson or post-mortem insight (\"TIL X\", \"got bit by Y\", \"causa raiz foi Z\")\n• plan — intent to do something (\"TODO: migrate\", \"next up: refactor\")\n• summary — consolidated recap (\"daily recap\", \"sprint summary\")\n\nDO NOT save: ephemeral task state, basic engineering trivia, anything inferable from the codebase, secrets/credentials. Auto-detects project from cwd. Content is sanitized for tokens/keys before storage.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -69,6 +69,11 @@ func ToolDefinitions() []Tool {
 					"cwd": map[string]any{
 						"type":        "string",
 						"description": "Current working directory for project detection",
+					},
+					"scope": map[string]any{
+						"type":        "string",
+						"description": "Optional scope for category=preference. Defaults to user. Use project for project conventions; use team only when explicitly shared.",
+						"enum":        []string{"user", "project", "team"},
 					},
 				},
 				"required": []string{"content", "category"},

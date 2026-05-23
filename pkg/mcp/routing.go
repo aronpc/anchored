@@ -4,12 +4,12 @@ package mcp
 // treat anchored at runtime. It is consumed in TWO places that need to stay
 // in lockstep:
 //
-//   1. Server.handleInitialize → returned in the MCP `initialize` response as
-//      the `instructions` field, so any MCP-compatible client gets the
-//      guidance during the handshake.
-//   2. cmd/anchored/hook_sessionstart.go and hook_userpromptsubmit.go →
-//      injected via Claude Code's `additionalContext` so the same guidance
-//      survives compaction and is re-applied on every prompt.
+//  1. Server.handleInitialize → returned in the MCP `initialize` response as
+//     the `instructions` field, so any MCP-compatible client gets the
+//     guidance during the handshake.
+//  2. cmd/anchored/hook_sessionstart.go and hook_userpromptsubmit.go →
+//     injected via Claude Code's `additionalContext` so the same guidance
+//     survives compaction and is re-applied on every prompt.
 //
 // Mirrors the structure context-mode uses for its <context_window_protection>
 // block: XML-tagged sections so the model can scan them quickly and so the
@@ -42,7 +42,7 @@ const AnchoredRoutingBlock = `<anchored_memory>
   <when_to_save>
     Call anchored_save (and anchored_kg_add for "X depends_on Y" / "owns" / "deployed_on" facts) PROACTIVELY whenever durable, non-obvious knowledge emerges — without waiting for "remember this", "salva isso", or any explicit phrase. Pick the category explicitly:
     - fact — stable truth ("we run Go 1.22 on ARM").
-    - preference — recurring choice ("I always pin deps").
+    - preference — recurring choice. Defaults to scope=user (personal/local). Use scope=project only for project conventions; use scope=team only when the user/team explicitly wants it shared.
     - decision — directional choice ("settled on Postgres").
     - event — point-in-time happening ("deployed v2 today", "merged #421").
     - learning — non-obvious lesson ("got bit by", "post-mortem", "lição aprendida").

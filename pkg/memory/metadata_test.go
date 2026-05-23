@@ -7,12 +7,13 @@ import (
 
 func TestMemoryMetadata_MarshalJSON(t *testing.T) {
 	m := MemoryMetadata{
-		Source:        "auto_capture",
-		SessionID:     "sess_123",
-		Consolidated:  []string{"id1", "id2"},
-		DreamVersion:  "dream_v3",
-		CaptureReason: "high relevance",
-		QualityScore:  0.95,
+		Source:          "auto_capture",
+		SessionID:       "sess_123",
+		Consolidated:    []string{"id1", "id2"},
+		DreamVersion:    "dream_v3",
+		CaptureReason:   "high relevance",
+		QualityScore:    0.95,
+		PreferenceScope: PreferenceScopeProject,
 	}
 
 	b, err := json.Marshal(m)
@@ -40,6 +41,9 @@ func TestMemoryMetadata_MarshalJSON(t *testing.T) {
 	if raw["quality_score"] != 0.95 {
 		t.Errorf("expected quality_score=0.95, got %v", raw["quality_score"])
 	}
+	if raw["preference_scope"] != PreferenceScopeProject {
+		t.Errorf("expected preference_scope=project, got %v", raw["preference_scope"])
+	}
 
 	consolidated, ok := raw["consolidated"].([]any)
 	if !ok || len(consolidated) != 2 {
@@ -48,7 +52,7 @@ func TestMemoryMetadata_MarshalJSON(t *testing.T) {
 }
 
 func TestMemoryMetadata_UnmarshalJSON(t *testing.T) {
-	input := `{"source":"user","session_id":"s1","consolidated":["a","b"],"dream_version":"v1","capture_reason":"test","quality_score":0.5}`
+	input := `{"source":"user","session_id":"s1","consolidated":["a","b"],"dream_version":"v1","capture_reason":"test","quality_score":0.5,"preference_scope":"team"}`
 
 	var m MemoryMetadata
 	if err := json.Unmarshal([]byte(input), &m); err != nil {
@@ -70,6 +74,9 @@ func TestMemoryMetadata_UnmarshalJSON(t *testing.T) {
 	if m.QualityScore != 0.5 {
 		t.Errorf("expected QualityScore=0.5, got %f", m.QualityScore)
 	}
+	if m.PreferenceScope != PreferenceScopeTeam {
+		t.Errorf("expected PreferenceScope=team, got %q", m.PreferenceScope)
+	}
 	if len(m.Consolidated) != 2 || m.Consolidated[0] != "a" || m.Consolidated[1] != "b" {
 		t.Errorf("expected Consolidated=[a b], got %v", m.Consolidated)
 	}
@@ -77,12 +84,13 @@ func TestMemoryMetadata_UnmarshalJSON(t *testing.T) {
 
 func TestMemoryMetadata_RoundTrip(t *testing.T) {
 	original := MemoryMetadata{
-		Source:        "dream",
-		SessionID:     "session_42",
-		Consolidated:  []string{"mem1", "mem2", "mem3"},
-		DreamVersion:  "dream_2026_04_30",
-		CaptureReason: "consolidation",
-		QualityScore:  0.88,
+		Source:          "dream",
+		SessionID:       "session_42",
+		Consolidated:    []string{"mem1", "mem2", "mem3"},
+		DreamVersion:    "dream_2026_04_30",
+		CaptureReason:   "consolidation",
+		QualityScore:    0.88,
+		PreferenceScope: PreferenceScopeUser,
 	}
 
 	b, err := json.Marshal(original)
@@ -95,7 +103,7 @@ func TestMemoryMetadata_RoundTrip(t *testing.T) {
 		t.Fatalf("unmarshal error: %v", err)
 	}
 
-	if decoded.Source != original.Source || decoded.SessionID != original.SessionID || decoded.DreamVersion != original.DreamVersion || decoded.CaptureReason != original.CaptureReason || decoded.QualityScore != original.QualityScore {
+	if decoded.Source != original.Source || decoded.SessionID != original.SessionID || decoded.DreamVersion != original.DreamVersion || decoded.CaptureReason != original.CaptureReason || decoded.QualityScore != original.QualityScore || decoded.PreferenceScope != original.PreferenceScope {
 		t.Errorf("round-trip scalar mismatch:\n  original: %+v\n  decoded:  %+v", original, decoded)
 	}
 	if len(decoded.Consolidated) != len(original.Consolidated) {
@@ -132,10 +140,11 @@ func TestMemoryMetadata_ParseMetadata_DirectType(t *testing.T) {
 
 func TestMemoryMetadata_ParseMetadata_FromMap(t *testing.T) {
 	v := map[string]any{
-		"source":         "auto_capture",
-		"session_id":     "s1",
-		"quality_score":  0.75,
-		"consolidated":   []any{"c1", "c2"},
+		"source":           "auto_capture",
+		"session_id":       "s1",
+		"quality_score":    0.75,
+		"consolidated":     []any{"c1", "c2"},
+		"preference_scope": PreferenceScopeTeam,
 	}
 	m := ParseMetadata(v)
 	if m.Source != "auto_capture" {
@@ -149,6 +158,9 @@ func TestMemoryMetadata_ParseMetadata_FromMap(t *testing.T) {
 	}
 	if len(m.Consolidated) != 2 {
 		t.Errorf("expected 2 consolidated IDs, got %d", len(m.Consolidated))
+	}
+	if m.PreferenceScope != PreferenceScopeTeam {
+		t.Errorf("expected PreferenceScope=team, got %q", m.PreferenceScope)
 	}
 }
 
@@ -172,5 +184,44 @@ func TestMemoryMetadata_ToAny_NonEmpty(t *testing.T) {
 	}
 	if typed.Source != "user" {
 		t.Errorf("expected Source=user, got %q", typed.Source)
+	}
+}
+
+func TestWithPreferenceScope_DefaultsPreferenceToUser(t *testing.T) {
+	metadata := WithPreferenceScope(nil, "preference", "")
+	m := ParseMetadata(metadata)
+	if m.PreferenceScope != PreferenceScopeUser {
+		t.Fatalf("expected default preference scope %q, got %q", PreferenceScopeUser, m.PreferenceScope)
+	}
+}
+
+func TestWithPreferenceScope_ExplicitScopes(t *testing.T) {
+	for _, scope := range []string{PreferenceScopeUser, PreferenceScopeProject, PreferenceScopeTeam} {
+		metadata := WithPreferenceScope(nil, "preference", scope)
+		m := ParseMetadata(metadata)
+		if m.PreferenceScope != scope {
+			t.Fatalf("expected preference scope %q, got %q", scope, m.PreferenceScope)
+		}
+	}
+}
+
+func TestWithPreferenceScope_IgnoresNonPreference(t *testing.T) {
+	metadata := WithPreferenceScope(nil, "decision", PreferenceScopeTeam)
+	if metadata != nil {
+		t.Fatalf("expected non-preference metadata to remain nil, got %#v", metadata)
+	}
+}
+
+func TestWithPreferenceScope_ClearsStalePreferenceScopeForNonPreference(t *testing.T) {
+	metadata := WithPreferenceScope(MemoryMetadata{
+		Source:          "import",
+		PreferenceScope: PreferenceScopeTeam,
+	}.ToAny(), "decision", "")
+	m := ParseMetadata(metadata)
+	if m.Source != "import" {
+		t.Fatalf("expected non-scope metadata to be preserved, got source %q", m.Source)
+	}
+	if m.PreferenceScope != "" {
+		t.Fatalf("expected stale preference scope to be cleared, got %q", m.PreferenceScope)
 	}
 }

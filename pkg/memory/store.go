@@ -38,9 +38,9 @@ type SearchOptions struct {
 }
 
 type ListOptions struct {
-	Limit     int
-	Offset    int
-	Category  string
+	Limit    int
+	Offset   int
+	Category string
 	// Categories lets callers filter on multiple categories with one query.
 	// When non-empty, takes precedence over Category. Use it for L0 context
 	// builders that want decision/learning/plan/preference/fact in one shot.
@@ -61,6 +61,9 @@ type SaveOptions struct {
 	SourceID  *string
 	CWD       string
 	SkipEmbed bool
+	// PreferenceScope is used only when Category is "preference".
+	// Empty defaults to "user" so inferred preferences remain local/personal by default.
+	PreferenceScope string
 }
 
 type DeleteScopeOptions struct {
