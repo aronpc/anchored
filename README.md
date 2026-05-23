@@ -23,7 +23,14 @@ For team-shared project memory, the planned self-hosted/open distribution lives 
 - **Sandbox tools** — `anchored_execute`/`anchored_execute_file` run code in 11 languages with stdout-only capture, hardened env, FILE_PATH/FILE_CONTENT injection
 - **Knowledge indexing** — `anchored_fetch_and_index` mirrors URLs to a local FTS5 store; sandbox keeps raw data out of context
 - **Background auto-updater** — checks GitHub releases on startup; new binary atomically replaced, current process unaffected
-- **Credential redaction** — regex-based secret sanitization before storage
+- **Credential redaction** — regex-based secret sanitization with configurable custom patterns
+- **Preference scopes** — `user`/`project`/`team` scope metadata on preferences (defaults to `user`)
+- **Stable project identity** — git remote URL derived `RemoteKey` (SHA-256) for cross-machine consistency
+- **Remote safety filter** — detects local paths, secrets, and personal preferences in outbound content
+- **Sync-ready schema** — dirty flags, sync origin, author, remote project key columns and `sync_state` table
+- **Memory inspection** — `inspect` for full JSON details, `export` with filters (JSON/JSONL)
+- **Remote preview** — classify memories as syncable/blocked/needs-review without network access
+- **Dream review** — apply individual dream actions, dedup soft-deletes, contradictions require manual review
 - **Multi-source import** — Claude Code (JSONL), OpenCode (SQLite), Cursor (.mdc rules), DevClaw
 - **Team sync ready** — design work for self-hosted and cloud-compatible shared project memory lives in `docs/team-sync.md` and the sibling `anchored_oss` repo
 
@@ -108,6 +115,12 @@ anchored identity [edit]    View or edit identity file
 anchored config [show|set|wizard] View or modify configuration
 
 anchored dream              Analyze and consolidate duplicate memories
+anchored dream --apply <action-id>  Apply a single dream action
+anchored inspect <id>       Show full memory details (JSON)
+anchored export [--project] [--category] [--source] [--include-deleted] [--format json|jsonl] [--output]
+                           Export memories (embeddings excluded)
+anchored remote status      Show remote sync configuration (offline)
+anchored remote preview     Preview what would sync — syncable/blocked/needs-review (offline)
 anchored precompact         Pre-compact memory context
 anchored hook <subcommand>  Run session continuity hooks
 anchored purge              Wipe memories (--hard for full DB reset with backup)
@@ -150,7 +163,8 @@ Import sources: `claude-code` `devclaw` `opencode` `cursor` `all`
 - **Topic change detection** — identifies conversation shifts and increases retrieval diversity
 - **Memory stack** — L0 identity + L1 essential stories + L2 on-demand, budget-enforced
 - **Knowledge graph** — bitemporal triples with functional predicates and alias resolution, auto-extracted from memory text
-- **Credential redaction** — regex-based secret sanitization before storage
+- **Credential redaction** — regex-based secret sanitization with configurable custom patterns
+- **Observer hooks** — `MemoryObserver` interface for save/update/delete side effects (sync, audit)
 
 ## Storage
 

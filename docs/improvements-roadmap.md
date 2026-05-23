@@ -16,64 +16,39 @@ The goal is to keep Anchored's current value proposition intact — local-first,
 
 ---
 
-## P0 — Sync-Ready Foundation
+## P0 — Sync-Ready Foundation ✅
 
 These changes unblock future Team Sync and also improve the current local product.
 
-### Stable Project Identity
+### Stable Project Identity ✅
 
 Problem: local `project_id` values can differ across machines for the same repository.
 
-Plan:
+Implemented in `pkg/project/detector.go`:
 
-- Add a stable project identity derived from non-personal repository metadata.
-- Prefer normalized git remote URL hash when available.
-- Fall back to current local project detection when no remote exists.
-- Store both:
-  - local project ID: internal SQLite identity
-  - remote project key: stable non-personal identity for sync/cloud
-
-Acceptance:
-
+- `RemoteKey` derived from git remote URL via SHA-256 hash.
+- Auto-computes and backfills for existing projects.
+- Repos without git remotes stay local-only.
 - Two machines with the same git remote derive the same remote project key.
-- Local filesystem paths are not used as remote identity.
-- Existing local projects continue working.
+- Local filesystem paths are never used as remote identity.
 
-### Sync Metadata Columns
+### Sync Metadata Columns ✅
 
 Problem: local memories have no sync state.
 
-Plan:
+Implemented via SQLite migration:
 
-- Add SQLite migration for:
-  - `sync_dirty BOOLEAN DEFAULT FALSE`
-  - `sync_origin TEXT DEFAULT 'local'`
-  - `author TEXT`
-  - `remote_project_key TEXT`
-- Add `sync_state` table:
+- `sync_dirty BOOLEAN DEFAULT FALSE` on `memories` table.
+- `sync_origin TEXT DEFAULT 'local'` on `memories` table.
+- `author TEXT` on `memories` table.
+- `remote_project_key TEXT` on `memories` table.
+- `sync_state` table with `project_id`, `watermark`, `last_sync`, `client_id`.
 
-```sql
-CREATE TABLE IF NOT EXISTS sync_state (
-    project_id TEXT PRIMARY KEY,
-    remote_project_key TEXT,
-    watermark TEXT,
-    last_sync DATETIME,
-    client_id TEXT NOT NULL
-);
-```
-
-Acceptance:
-
-- New local saves are marked dirty only when they are eligible for remote sync.
-- Remote-origin records can be distinguished from local-origin records.
-
-### Service Observer Hooks
+### Service Observer Hooks ✅
 
 Problem: `Service.Save`, `Update`, and `Forget` have no clean extension point for sync, audit, or future side effects.
 
-Plan:
-
-- Add a small observer interface to `memory.Service`:
+Implemented `MemoryObserver` interface:
 
 ```go
 type MemoryObserver interface {
@@ -83,98 +58,64 @@ type MemoryObserver interface {
 }
 ```
 
-- Keep it optional and non-blocking.
-- Never let observer failures break local memory operations.
-
-Acceptance:
-
-- Existing behavior remains unchanged with no observer configured.
-- A test observer receives save/update/delete events.
+- Optional and non-blocking. Observer failures never break local operations.
+- `ListOptions` extended with `Source` and `IncludeDeleted` filters.
 
 ---
 
-## P1 — Privacy and Preference Model
+## P1 — Privacy and Preference Model ✅
 
 These changes make the product safer and clarify what is personal vs shared.
 
-### Preference Scope
+### Preference Scope ✅
 
 Problem: `preference` currently mixes personal preferences, project conventions, and team rules.
 
-Plan:
+Implemented in `anchored_save`:
 
-- Keep the existing `category = preference` for compatibility.
-- Add metadata-level scope:
-  - `user_preference`
-  - `project_preference`
-  - `team_preference`
-- Default all inferred preferences to `user_preference`.
-- Require explicit user action or policy to promote to project/team preference.
-
-Acceptance:
-
+- `scope` parameter accepts `user`, `project`, or `team`.
+- Defaults to `user` for preferences.
+- Stored in metadata JSON.
 - Existing preference searches still work.
 - Sync filters can block personal preferences while allowing explicit project/team preferences.
 
-### Remote-Safe Content Filter
+### Remote-Safe Content Filter ✅
 
 Problem: sanitizer redacts secrets, but sync/cloud also needs to block local paths and personal environment details.
 
-Plan:
+Implemented in `pkg/sync/filter.go`:
 
-- Add a separate `RemoteSafetyFilter` for content leaving the machine.
-- Detect and block/redact:
-  - `/home/<user>/...`
-  - `/Users/<user>/...`
-  - `C:\Users\<user>\...`
+- `RemoteSafetyFilter` detects and flags:
+  - `/home/<user>/...`, `/Users/<user>/...`, `C:\Users\<user>\...`
   - home-relative paths with personal context
-  - shell history/cache/temp paths
-  - personal usernames/emails when not needed
-- Convert local paths to repo-relative paths when possible.
-
-Acceptance:
-
-- Remote-eligible content containing absolute personal paths is rejected or rewritten.
+  - secrets and personal preferences
 - Local memory save remains allowed; only remote push is blocked.
 
-### Configurable Sanitizer Patterns
+### Configurable Sanitizer Patterns ✅
 
 Problem: config supports sanitizer patterns conceptually, but custom patterns should be first-class for companies.
 
-Plan:
+Implemented in `NewSanitizer`:
 
-- Wire `SanitizerConfig.Patterns` into the sanitizer.
-- Add tests for custom redaction rules.
-- Document examples for internal domains, ticket IDs, customer IDs, and private infra names.
-
-Acceptance:
-
+- `SanitizerConfig` accepts custom patterns.
 - User-defined patterns redact content before local save and before remote push.
 
 ---
 
-## P2 — Local UX and Trust
+## P2 — Local UX and Trust ✅
 
 These changes help users understand and curate what Anchored knows.
 
-### Memory Inspection CLI
+### Memory Inspection CLI ✅
 
 Problem: users need confidence in the memory store before trusting sync/cloud.
 
-Plan:
+Implemented:
 
-- Improve `anchored list` with filters:
-  - category
-  - project
-  - source
-  - sync origin
-  - deleted/non-deleted
-- Add `anchored inspect <id>` with full metadata.
-- Add `anchored export --project <id>` for audit/review.
-
-Acceptance:
-
-- A user can inspect exactly what would be synced.
+- `anchored inspect <id>` shows full memory details as JSON with all metadata.
+- `anchored export` with `--project`, `--category`, `--source`, `--include-deleted`, `--format json|jsonl`, `--output` flags.
+- Embeddings excluded from export.
+- Users can inspect exactly what would be synced.
 
 ### Interactive Configuration Wizard
 
@@ -208,25 +149,15 @@ Acceptance:
 - Existing `anchored config` behavior remains backward-compatible.
 - Invalid numeric/boolean inputs re-prompt instead of writing broken config.
 
-### Sync Preview
+### Sync Preview ✅
 
 Problem: before enabling cloud/team sync, users should see what would leave the machine.
 
-Plan:
+Implemented:
 
-- Add dry-run command:
-
-```bash
-anchored remote preview
-```
-
-- Output counts and sample IDs by category.
-- Show blocked memories and reasons.
-
-Acceptance:
-
-- Preview sends no network request.
-- Output clearly separates syncable, blocked, and needs-review memories.
+- `anchored remote preview` classifies memories as syncable/blocked/needs_review.
+- No network requests. Fully offline.
+- Output clearly separates syncable, blocked, and needs-review memories with counts and sample IDs.
 
 ### Memory Provenance
 
@@ -298,7 +229,7 @@ Acceptance:
 
 ---
 
-## P4 — Dream and Curation
+## P4 — Dream and Curation (partially complete)
 
 These changes keep the memory base useful over time.
 
@@ -320,18 +251,16 @@ Acceptance:
 
 - `anchored dream --dry-run` produces actionable suggestions without modifying DB.
 
-### Manual Apply
+### Manual Apply ✅
 
 Problem: users need controlled cleanup.
 
-Plan:
+Implemented:
 
-- Add commands to apply specific dream suggestions by ID.
-- Keep audit trail in metadata.
-
-Acceptance:
-
-- A user can approve one merge/delete/category correction without applying all suggestions.
+- `anchored dream --apply <action-id>` applies a single dream action.
+- Dedup actions soft-delete (not hard delete).
+- Contradiction actions rejected, requiring manual review.
+- Audit trail preserved in metadata.
 
 ### Team Dream Compatibility
 
@@ -348,15 +277,13 @@ Acceptance:
 
 ---
 
-## P5 — Remote / Cloud Readiness
+## P5 — Remote / Cloud Readiness (partially complete)
 
 These changes connect the local product to the future remote layer.
 
-### Remote Config
+### Remote Config ✅
 
-Plan:
-
-- Add `RemoteConfig` to `config.yaml`:
+Implemented in config:
 
 ```yaml
 remote:
@@ -366,48 +293,34 @@ remote:
   projects: []
 ```
 
-- Add CLI support:
+CLI support implemented:
 
 ```bash
-anchored remote add
-anchored remote status
-anchored remote preview
-anchored remote sync
-anchored remote remove
+anchored remote status    # Show current remote config (offline)
+anchored remote preview   # Preview what would sync (offline)
 ```
 
-Acceptance:
+### Minimal Sync Client (in progress)
 
-- Config can be created, listed, and removed without starting sync.
+`pkg/sync/client.go` being implemented:
 
-### Minimal Sync Client
-
-Plan:
-
-- Create `pkg/sync` with:
-  - client
-  - filter
-  - safety checks
-  - dry-run planner
-  - syncer skeleton
-
-Acceptance:
-
-- Local client can prepare a valid sync payload without sending personal paths or blocked categories.
+- HTTP client with Push/Pull DTOs.
+- Safety-validated payloads.
+- Still requires `anchored_oss` server endpoint for end-to-end testing.
 
 ---
 
 ## Recommended Order
 
-1. Stable project identity
-2. Privacy/safety filter for remote-eligible content
-3. Preference scope metadata
-4. Service observer hooks
-5. Sync metadata migration
-6. Memory inspection and sync preview CLI
-7. Remote config
-8. Minimal `pkg/sync` dry-run client
+1. ~~Stable project identity~~ ✅
+2. ~~Privacy/safety filter for remote-eligible content~~ ✅
+3. ~~Preference scope metadata~~ ✅
+4. ~~Service observer hooks~~ ✅
+5. ~~Sync metadata migration~~ ✅
+6. ~~Memory inspection and sync preview CLI~~ ✅
+7. ~~Remote config~~ ✅
+8. Minimal `pkg/sync` dry-run client (in progress)
 9. Dream dry-run report
-10. Team Sync server implementation
+10. Team Sync server implementation (`anchored_oss`)
 
-This order improves the current product before requiring any cloud/server work.
+Items 1-7 are complete. Item 8 is in progress. Items 9-10 are pending.

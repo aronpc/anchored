@@ -594,6 +594,41 @@ Dev A saves a decision on project X
 
 ---
 
+## Local Sync Readiness Status
+
+Summary of what's been implemented locally and what's still pending for `anchored_oss`.
+
+### Implemented (local side)
+
+| Feature | Location | Notes |
+|---|---|---|
+| Preference scope metadata | `anchored_save` accepts `scope` (user/project/team) | Defaults to `user` for preferences. Stored in metadata JSON. |
+| Sanitizer custom patterns | `NewSanitizer` accepts `SanitizerConfig` | Custom redaction rules beyond built-in secret patterns. |
+| Remote safety filter | `pkg/sync/filter.go` `RemoteSafetyFilter` | Detects local paths, secrets, personal preferences in outbound content. |
+| Stable project identity | `pkg/project/detector.go` | `RemoteKey` derived from git remote URL (SHA-256). Auto-computes and backfills. Repos without remotes stay local-only. |
+| Sync metadata columns | SQLite migration | `sync_dirty`, `sync_origin`, `author`, `remote_project_key` on `memories` table. `sync_state` table added. |
+| Service observers | `MemoryObserver` interface | `OnMemorySaved`, `OnMemoryUpdated`, `OnMemoryDeleted` hooks. Non-blocking, optional. |
+| List extensions | `ListOptions` | `Source` and `IncludeDeleted` filters. |
+| Memory inspect CLI | `anchored inspect <id>` | Full JSON output with all metadata. |
+| Memory export CLI | `anchored export` | Filters: --project, --category, --source, --include-deleted. Formats: json, jsonl. Embeddings excluded. |
+| Remote config | `RemoteConfig` in config.yaml | `enabled`, `server_url`, `api_key`, `projects`. |
+| Remote status CLI | `anchored remote status` | Shows current remote config. Offline. |
+| Remote preview CLI | `anchored remote preview` | Classifies memories as syncable/blocked/needs_review. Offline, no network requests. |
+| Dream review improvements | `anchored dream --apply <action-id>` | Apply single actions. Dedup actions soft-delete. Contradictions rejected (manual review required). |
+
+### Pending (requires `anchored_oss`)
+
+| Feature | Dependency | Notes |
+|---|---|---|
+| HTTP sync client (`pkg/sync/client.go`) | `anchored_oss` server endpoint | Push/Pull DTOs and safety-validated payloads in progress. |
+| Background syncer goroutine | `anchored_oss` server endpoint | Periodic push/pull cycle, dirty channel, ticker. |
+| Conflict resolution | `anchored_oss` server endpoint | Last-write-wins based on `updated_at`. |
+| Server deployment | `anchored_oss` repo | Postgres, Docker Compose, API endpoints. |
+| Auth (API keys) | `anchored_oss` server | Invite keys, member management. |
+| Dashboard | `anchored_oss` server | Web UI for project/member management. |
+
+---
+
 ## Decisions Summary
 
 | Decision | Choice | Rationale |
