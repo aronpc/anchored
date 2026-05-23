@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
@@ -91,6 +92,45 @@ func openDebugLogger(configPath string) *debuglog.Logger {
 
 func newFlagSet(name string) *flag.FlagSet {
 	return flag.NewFlagSet(name, flag.ExitOnError)
+}
+
+// reorderArgsForFlag moves all flag arguments before positional arguments.
+// Go's flag.Parse stops at the first non-flag arg, so `cmd "query" --flag`
+// never reaches --flag. This reordering lets flags appear anywhere in the
+// argument list. It inspects the FlagSet to distinguish Bool flags (which
+// don't consume the next arg) from string/int flags (which do).
+func reorderArgsForFlag(fs *flag.FlagSet, args []string) []string {
+	var flagArgs, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			continue
+		}
+		if strings.Contains(a, "=") {
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		f := fs.Lookup(name)
+		_, isBool := f.Value.(boolFlag)
+		if isBool || f == nil {
+			flagArgs = append(flagArgs, a)
+		} else if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			flagArgs = append(flagArgs, a, args[i+1])
+			i++
+		} else {
+			// String/int flag with no explicit value — pass --flag= so
+			// fs.Parse doesn't steal the next arg as the value.
+			flagArgs = append(flagArgs, a+"=")
+		}
+	}
+	return append(flagArgs, positional...)
+}
+
+// boolFlag is implemented by flag.BoolVar values to signal "no value needed".
+type boolFlag interface {
+	IsBoolFlag() bool
 }
 
 func initService(configPath string) (*config.Config, *slog.Logger, *memory.Service, error) {

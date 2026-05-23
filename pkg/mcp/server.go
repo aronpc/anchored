@@ -16,10 +16,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/session"
+	remotesync "github.com/jholhewres/anchored/pkg/sync"
 )
 
 // OptimizerFacade decouples pkg/mcp from pkg/context (which has a !windows build tag).
@@ -90,6 +92,7 @@ type Server struct {
 	kg        *kg.KG
 	sessions  *session.Manager
 	optimizer OptimizerFacade
+	cfg       *config.Config
 	logger    *slog.Logger
 	dlog      *debuglog.Logger
 	version   string
@@ -111,11 +114,11 @@ func (s *Server) resetSearchThrottle() { s.searchCalls.Store(0) }
 // throttling decision derived from it.
 func (s *Server) nextSearchCall() int32 { return s.searchCalls.Add(1) }
 
-func NewServer(mem *memory.Service, kg *kg.KG, sessions *session.Manager, optimizer OptimizerFacade, version string, logger *slog.Logger) *Server {
+func NewServer(mem *memory.Service, kg *kg.KG, sessions *session.Manager, optimizer OptimizerFacade, cfg *config.Config, version string, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{mem: mem, kg: kg, sessions: sessions, optimizer: optimizer, logger: logger, version: version}
+	return &Server{mem: mem, kg: kg, sessions: sessions, optimizer: optimizer, cfg: cfg, logger: logger, version: version}
 }
 
 // SetDebugLogger attaches an optional NDJSON debug logger. When set, every
@@ -625,11 +628,61 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		CWD        string `json:"cwd"`
 		Category   string `json:"category"`
 		MaxResults int    `json:"max_results"`
+		Remote     string `json:"remote"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
 	}
 
+	// Remote search: query remote server instead of local
+	if p.Remote != "" && s.cfg != nil {
+		var entry *config.RemoteEntry
+		if p.Remote == "_" || p.Remote == "default" {
+			entry = s.cfg.ResolveRemote(p.CWD)
+		} else {
+			if e, ok := s.cfg.Remotes[p.Remote]; ok {
+				e.Name = p.Remote
+				entry = &e
+			}
+		}
+		if entry != nil {
+			client := remotesync.NewClientFromEntry(*entry, "mcp")
+			projectID := ""
+			if p.CWD != "" {
+				projectID = s.mem.ResolveProject(p.CWD)
+			}
+			limit := p.MaxResults
+			if limit <= 0 {
+				limit = 10
+			}
+			results, err := client.SearchRemote(ctx, projectID, p.Query, limit)
+			if err != nil {
+				if remotesync.IsRemoteForbidden(err) || remotesync.IsRemoteUnavailable(err) {
+					s.logger.Warn("remote search unavailable, falling back to local", "remote", entry.Name, "error", err)
+				} else {
+					s.logger.Warn("remote search failed, falling back to local", "remote", entry.Name, "error", err)
+				}
+				// Fall through to local search below
+			} else {
+				if len(results) == 0 {
+					return "<anchored_search count=\"0\" remote=\"" + escapeAttr(entry.Name) + "\"/>", nil
+				}
+				var sb strings.Builder
+				fmt.Fprintf(&sb, "<anchored_search query=%q count=%q remote=%q>\n",
+					truncateRunes(p.Query, 200), fmt.Sprintf("%d", len(results)), escapeAttr(entry.Name))
+				for _, r := range results {
+					content := strings.ReplaceAll(r.Content, "\n", " ")
+					content = strings.ReplaceAll(content, "\r", " ")
+					fmt.Fprintf(&sb, "  <hit id=%q category=%q project=%q>%s</hit>\n",
+						r.ID, r.Category, r.ProjectID, escapeText(content))
+				}
+				sb.WriteString("</anchored_search>")
+				return sb.String(), nil
+			}
+		}
+	}
+
+	// Local search (original path, also fallback from remote failure)
 	var projectID, boostProjectID string
 	if p.CWD != "" {
 		projectID = s.mem.ResolveProject(p.CWD)
@@ -688,6 +741,7 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		Category string `json:"category"`
 		CWD      string `json:"cwd"`
 		Scope    string `json:"scope"`
+		Remote   string `json:"remote"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
@@ -708,7 +762,54 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		return "", err
 	}
 
-	return fmt.Sprintf("Saved [%s] memory %s", m.Category, m.ID), nil
+	result := fmt.Sprintf("Saved [%s] memory %s", m.Category, m.ID)
+
+	// Remote save
+	if p.Remote != "" && s.cfg != nil {
+		var entry *config.RemoteEntry
+		if p.Remote == "_" || p.Remote == "default" {
+			entry = s.cfg.ResolveRemote(p.CWD)
+		} else {
+			if e, ok := s.cfg.Remotes[p.Remote]; ok {
+				e.Name = p.Remote
+				entry = &e
+			}
+		}
+		if entry == nil {
+			result += " (remote: no remote configured, skipped)"
+		} else {
+			client := remotesync.NewClientFromEntry(*entry, "mcp")
+			projectID := ""
+			if m.ProjectID != nil {
+				projectID = *m.ProjectID
+			}
+			if projectID == "" {
+				projectID = s.mem.ResolveProject(p.CWD)
+			}
+			remoteMem := remotesync.RemoteMemory{
+				ID:        m.ID,
+				Category:  m.Category,
+				Content:   m.Content,
+				Source:    "mcp",
+				ProjectID: projectID,
+			}
+			resp, err := client.SaveRemote(ctx, remoteMem)
+			if err != nil {
+				if remotesync.IsRemoteForbidden(err) || remotesync.IsRemoteUnavailable(err) {
+					result += fmt.Sprintf(" (remote: unavailable, local save preserved)")
+				} else {
+					result += fmt.Sprintf(" (remote: %v)", err)
+				}
+			} else {
+				result += fmt.Sprintf(" (remote: saved to %s)", entry.Name)
+				if !resp.Created {
+					result += " [updated existing]"
+				}
+			}
+		}
+	}
+
+	return result, nil
 }
 
 func (s *Server) toolList(ctx context.Context, args json.RawMessage) (string, error) {

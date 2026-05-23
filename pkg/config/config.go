@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"path"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,6 +21,8 @@ type Config struct {
 	Debug           DebugConfig           `yaml:"debug"`
 	Plugin          PluginConfig          `yaml:"plugin"`
 	Remote          RemoteConfig          `yaml:"remote"`
+	// Remotes maps named remotes. When non-empty, takes precedence over Remote.
+	Remotes map[string]RemoteEntry `yaml:"remotes,omitempty"`
 }
 
 // RemoteConfig controls the remote sync endpoint for team-shared memories.
@@ -31,6 +34,15 @@ type RemoteConfig struct {
 	ServerURL string   `yaml:"server_url"`
 	APIKey    string   `yaml:"api_key"`
 	Projects  []string `yaml:"projects"`
+}
+
+// RemoteEntry is a single named remote server in the remotes map.
+type RemoteEntry struct {
+	Name      string   `yaml:"-"`
+	ServerURL string   `yaml:"server_url"`
+	APIKey    string   `yaml:"api_key"`
+	Default   bool     `yaml:"default,omitempty"`
+	Projects  []string `yaml:"projects,omitempty"`
 }
 
 // PluginConfig controls how anchored handles drift between the binary version
@@ -183,6 +195,8 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
+	cfg.migrateRemotes()
+
 	return expandPaths(cfg), nil
 }
 
@@ -206,6 +220,50 @@ func expandHome(path, home string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+func (c *Config) migrateRemotes() {
+	if len(c.Remotes) > 0 {
+		for name, entry := range c.Remotes {
+			entry.Name = name
+			c.Remotes[name] = entry
+		}
+		return
+	}
+	if c.Remote.ServerURL != "" {
+		c.Remotes = map[string]RemoteEntry{
+			"default": {
+				Name:      "default",
+				ServerURL: c.Remote.ServerURL,
+				APIKey:    c.Remote.APIKey,
+				Default:   true,
+				Projects:  c.Remote.Projects,
+			},
+		}
+	}
+}
+
+func (c *Config) ResolveRemote(projectPath string) *RemoteEntry {
+	for name, entry := range c.Remotes {
+		for _, pattern := range entry.Projects {
+			if globMatch(pattern, projectPath) {
+				entry.Name = name
+				return &entry
+			}
+		}
+	}
+	for name, entry := range c.Remotes {
+		if entry.Default {
+			entry.Name = name
+			return &entry
+		}
+	}
+	return nil
+}
+
+func globMatch(pattern, s string) bool {
+	matched, _ := path.Match(pattern, s)
+	return matched
 }
 
 func EnsureDirs(cfg *Config) error {

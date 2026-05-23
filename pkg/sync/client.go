@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,23 +37,84 @@ func NewClient(cfg config.RemoteConfig, clientID string) *Client {
 	}
 }
 
+// HTTPError represents a non-2xx response from the sync server.
+type HTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("sync server returned %d: %s", e.Status, e.Body)
+}
+
+type RemoteError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *RemoteError) Error() string {
+	return fmt.Sprintf("remote server returned %d: %s", e.StatusCode, e.Body)
+}
+
+func IsRemoteForbidden(err error) bool {
+	var re *RemoteError
+	return errors.As(err, &re) && re.StatusCode == http.StatusForbidden
+}
+
+func IsRemoteUnavailable(err error) bool {
+	var re *RemoteError
+	return errors.As(err, &re) && re.StatusCode >= http.StatusInternalServerError
+}
+
+func NewClientFromEntry(entry config.RemoteEntry, clientID string) *Client {
+	return &Client{
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		serverURL:  entry.ServerURL,
+		apiKey:     entry.APIKey,
+		clientID:   clientID,
+	}
+}
+
 // Push sends classified memories to the remote server.
-// All memories are validated through RemoteSafetyFilter before sending.
-// Any memory that would be blocked is rejected locally with a clear error.
-// The caller MUST run ClassifyForPreview first and only push syncable memories.
+// All memories are validated through RemoteSafetyFilter before sending using
+// the same projectRoot the caller used for preview, so a memory classified as
+// syncable cannot be silently re-blocked here. Personal preferences
+// (PreferenceScope=="user") are rejected as a defense-in-depth net even if
+// the caller forgot to pre-filter them.
+//
+// The caller SHOULD run ClassifyForPreview first and only push syncable
+// memories; this method is the last line of defense.
 func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushResponse, error) {
-	// Validate all memories through RemoteSafetyFilter before sending.
 	filtered := make([]SyncMemory, 0, len(req.Memories))
 	var rejections []string
 	for i := range req.Memories {
-		m := &req.Memories[i]
-		result := RemoteSafetyFilter(m.Content, nil, "")
+		m := req.Memories[i]
+
+		if m.PreferenceScope == "user" {
+			rejections = append(rejections, fmt.Sprintf("memory %s blocked: personal_preference", m.ID))
+			continue
+		}
+
+		result := RemoteSafetyFilter(m.Content, nil, req.ProjectRoot)
 		if result.Blocked {
 			rejections = append(rejections, fmt.Sprintf("memory %s blocked: %s", m.ID, violationReason(result.Violations)))
 			continue
 		}
-		filtered = append(filtered, *m)
+		// Always send the rewritten (safe) content, never the raw one.
+		m.Content = result.Content
+		filtered = append(filtered, m)
 	}
+
+	// Short-circuit when nothing survives the local filter — no point spending
+	// a network round-trip and an auth token to push zero memories.
+	if len(filtered) == 0 {
+		return &SyncPushResponse{
+			Accepted: 0,
+			Rejected: len(rejections),
+			Errors:   rejections,
+		}, nil
+	}
+
 	req.Memories = filtered
 
 	body, err := json.Marshal(req)
@@ -68,7 +130,7 @@ func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushRespon
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("push failed (%d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("push failed: %w", &HTTPError{Status: resp.StatusCode, Body: string(respBody)})
 	}
 
 	var pushResp SyncPushResponse
@@ -76,7 +138,6 @@ func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushRespon
 		return nil, fmt.Errorf("decode push response: %w", err)
 	}
 
-	// Merge local rejections into server response.
 	if len(rejections) > 0 {
 		pushResp.Rejected += len(rejections)
 		pushResp.Errors = append(pushResp.Errors, rejections...)
@@ -101,7 +162,7 @@ func (c *Client) Pull(ctx context.Context, req SyncPullRequest) (*SyncPullRespon
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("pull failed (%d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("pull failed: %w", &HTTPError{Status: resp.StatusCode, Body: string(respBody)})
 	}
 
 	var pullResp SyncPullResponse
@@ -112,10 +173,93 @@ func (c *Client) Pull(ctx context.Context, req SyncPullRequest) (*SyncPullRespon
 	return &pullResp, nil
 }
 
-// Preview is a local-only operation that classifies memories for sync.
-// It does NOT make any network request.
-func (c *Client) Preview(memories []Memory, projectRoot string) PreviewResult {
-	return ClassifyForPreview(memories, projectRoot)
+func (c *Client) SaveRemote(ctx context.Context, mem RemoteMemory) (*SaveRemoteResponse, error) {
+	filtered := []string{"event", "preference"}
+	for _, blocked := range filtered {
+		if mem.Category == blocked {
+			return nil, fmt.Errorf("category %q blocked for remote save", mem.Category)
+		}
+	}
+
+	result := RemoteSafetyFilter(mem.Content, nil, "")
+	if result.Blocked {
+		return nil, fmt.Errorf("content blocked by safety filter: %s", violationReason(result.Violations))
+	}
+	mem.Content = result.Content
+
+	body, err := json.Marshal(mem)
+	if err != nil {
+		return nil, fmt.Errorf("marshal save request: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, "/v1/memories", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("save request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return nil, &RemoteError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+	if resp.StatusCode >= 400 {
+		return nil, &RemoteError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+
+	var saveResp SaveRemoteResponse
+	if err := json.Unmarshal(respBody, &saveResp); err != nil {
+		return nil, fmt.Errorf("decode save response: %w", err)
+	}
+
+	return &saveResp, nil
+}
+
+func (c *Client) SearchRemote(ctx context.Context, projectID string, query string, limit int) ([]RemoteSearchResult, error) {
+	url := fmt.Sprintf("/v1/memories/search?project_id=%s&q=%s&limit=%d",
+		urlQueryEscape(projectID),
+		urlQueryEscape(query),
+		limit,
+	)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("search request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return nil, &RemoteError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+	if resp.StatusCode >= 400 {
+		return nil, &RemoteError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+
+	var results []RemoteSearchResult
+	if err := json.Unmarshal(respBody, &results); err != nil {
+		return nil, fmt.Errorf("decode search response: %w", err)
+	}
+
+	return results, nil
+}
+
+func urlQueryEscape(s string) string {
+	var buf bytes.Buffer
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if isURLSafe(c) {
+			buf.WriteByte(c)
+		} else {
+			fmt.Fprintf(&buf, "%%%02X", c)
+		}
+	}
+	return buf.String()
+}
+
+func isURLSafe(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~'
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body io.Reader) (*http.Response, error) {
@@ -124,7 +268,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body io.Rea
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	return c.httpClient.Do(req)
 }

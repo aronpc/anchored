@@ -47,6 +47,10 @@ func ToolDefinitions() []Tool {
 						"type":        "integer",
 						"description": "Maximum results to return (default: 20)",
 					},
+					"remote": map[string]any{
+						"type":        "string",
+						"description": "Search on remote server instead of local. Pass empty string for default remote, or a named remote. Falls back to local on error.",
+					},
 				},
 				"required": []string{"query"},
 			},
@@ -74,6 +78,10 @@ func ToolDefinitions() []Tool {
 						"type":        "string",
 						"description": "Optional scope for category=preference. Defaults to user. Use project for project conventions; use team only when explicitly shared.",
 						"enum":        []string{"user", "project", "team"},
+					},
+					"remote": map[string]any{
+						"type":        "string",
+						"description": "Also save to remote server. Pass empty string for default remote, or a named remote. Falls back gracefully on remote error — local save always succeeds.",
 					},
 				},
 				"required": []string{"content", "category"},

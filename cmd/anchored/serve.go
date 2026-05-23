@@ -90,7 +90,7 @@ func serveSTDIO(ctx context.Context, memSvc *memory.Service, cfg *config.Config,
 		defer optimizer.Close()
 	}
 
-	server := mcp.NewServer(memSvc, kgSvc, sessionMgr, optimizer, Version, logFn)
+	server := mcp.NewServer(memSvc, kgSvc, sessionMgr, optimizer, cfg, Version, logFn)
 
 	// Optional NDJSON event log for post-mortem analysis. No-op when
 	// debug.enabled is false (the default) and ANCHORED_DEBUG isn't set.
