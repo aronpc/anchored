@@ -12,10 +12,12 @@ import (
 	"github.com/jholhewres/anchored/pkg/memory"
 )
 
-func runPrecompact(args []string) {
-	fs := newFlagSet("precompact")
+func runHandoff(args []string) {
+	fs := newFlagSet("handoff")
 	cwd := fs.String("cwd", "", "current working directory for project detection")
 	configPath := fs.String("config", "", "path to config file")
+	scope := fs.String("scope", "project", "scope: project, team, user")
+	ttlHours := fs.Int("ttl", 48, "hours until handoff expires")
 	fs.Parse(args)
 
 	content, err := io.ReadAll(os.Stdin)
@@ -26,8 +28,13 @@ func runPrecompact(args []string) {
 
 	text := strings.TrimSpace(string(content))
 	if text == "" {
-		fmt.Println("No content to capture.")
+		fmt.Println("No content to capture for handoff.")
 		return
+	}
+
+	if *ttlHours < 1 {
+		fmt.Fprintln(os.Stderr, "ttl must be at least 1 hour")
+		os.Exit(1)
 	}
 
 	_, _, svc, err := initService(*configPath)
@@ -42,25 +49,21 @@ func runPrecompact(args []string) {
 		cwdVal = "."
 	}
 
-	projectID := svc.ResolveProject(cwdVal)
-	expiresAt := time.Now().Add(14 * 24 * time.Hour).Format(time.RFC3339)
-	scope := memory.ScopeProject
-	if projectID == "" {
-		scope = memory.ScopeUser
-	}
-	precompactMeta := memory.PreCompactMetadata(scope, expiresAt)
+	expiresAt := time.Now().Add(time.Duration(*ttlHours) * time.Hour).Format(time.RFC3339)
+	meta := memory.HandoffMetadata(*scope, expiresAt)
 
 	m, err := svc.SaveWithOptions(context.Background(), memory.SaveOptions{
 		Content:   text,
 		Category:  "summary",
-		Source:    "precompact",
+		Source:    "handoff",
 		CWD:       cwdVal,
-		Metadata:  precompactMeta.ToAny(),
+		Metadata:  meta.ToAny(),
 	})
 	if err != nil {
-		slog.Error("failed to save precompact memory", "error", err)
+		slog.Error("failed to save handoff", "error", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Pre-compact context saved [%s] memory %s (%d bytes)\n", m.Category, m.ID, len(text))
+	fmt.Printf("Handoff saved [%s] memory %s (scope=%s, ttl=%dh, %d bytes)\n",
+		m.Category, m.ID, *scope, *ttlHours, len(text))
 }
