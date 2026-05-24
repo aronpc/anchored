@@ -185,3 +185,112 @@ func TestClassifyForPreview_Empty(t *testing.T) {
 		t.Errorf("expected no items, got %d", len(result.Items))
 	}
 }
+
+func TestClassifyForPreview_V2EpisodicBlocked(t *testing.T) {
+	memories := []Memory{
+		{
+			ID:       "e1",
+			Category: "event",
+			Content:  "deployed v2 today",
+			Source:   "user",
+			Metadata: map[string]any{"memory_type": "episodic"},
+		},
+	}
+	result := ClassifyForPreview(memories, "")
+	if result.Blocked != 1 {
+		t.Errorf("expected Blocked=1 for episodic, got %d", result.Blocked)
+	}
+	if len(result.Items) == 0 || result.Items[0].Reason != "episodic_local_only" {
+		t.Errorf("expected reason=episodic_local_only, got %q", result.Items[0].Reason)
+	}
+}
+
+func TestClassifyForPreview_V2PrecompactBlocked(t *testing.T) {
+	memories := []Memory{
+		{
+			ID:       "pc1",
+			Category: "summary",
+			Content:  "precompact snapshot",
+			Source:   "precompact_hook",
+			Metadata: map[string]any{"memory_type": "operational", "kind": "precompact", "origin": "precompact"},
+		},
+	}
+	result := ClassifyForPreview(memories, "")
+	if result.Blocked != 1 {
+		t.Errorf("expected Blocked=1 for precompact, got %d", result.Blocked)
+	}
+	if len(result.Items) == 0 || result.Items[0].Reason != "precompact_local_only" {
+		t.Errorf("expected reason=precompact_local_only, got %q", result.Items[0].Reason)
+	}
+}
+
+func TestClassifyForPreview_V2UserScopeBlocked(t *testing.T) {
+	memories := []Memory{
+		{
+			ID:       "u1",
+			Category: "fact",
+			Content:  "personal fact",
+			Source:   "user",
+			Metadata: map[string]any{"memory_type": "semantic", "scope": "user"},
+		},
+	}
+	result := ClassifyForPreview(memories, "")
+	if result.Blocked != 1 {
+		t.Errorf("expected Blocked=1 for user-scope, got %d (syncable=%d, needs_review=%d)", result.Blocked, result.Syncable, result.NeedsReview)
+	}
+	if len(result.Items) == 0 {
+		t.Fatal("expected at least one item")
+	}
+	reason := result.Items[0].Reason
+	if reason != "user_scope_blocked" && reason != "personal_preference" {
+		t.Errorf("expected user_scope_blocked or personal_preference, got %q", reason)
+	}
+}
+
+func TestClassifyForPreview_V2SemanticProjectSyncable(t *testing.T) {
+	memories := []Memory{
+		{
+			ID:       "s1",
+			Category: "decision",
+			Content:  "use Go 1.24 for the project",
+			Source:   "user",
+			Metadata: map[string]any{"memory_type": "semantic", "scope": "project", "origin": "bootstrap"},
+		},
+	}
+	result := ClassifyForPreview(memories, "")
+	if result.Syncable != 1 {
+		t.Errorf("expected Syncable=1 for bootstrap semantic project memory, got %d", result.Syncable)
+	}
+}
+
+func TestClassifyForPreview_V2OperationalBlocked(t *testing.T) {
+	memories := []Memory{
+		{
+			ID:       "o1",
+			Category: "summary",
+			Content:  "operational snapshot",
+			Source:   "user",
+			Metadata: map[string]any{"memory_type": "operational", "kind": "snapshot"},
+		},
+	}
+	result := ClassifyForPreview(memories, "")
+	if result.Blocked != 1 {
+		t.Errorf("expected Blocked=1 for operational non-handoff, got %d", result.Blocked)
+	}
+}
+
+func TestClassifyForPreview_V2DreamSemanticProjectSyncable(t *testing.T) {
+	memories := []Memory{
+		{
+			ID:       "d1",
+			Category: "learning",
+			Content:  "extracted learning from dream",
+			Source:   "dream",
+			Metadata: map[string]any{"memory_type": "semantic", "scope": "project", "origin": "dream"},
+		},
+	}
+	result := ClassifyForPreview(memories, "")
+	if result.Syncable != 1 {
+		t.Errorf("expected Syncable=1 for dream semantic project memory, got %d", result.Syncable)
+	}
+}
