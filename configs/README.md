@@ -21,6 +21,13 @@ The pretooluse hook ensures anchored gets a chance to inject memory context befo
 
 OpenCode does not yet expose a stable `SessionStart` event, so `experimental.chat.system.transform` is used as the surrogate — anchored injects the routing block into the system prompt at session start. `experimental.hook.chat_message` re-injects on every user prompt; `experimental.hook.session_compacting` snapshots before compaction.
 
+## Antigravity (agy)
+
+1. Merge [`agy/mcp_config.json`](agy/mcp_config.json) into your `~/.gemini/config/mcp_config.json` (Antigravity 2.0 desktop) or `~/.gemini/antigravity-cli/mcp_config.json` (Antigravity CLI).
+2. Restart Antigravity.
+
+Antigravity does not yet expose a hook system, so the MCP tool descriptions and the `Instructions` field returned in `initialize` steer the model. You may need to ask the agent to "check anchored memory" occasionally.
+
 ## Anything else MCP-compatible
 
 If your tool only supports MCP server registration (no hooks), just register `anchored` as the MCP server and the tool descriptions + the `Instructions` field returned in `initialize` will steer the model. You won't get the SessionStart/UserPromptSubmit reminders, so the model may need a nudge ("check anchored memory") more often.
