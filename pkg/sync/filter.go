@@ -20,6 +20,9 @@ type RemoteSafetyResult struct {
 	Allowed    bool
 	Blocked    bool
 	Violations []RemoteSafetyViolation
+	// Rewritten is true when Content was modified (paths or secrets redacted).
+	// A memory can be both Rewritten and Blocked — rewriting reduces sensitive
+	// content but other violations may still block sync.
 	Rewritten  bool
 }
 
@@ -48,7 +51,7 @@ func RemoteSafetyFilter(content string, metadata map[string]any, projectRoot str
 
 	result.Content, result.Violations = detectLocalPaths(content, projectRoot, result.Violations)
 
-	secretContent, secretViolations := detectSecrets(content)
+	secretContent, secretViolations := detectSecrets(result.Content)
 	if len(secretViolations) > 0 {
 		result.Violations = append(result.Violations, secretViolations...)
 		result.Content = secretContent
@@ -56,6 +59,10 @@ func RemoteSafetyFilter(content string, metadata map[string]any, projectRoot str
 
 	if metadata != nil {
 		result.Violations = detectPersonalPreference(metadata, result.Violations)
+	}
+
+	if result.Content != content {
+		result.Rewritten = true
 	}
 
 	if len(result.Violations) > 0 {

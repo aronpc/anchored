@@ -11,20 +11,29 @@ func ClassifyForPreview(memories []Memory, projectRoot string) PreviewResult {
 
 		meta := toMap(m.Metadata)
 		filterResult := RemoteSafetyFilter(m.Content, meta, projectRoot)
+		// Propagate the safe (rewritten) content so downstream callers
+		// that push item.Memory don't re-leak the original local paths.
+		item.Memory.Content = filterResult.Content
 
-		if filterResult.Blocked {
+		scope := m.PreferenceScope
+		if scope == "" {
+			scope = preferenceScope(meta)
+		}
+
+		switch {
+		case filterResult.Blocked:
 			item.Classification = ClassificationBlocked
 			item.Reason = violationReason(filterResult.Violations)
-		} else if m.SyncOrigin != "" && m.SyncOrigin != "local" {
+		case m.SyncOrigin != "" && m.SyncOrigin != "local":
 			item.Classification = ClassificationNeedsReview
 			item.Reason = "already_synced"
-		} else if m.SyncDirty {
+		case m.SyncDirty:
 			item.Classification = ClassificationNeedsReview
 			item.Reason = "pending_changes"
-		} else if scope := preferenceScope(meta); scope == "user" {
+		case scope == "user":
 			item.Classification = ClassificationBlocked
 			item.Reason = "personal_preference"
-		} else {
+		default:
 			item.Classification = ClassificationSyncable
 			item.Reason = ""
 		}
