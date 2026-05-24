@@ -15,7 +15,12 @@ import (
 func runDoctor(args []string) {
 	fs := newFlagSet("doctor")
 	configPath := fs.String("config", "", "path to config file")
+	cwd := fs.String("cwd", "", "current working directory (for workspace-scoped probes)")
 	fs.Parse(args)
+
+	if *cwd == "" {
+		*cwd = "."
+	}
 
 	fmt.Printf("anchored doctor — diagnostics for v%s\n\n", Version)
 
@@ -30,7 +35,7 @@ func runDoctor(args []string) {
 	checkBinary(home)
 	checkONNX(cfg.Embedding.ModelDir)
 	checkDatabase(cfg.Memory.DatabasePath, cfg.Embedding.Dimensions)
-	checkMCPRegistration(home)
+	checkMCPRegistration(home, *cwd)
 	checkConfig(home, cfg)
 
 	fmt.Println()
@@ -185,8 +190,9 @@ type mcpProbe struct {
 	hint    string
 }
 
-func checkMCPRegistration(home string) {
-	wsVSCode := filepath.Join(".", ".vscode", "mcp.json")
+func checkMCPRegistration(home string, cwd string) {
+	wsVSCode := filepath.Join(cwd, ".vscode", "mcp.json")
+	wsDevin := filepath.Join(cwd, ".devin", "config.json")
 	probes := []mcpProbe{
 		{"Claude Code", filepath.Join(home, ".claude.json"), "user", "claude mcp add -s user anchored anchored"},
 		{"Cursor", filepath.Join(home, ".cursor", "mcp.json"), "user", "anchored init --tool cursor"},
@@ -198,7 +204,7 @@ func checkMCPRegistration(home string) {
 		{"Cline", filepath.Join(home, ".cline", "mcp.json"), "user", "anchored init --tool cline"},
 		{"VS Code Copilot (workspace)", wsVSCode, "workspace", "anchored init --tool vscode"},
 		{"Codex CLI", filepath.Join(home, ".codex", "config.toml"), "user", "anchored init --tool codex"},
-		{"Devin", filepath.Join(".", ".devin", "config.json"), "project", "anchored init --tool devin"},
+		{"Devin", wsDevin, "project", "anchored init --tool devin"},
 	}
 
 	for _, p := range probes {
@@ -214,7 +220,8 @@ func checkMCPRegistration(home string) {
 			continue
 		}
 
-		if hasAnchoredEntry(data) || hasVSCodeAnchoredEntry(data) || hasCodexAnchoredEntry(data) {
+		isTOML := strings.HasSuffix(p.path, ".toml")
+		if hasAnchoredEntry(data) || hasVSCodeAnchoredEntry(data) || (isTOML && hasCodexAnchoredEntry(data)) {
 			printCheck(true, fmt.Sprintf("MCP registered for %s (%s)", p.tool, p.path), "", "")
 		} else {
 			printCheck(false, fmt.Sprintf("MCP registered for %s", p.tool),
