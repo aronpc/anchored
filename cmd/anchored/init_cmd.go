@@ -11,7 +11,8 @@ import (
 
 func runInit(args []string) {
 	fs := newFlagSet("init")
-	tool := fs.String("tool", "all", "Target tool: claude-code, cursor, opencode, agy, gemini, all")
+	tool := fs.String("tool", "all", "Target tool: claude-code, cursor, opencode, agy, gemini, windsurf, cline, vscode, codex, devin, all")
+	cwd := fs.String("cwd", "", "current working directory (used for workspace-scoped tools)")
 	if err := fs.Parse(args); err != nil {
 		fs.Usage()
 		os.Exit(1)
@@ -22,12 +23,17 @@ func runInit(args []string) {
 	setupAnchored()
 	ensureONNXModel()
 
+	cwdVal := *cwd
+	if cwdVal == "" {
+		cwdVal = "."
+	}
+
 	for _, t := range tools {
-		if !isToolInstalled(t) {
+		if !isToolInstalled(t, cwdVal) {
 			slog.Info("tool not installed, skipping", "tool", t)
 			continue
 		}
-		if err := registerMCP(t); err != nil {
+		if err := registerMCP(t, cwdVal); err != nil {
 			slog.Error("failed to register MCP", "tool", t, "error", err)
 		}
 	}
@@ -47,8 +53,18 @@ func parseToolFlag(tool string) []string {
 		return []string{"agy"}
 	case "gemini":
 		return []string{"gemini"}
+	case "windsurf":
+		return []string{"windsurf"}
+	case "cline":
+		return []string{"cline"}
+	case "vscode":
+		return []string{"vscode"}
+	case "codex":
+		return []string{"codex"}
+	case "devin":
+		return []string{"devin"}
 	case "all":
-		return []string{"claude-code", "cursor", "opencode", "agy", "gemini"}
+		return []string{"claude-code", "cursor", "opencode", "agy", "gemini", "windsurf", "cline", "vscode", "codex", "devin"}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown tool: %s\n", tool)
 		os.Exit(1)
@@ -56,45 +72,48 @@ func parseToolFlag(tool string) []string {
 	}
 }
 
-type toolInfo struct {
-	name       string
-	configPath string
-}
-
-func isToolInstalled(t string) bool {
+func isToolInstalled(t string, cwd string) bool {
 	home, _ := os.UserHomeDir()
 	switch t {
 	case "claude-code":
-		// Check for .claude directory or any config file
-		p := filepath.Join(home, ".claude")
-		_, err := os.Stat(p)
+		_, err := os.Stat(filepath.Join(home, ".claude"))
 		return err == nil
 	case "cursor":
-		p := filepath.Join(home, ".cursor")
-		_, err := os.Stat(p)
+		_, err := os.Stat(filepath.Join(home, ".cursor"))
 		return err == nil
 	case "opencode":
-		p1 := filepath.Join(home, ".config", "opencode")
-		p2 := filepath.Join(home, ".local", "share", "opencode")
-		_, err1 := os.Stat(p1)
-		_, err2 := os.Stat(p2)
+		_, err1 := os.Stat(filepath.Join(home, ".config", "opencode"))
+		_, err2 := os.Stat(filepath.Join(home, ".local", "share", "opencode"))
 		return err1 == nil || err2 == nil
 	case "agy":
-		// Antigravity 2.0 desktop config OR Antigravity CLI directory
-		p1 := filepath.Join(home, ".gemini", "config")
-		p2 := filepath.Join(home, ".gemini", "antigravity-cli")
-		_, err1 := os.Stat(p1)
-		_, err2 := os.Stat(p2)
+		_, err1 := os.Stat(filepath.Join(home, ".gemini", "config"))
+		_, err2 := os.Stat(filepath.Join(home, ".gemini", "antigravity-cli"))
 		return err1 == nil || err2 == nil
 	case "gemini":
-		p := filepath.Join(home, ".gemini")
-		_, err := os.Stat(p)
+		_, err := os.Stat(filepath.Join(home, ".gemini"))
 		return err == nil
+	case "windsurf":
+		_, err := os.Stat(filepath.Join(home, ".codeium", "windsurf"))
+		return err == nil
+	case "cline":
+		_, err1 := os.Stat(filepath.Join(home, ".cline"))
+		_, err2 := os.Stat(filepath.Join(cwd, ".cline"))
+		return err1 == nil || err2 == nil
+	case "vscode":
+		_, err := os.Stat(filepath.Join(cwd, ".vscode"))
+		return err == nil
+	case "codex":
+		_, err := os.Stat(filepath.Join(home, ".codex"))
+		return err == nil
+	case "devin":
+		_, err1 := os.Stat(filepath.Join(home, ".devin"))
+		_, err2 := os.Stat(filepath.Join(cwd, ".devin"))
+		return err1 == nil || err2 == nil
 	}
 	return false
 }
 
-func getToolMCPPath(t string) string {
+func getToolMCPPath(t string, cwd string) string {
 	home, _ := os.UserHomeDir()
 	switch t {
 	case "claude-code":
@@ -108,7 +127,6 @@ func getToolMCPPath(t string) string {
 		}
 		return filepath.Join(home, ".local", "share", "opencode", "opencode.json")
 	case "agy":
-		// Prefer Antigravity 2.0 desktop config; fall back to CLI
 		p := filepath.Join(home, ".gemini", "config", "mcp_config.json")
 		if _, err := os.Stat(filepath.Dir(p)); err == nil {
 			return p
@@ -116,17 +134,61 @@ func getToolMCPPath(t string) string {
 		return filepath.Join(home, ".gemini", "antigravity-cli", "mcp_config.json")
 	case "gemini":
 		return filepath.Join(home, ".gemini", "settings.json")
+	case "windsurf":
+		return filepath.Join(home, ".codeium", "windsurf", "mcp_config.json")
+	case "cline":
+		p := filepath.Join(home, ".cline", "mcp.json")
+		if _, err := os.Stat(filepath.Dir(p)); err == nil {
+			return p
+		}
+		return filepath.Join(cwd, ".cline", "mcp.json")
+	case "vscode":
+		return filepath.Join(cwd, ".vscode", "mcp.json")
+	case "codex":
+		return filepath.Join(home, ".codex", "config.toml")
+	case "devin":
+		p := filepath.Join(cwd, ".devin", "config.json")
+		if _, err := os.Stat(filepath.Dir(p)); err == nil {
+			return p
+		}
+		return filepath.Join(home, ".devin", "config.json")
 	}
 	return ""
 }
 
-func registerMCP(t string) error {
-	configPath := getToolMCPPath(t)
+// mcpConfig describes how a tool stores MCP server entries.
+type mcpConfig struct {
+	rootKey     string // "mcpServers" or "servers" (VS Code)
+	requireType bool   // VS Code requires "type": "stdio"
+	isTOML      bool   // Codex uses TOML
+}
+
+func getToolMCPConfig(t string) mcpConfig {
+	switch t {
+	case "vscode":
+		return mcpConfig{rootKey: "servers", requireType: true}
+	case "codex":
+		return mcpConfig{isTOML: true}
+	default:
+		return mcpConfig{rootKey: "mcpServers"}
+	}
+}
+
+func registerMCP(t string, cwd string) error {
+	mc := getToolMCPConfig(t)
+
+	if mc.isTOML {
+		return registerMCPTOML(t, cwd)
+	}
+	return registerMCPJSON(t, cwd, mc)
+}
+
+func registerMCPJSON(t string, cwd string, mc mcpConfig) error {
+	configPath := getToolMCPPath(t, cwd)
 	if configPath == "" {
 		return fmt.Errorf("no config path for %s", t)
 	}
 
-	// Read existing config
 	var cfg map[string]json.RawMessage
 
 	data, err := os.ReadFile(configPath)
@@ -137,7 +199,6 @@ func registerMCP(t string) error {
 			return fmt.Errorf("read %s: %w", configPath, err)
 		}
 	} else if len(strings.TrimSpace(string(data))) == 0 {
-		// Empty file (e.g. Antigravity creates empty mcp_config.json)
 		cfg = make(map[string]json.RawMessage)
 	} else {
 		if err := json.Unmarshal(data, &cfg); err != nil {
@@ -145,8 +206,9 @@ func registerMCP(t string) error {
 		}
 	}
 
-	// Check if already registered
-	if serversRaw, ok := cfg["mcpServers"]; ok {
+	rootKey := mc.rootKey
+
+	if serversRaw, ok := cfg[rootKey]; ok {
 		var servers map[string]json.RawMessage
 		if err := json.Unmarshal(serversRaw, &servers); err == nil {
 			if _, exists := servers["anchored"]; exists {
@@ -156,14 +218,20 @@ func registerMCP(t string) error {
 		}
 	}
 
-	// Build anchored entry
-	anchoredEntry, _ := json.Marshal(map[string]string{
-		"command": "anchored",
-	})
+	var anchoredEntry json.RawMessage
+	if mc.requireType {
+		anchoredEntry, _ = json.Marshal(map[string]string{
+			"type":    "stdio",
+			"command": "anchored",
+		})
+	} else {
+		anchoredEntry, _ = json.Marshal(map[string]string{
+			"command": "anchored",
+		})
+	}
 
-	// Merge mcpServers
 	var servers map[string]json.RawMessage
-	if serversRaw, ok := cfg["mcpServers"]; ok {
+	if serversRaw, ok := cfg[rootKey]; ok {
 		_ = json.Unmarshal(serversRaw, &servers)
 	} else {
 		servers = make(map[string]json.RawMessage)
@@ -171,9 +239,8 @@ func registerMCP(t string) error {
 	servers["anchored"] = anchoredEntry
 
 	serversJSON, _ := json.Marshal(servers)
-	cfg["mcpServers"] = serversJSON
+	cfg[rootKey] = serversJSON
 
-	// Write back
 	dir := filepath.Dir(configPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create dir %s: %w", dir, err)
@@ -189,6 +256,60 @@ func registerMCP(t string) error {
 	}
 
 	if err := os.WriteFile(configPath, append(out, '\n'), 0644); err != nil {
+		return fmt.Errorf("write %s: %w", configPath, err)
+	}
+
+	slog.Info("registered anchored in MCP config", "tool", t, "path", configPath)
+	return nil
+}
+
+func registerMCPTOML(t string, cwd string) error {
+	configPath := getToolMCPPath(t, cwd)
+	if configPath == "" {
+		return fmt.Errorf("no config path for %s", t)
+	}
+
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create dir %s: %w", dir, err)
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", configPath, err)
+	}
+
+	if data != nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.TrimSpace(line) == "[mcp_servers.anchored]" {
+				slog.Info("already registered, skipping", "tool", t)
+				return nil
+			}
+		}
+	}
+
+	entry := `[mcp_servers.anchored]
+command = "anchored"
+enabled = true
+`
+
+	if _, err := os.Stat(configPath); err == nil {
+		_ = os.WriteFile(configPath+".bak", data, 0644)
+	}
+
+	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", configPath, err)
+	}
+	defer f.Close()
+
+	if len(data) > 0 && !strings.HasSuffix(string(data), "\n\n") {
+		if _, err := f.WriteString("\n"); err != nil {
+			return fmt.Errorf("write %s: %w", configPath, err)
+		}
+	}
+
+	if _, err := f.WriteString(entry); err != nil {
 		return fmt.Errorf("write %s: %w", configPath, err)
 	}
 
@@ -233,7 +354,6 @@ func ensureONNXModel() {
 	home, _ := os.UserHomeDir()
 	onnxDir := filepath.Join(home, ".anchored", "data", "onnx")
 
-	// Check if model file exists
 	entries, err := os.ReadDir(onnxDir)
 	if err != nil {
 		if os.IsNotExist(err) {
