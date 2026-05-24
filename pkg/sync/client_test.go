@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -233,27 +234,186 @@ func TestPull_AuthorizationHeader(t *testing.T) {
 	}
 }
 
-func TestClient_Preview(t *testing.T) {
+// Regression: a memory whose only "local path" sits under projectRoot must
+// be classified syncable by the preview AND must not be re-blocked by Push.
+// Before the fix, Push re-applied RemoteSafetyFilter with empty projectRoot
+// and silently dropped these.
+func TestPush_PathUnderProjectRoot_NotReBlocked(t *testing.T) {
+	var receivedMemories []SyncMemory
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body SyncPushRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		receivedMemories = body.Memories
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(SyncPushResponse{Accepted: len(body.Memories)})
+	}))
+	defer srv.Close()
+
+	projectRoot := "/home/alice/myproj"
+	memories := []Memory{
+		{ID: "m1", Category: "fact", Content: "see " + projectRoot + "/foo.go for details", Source: "user"},
+	}
+	preview := ClassifyForPreview(memories, projectRoot)
+	if preview.Syncable != 1 {
+		t.Fatalf("preview should classify as syncable, got %+v", preview)
+	}
+
 	client := &Client{
-		httpClient: &http.Client{},
-		serverURL:  "https://example.com",
+		httpClient: srv.Client(),
+		serverURL:  srv.URL,
+		apiKey:     "key",
+		clientID:   "test-client",
+	}
+
+	resp, err := client.Push(context.Background(), SyncPushRequest{
+		ClientID:    "test-client",
+		ProjectID:   "proj-1",
+		ProjectRoot: projectRoot,
+		Memories: []SyncMemory{
+			{ID: "m1", Category: "fact", Content: preview.Items[0].Memory.Content, Source: "user"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if resp.Accepted != 1 {
+		t.Fatalf("expected 1 accepted, got %d (rejected=%d errors=%v)", resp.Accepted, resp.Rejected, resp.Errors)
+	}
+	if len(receivedMemories) != 1 {
+		t.Fatalf("expected 1 memory in body, got %d", len(receivedMemories))
+	}
+	if got := receivedMemories[0].Content; got == memories[0].Content {
+		t.Errorf("expected rewritten content, got raw: %q", got)
+	}
+}
+
+// Defense in depth: even if the caller forgets to filter scope=user,
+// Push must not forward it to the server.
+func TestPush_PersonalPreferenceRejectedAtPush(t *testing.T) {
+	var receivedMemories []SyncMemory
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body SyncPushRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		receivedMemories = body.Memories
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(SyncPushResponse{Accepted: 0})
+	}))
+	defer srv.Close()
+
+	client := &Client{
+		httpClient: srv.Client(),
+		serverURL:  srv.URL,
 		apiKey:     "key",
 		clientID:   "test",
 	}
 
-	memories := []Memory{
-		{ID: "m1", Category: "fact", Content: "clean content", Source: "user"},
-		{ID: "m2", Category: "fact", Content: "path /home/alice/x", Source: "user"},
+	resp, err := client.Push(context.Background(), SyncPushRequest{
+		ClientID:  "test",
+		ProjectID: "p",
+		Memories: []SyncMemory{
+			{ID: "m1", Category: "preference", Content: "I like dark theme", Source: "user", PreferenceScope: "user"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if resp.Rejected != 1 {
+		t.Fatalf("expected 1 rejected, got %d", resp.Rejected)
+	}
+	if len(receivedMemories) != 0 {
+		t.Errorf("personal preference leaked to server: %d memories", len(receivedMemories))
+	}
+}
+
+// When everything is locally rejected, no HTTP call should happen.
+func TestPush_ShortCircuitsWhenAllBlocked(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(SyncPushResponse{})
+	}))
+	defer srv.Close()
+
+	client := &Client{
+		httpClient: srv.Client(),
+		serverURL:  srv.URL,
+		apiKey:     "k",
+		clientID:   "test",
 	}
 
-	result := client.Preview(memories, "")
-	if result.Total != 2 {
-		t.Errorf("expected Total=2, got %d", result.Total)
+	resp, err := client.Push(context.Background(), SyncPushRequest{
+		ClientID:  "test",
+		ProjectID: "p",
+		Memories: []SyncMemory{
+			{ID: "m1", Category: "fact", Content: "lives at /home/alice/x", Source: "user"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
 	}
-	if result.Syncable != 1 {
-		t.Errorf("expected Syncable=1, got %d", result.Syncable)
+	if hits != 0 {
+		t.Errorf("expected 0 HTTP hits when all rejected, got %d", hits)
 	}
-	if result.Blocked != 1 {
-		t.Errorf("expected Blocked=1, got %d", result.Blocked)
+	if resp.Rejected != 1 || resp.Accepted != 0 {
+		t.Errorf("expected accepted=0 rejected=1, got %+v", resp)
+	}
+}
+
+// When APIKey is empty, no Authorization header should be sent.
+func TestPush_NoAuthHeaderWhenAPIKeyEmpty(t *testing.T) {
+	var receivedAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(SyncPushResponse{Accepted: 1})
+	}))
+	defer srv.Close()
+
+	client := &Client{
+		httpClient: srv.Client(),
+		serverURL:  srv.URL,
+		apiKey:     "",
+		clientID:   "test",
+	}
+
+	_, err := client.Push(context.Background(), SyncPushRequest{
+		ClientID:  "test",
+		ProjectID: "p",
+		Memories: []SyncMemory{
+			{ID: "m1", Category: "fact", Content: "clean", Source: "user"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if receivedAuth != "" {
+		t.Errorf("expected no Authorization header, got %q", receivedAuth)
+	}
+}
+
+func TestPull_ServerError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	client := &Client{
+		httpClient: srv.Client(),
+		serverURL:  srv.URL,
+		apiKey:     "k",
+		clientID:   "test",
+	}
+
+	_, err := client.Pull(context.Background(), SyncPullRequest{ClientID: "test", ProjectID: "p"})
+	if err == nil {
+		t.Fatal("expected error on 5xx")
+	}
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Errorf("expected HTTPError, got %T: %v", err, err)
+	}
+	if httpErr != nil && httpErr.Status != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d", httpErr.Status)
 	}
 }
