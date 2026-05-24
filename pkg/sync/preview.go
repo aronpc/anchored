@@ -1,5 +1,9 @@
 package sync
 
+import (
+	"github.com/jholhewres/anchored/pkg/memory"
+)
+
 func ClassifyForPreview(memories []Memory, projectRoot string) PreviewResult {
 	result := PreviewResult{
 		Total: len(memories),
@@ -11,8 +15,6 @@ func ClassifyForPreview(memories []Memory, projectRoot string) PreviewResult {
 
 		meta := toMap(m.Metadata)
 		filterResult := RemoteSafetyFilter(m.Content, meta, projectRoot)
-		// Propagate the safe (rewritten) content so downstream callers
-		// that push item.Memory don't re-leak the original local paths.
 		item.Memory.Content = filterResult.Content
 
 		scope := m.PreferenceScope
@@ -20,19 +22,46 @@ func ClassifyForPreview(memories []Memory, projectRoot string) PreviewResult {
 			scope = preferenceScope(meta)
 		}
 
+		lifecycle := memory.ParseMetadata(m.Metadata)
+
 		switch {
 		case filterResult.Blocked:
 			item.Classification = ClassificationBlocked
 			item.Reason = violationReason(filterResult.Violations)
+
 		case m.SyncOrigin != "" && m.SyncOrigin != "local":
 			item.Classification = ClassificationNeedsReview
 			item.Reason = "already_synced"
+
 		case m.SyncDirty:
 			item.Classification = ClassificationNeedsReview
 			item.Reason = "pending_changes"
+
+		case lifecycle.MemoryType == memory.MemoryTypeEpisodic:
+			item.Classification = ClassificationBlocked
+			item.Reason = "episodic_local_only"
+		case lifecycle.Kind == "precompact":
+			item.Classification = ClassificationBlocked
+			item.Reason = "precompact_local_only"
+		case lifecycle.Origin == memory.OriginPrecompact:
+			item.Classification = ClassificationBlocked
+			item.Reason = "precompact_origin"
+		case lifecycle.MemoryType == memory.MemoryTypeOperational && lifecycle.Kind != "handoff":
+			item.Classification = ClassificationBlocked
+			item.Reason = "operational_local_only"
+
+		case lifecycle.Scope == memory.ScopeUser:
+			item.Classification = ClassificationBlocked
+			item.Reason = "user_scope_blocked"
+
 		case scope == "user":
 			item.Classification = ClassificationBlocked
 			item.Reason = "personal_preference"
+
+		case lifecycle.IsRemoteSyncCandidate():
+			item.Classification = ClassificationSyncable
+			item.Reason = ""
+
 		default:
 			item.Classification = ClassificationSyncable
 			item.Reason = ""
