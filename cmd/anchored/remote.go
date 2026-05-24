@@ -59,46 +59,27 @@ func runRemotePreview(args []string) {
 	format := fs.String("format", "table", "output format: table or json")
 	fs.Parse(args)
 
-	cfg, _, svc, err := initService(*configPath)
+	_, _, svc, err := initService(*configPath)
 	if err != nil {
 		slog.Error("failed to initialize", "error", err)
 		os.Exit(1)
 	}
 	defer svc.Close()
 
-	_ = cfg
-
 	ctx := context.Background()
-
-	opts := memory.ListOptions{
-		Limit:           10000,
-		IncludeDeleted:  false,
-	}
 
 	projectRoot := *project
 	if projectRoot == "" {
 		projectRoot, _ = os.Getwd()
 	}
 
-	memories, err := svc.List(ctx, opts)
+	memories, err := listAllMemories(ctx, svc)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "list error: %v\n", err)
 		os.Exit(1)
 	}
 
-	syncMemories := make([]sync.Memory, len(memories))
-	for i, m := range memories {
-		syncMemories[i] = sync.Memory{
-			ID:         m.ID,
-			Category:   m.Category,
-			Content:    m.Content,
-			ProjectID:  m.ProjectID,
-			Source:     m.Source,
-			SyncOrigin: m.SyncOrigin,
-			SyncDirty:  m.SyncDirty,
-			Metadata:   m.Metadata,
-		}
-	}
+	syncMemories := toSyncMemories(memories)
 
 	result := sync.ClassifyForPreview(syncMemories, projectRoot)
 
@@ -167,35 +148,18 @@ func runRemoteSync(args []string) {
 
 	ctx := context.Background()
 
-	opts := memory.ListOptions{
-		Limit:          10000,
-		IncludeDeleted: false,
-	}
-
 	projectRoot := *project
 	if projectRoot == "" {
 		projectRoot, _ = os.Getwd()
 	}
 
-	memories, err := svc.List(ctx, opts)
+	memories, err := listAllMemories(ctx, svc)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "list error: %v\n", err)
 		os.Exit(1)
 	}
 
-	syncMemories := make([]sync.Memory, len(memories))
-	for i, m := range memories {
-		syncMemories[i] = sync.Memory{
-			ID:         m.ID,
-			Category:   m.Category,
-			Content:    m.Content,
-			ProjectID:  m.ProjectID,
-			Source:     m.Source,
-			SyncOrigin: m.SyncOrigin,
-			SyncDirty:  m.SyncDirty,
-			Metadata:   m.Metadata,
-		}
-	}
+	syncMemories := toSyncMemories(memories)
 
 	preview := sync.ClassifyForPreview(syncMemories, projectRoot)
 
@@ -221,29 +185,33 @@ func runRemoteSync(args []string) {
 		os.Exit(1)
 	}
 
+	// NewClient only returns nil when cfg.Remote.Enabled is false, which is
+	// guarded above — no nil check needed here.
 	client := sync.NewClient(cfg.Remote, "cli")
-	if client == nil {
-		fmt.Fprintln(os.Stderr, "Failed to create sync client.")
-		os.Exit(1)
-	}
 
 	pushMemories := make([]sync.SyncMemory, 0, preview.Syncable)
 	for _, item := range preview.Items {
 		if item.Classification != sync.ClassificationSyncable {
 			continue
 		}
+		// item.Memory.Content is already path-rewritten by the preview;
+		// PreferenceScope and RemoteProjectKey are carried through so the
+		// server can route per-project and skip personal preferences.
 		pushMemories = append(pushMemories, sync.SyncMemory{
-			ID:       item.Memory.ID,
-			Category: item.Memory.Category,
-			Content:  item.Memory.Content,
-			Source:   item.Memory.Source,
+			ID:               item.Memory.ID,
+			Category:         item.Memory.Category,
+			Content:          item.Memory.Content,
+			Source:           item.Memory.Source,
+			PreferenceScope:  item.Memory.PreferenceScope,
+			RemoteProjectKey: derefString(item.Memory.RemoteProjectKey),
 		})
 	}
 
 	pushReq := sync.SyncPushRequest{
-		ClientID:  "cli",
-		ProjectID: *projectID,
-		Memories:  pushMemories,
+		ClientID:    "cli",
+		ProjectID:   *projectID,
+		Memories:    pushMemories,
+		ProjectRoot: projectRoot,
 	}
 
 	resp, err := client.Push(ctx, pushReq)
@@ -258,4 +226,66 @@ func runRemoteSync(args []string) {
 			fmt.Fprintf(os.Stderr, "  error: %s\n", e)
 		}
 	}
+}
+
+// listAllMemories paginates through every non-deleted memory.
+// Using a fixed Limit caps the result set; without pagination, large stores
+// silently drop rows past the cap.
+func listAllMemories(ctx context.Context, svc *memory.Service) ([]memory.Memory, error) {
+	const pageSize = 1000
+	var all []memory.Memory
+	offset := 0
+	for {
+		page, err := svc.List(ctx, memory.ListOptions{
+			Limit:          pageSize,
+			Offset:         offset,
+			IncludeDeleted: false,
+		})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if len(page) < pageSize {
+			return all, nil
+		}
+		offset += pageSize
+	}
+}
+
+func toSyncMemories(memories []memory.Memory) []sync.Memory {
+	out := make([]sync.Memory, len(memories))
+	for i, m := range memories {
+		out[i] = sync.Memory{
+			ID:               m.ID,
+			Category:         m.Category,
+			Content:          m.Content,
+			ProjectID:        m.ProjectID,
+			Source:           m.Source,
+			SyncOrigin:       m.SyncOrigin,
+			SyncDirty:        m.SyncDirty,
+			RemoteProjectKey: m.RemoteProjectKey,
+			PreferenceScope:  preferenceScopeFromMetadata(m.Metadata),
+			Metadata:         m.Metadata,
+		}
+	}
+	return out
+}
+
+func preferenceScopeFromMetadata(v any) string {
+	switch m := v.(type) {
+	case memory.MemoryMetadata:
+		return m.PreferenceScope
+	case map[string]any:
+		s, _ := m["scope"].(string)
+		return s
+	default:
+		return memory.ParseMetadata(v).PreferenceScope
+	}
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
