@@ -194,7 +194,11 @@ func checkMCPRegistration(home string) {
 		{"Gemini CLI", filepath.Join(home, ".gemini", "settings.json"), "user", "anchored init --tool gemini"},
 		{"Antigravity 2.0", filepath.Join(home, ".gemini", "config", "mcp_config.json"), "user", "anchored init --tool agy"},
 		{"Antigravity CLI (agy)", filepath.Join(home, ".gemini", "antigravity-cli", "mcp_config.json"), "user", "anchored init --tool agy"},
-		{"VS Code Copilot (workspace)", wsVSCode, "workspace", "run from your project root and create .vscode/mcp.json with an 'anchored' entry under mcpServers"},
+		{"Windsurf", filepath.Join(home, ".codeium", "windsurf", "mcp_config.json"), "user", "anchored init --tool windsurf"},
+		{"Cline", filepath.Join(home, ".cline", "mcp.json"), "user", "anchored init --tool cline"},
+		{"VS Code Copilot (workspace)", wsVSCode, "workspace", "anchored init --tool vscode"},
+		{"Codex CLI", filepath.Join(home, ".codex", "config.toml"), "user", "anchored init --tool codex"},
+		{"Devin", filepath.Join(".", ".devin", "config.json"), "project", "anchored init --tool devin"},
 	}
 
 	for _, p := range probes {
@@ -210,7 +214,7 @@ func checkMCPRegistration(home string) {
 			continue
 		}
 
-		if hasAnchoredEntry(data) {
+		if hasAnchoredEntry(data) || hasVSCodeAnchoredEntry(data) || hasCodexAnchoredEntry(data) {
 			printCheck(true, fmt.Sprintf("MCP registered for %s (%s)", p.tool, p.path), "", "")
 		} else {
 			printCheck(false, fmt.Sprintf("MCP registered for %s", p.tool),
@@ -243,6 +247,23 @@ func hasAnchoredEntry(data []byte) bool {
 		}
 	}
 	return false
+}
+
+func hasVSCodeAnchoredEntry(data []byte) bool {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	if servers, ok := raw["servers"].(map[string]any); ok {
+		if _, found := servers["anchored"]; found {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCodexAnchoredEntry(data []byte) bool {
+	return strings.Contains(string(data), "[mcp_servers.anchored]")
 }
 
 func checkConfig(home string, cfg interface{}) {
