@@ -269,3 +269,85 @@ func TestSearch_CrossProject_BackwardCompat(t *testing.T) {
 	}
 	_ = results
 }
+
+func TestApplyLifecycleBoost_Pinned(t *testing.T) {
+	now := time.Now()
+	results := []SearchResult{
+		{Memory: Memory{Metadata: MemoryMetadata{Pinned: true}.ToAny()}, Score: 1.0},
+		{Memory: Memory{Metadata: MemoryMetadata{}.ToAny()}, Score: 1.0},
+	}
+	out := applyLifecycleBoost(results, now)
+	if out[0].Score <= out[1].Score {
+		t.Errorf("pinned should outrank unpinned: pinned=%f, unpinned=%f", out[0].Score, out[1].Score)
+	}
+	if out[0].Score != 1.5 {
+		t.Errorf("pinned boost: got %f, want 1.5", out[0].Score)
+	}
+}
+
+func TestApplyLifecycleBoost_ExpiredOperational(t *testing.T) {
+	now := time.Now()
+	past := now.AddDate(0, 0, -30).Format("2006-01-02T15:04:05Z")
+	meta := MemoryMetadata{MemoryType: MemoryTypeOperational, ExpiresAt: past}.ToAny()
+	results := []SearchResult{
+		{Memory: Memory{Metadata: meta}, Score: 1.0},
+	}
+	out := applyLifecycleBoost(results, now)
+	if out[0].Score >= 1.0 {
+		t.Errorf("expired operational should be penalized: got %f", out[0].Score)
+	}
+}
+
+func TestApplyLifecycleBoost_Superseded(t *testing.T) {
+	now := time.Now()
+	meta := MemoryMetadata{Supersedes: []string{"old-id"}}.ToAny()
+	results := []SearchResult{
+		{Memory: Memory{Metadata: meta}, Score: 1.0},
+	}
+	out := applyLifecycleBoost(results, now)
+	if out[0].Score >= 1.0 {
+		t.Errorf("superseded memory should be penalized: got %f", out[0].Score)
+	}
+}
+
+func TestApplyLifecycleBoost_Clamp(t *testing.T) {
+	now := time.Now()
+	meta := MemoryMetadata{
+		Pinned:      true,
+		Importance:  1.0,
+		Kind:        "decision",
+		MemoryType:  MemoryTypeSemantic,
+		ContextTier: ContextTierL0,
+	}.ToAny()
+	results := []SearchResult{
+		{Memory: Memory{Metadata: meta}, Score: 1.0},
+	}
+	out := applyLifecycleBoost(results, now)
+	if out[0].Score > 10.0 {
+		t.Errorf("score should be clamped at 10.0: got %f", out[0].Score)
+	}
+}
+
+func TestApplyLifecycleBoost_HandoffNotExpired(t *testing.T) {
+	now := time.Now()
+	future := now.AddDate(0, 0, 7).Format("2006-01-02T15:04:05Z")
+	meta := MemoryMetadata{Kind: "handoff", MemoryType: MemoryTypeOperational, ExpiresAt: future}.ToAny()
+	results := []SearchResult{
+		{Memory: Memory{Metadata: meta}, Score: 1.0},
+	}
+	out := applyLifecycleBoost(results, now)
+	if out[0].Score <= 1.0 {
+		t.Errorf("valid handoff should be boosted: got %f", out[0].Score)
+	}
+}
+
+func TestApplyLifecycleBoost_NilMetadata(t *testing.T) {
+	now := time.Now()
+	results := []SearchResult{
+		{Memory: Memory{Metadata: nil}, Score: 1.0},
+	}
+	out := applyLifecycleBoost(results, now)
+	if out[0].Score != 1.0 {
+		t.Errorf("nil metadata should not change score: got %f", out[0].Score)
+	}
+}

@@ -79,6 +79,8 @@ func (h *HybridSearcher) Search(ctx context.Context, query string, opts ...Searc
 
 	fused := h.rrfFuse(vecResults, bm25Results, cfg.VectorWeight, cfg.BM25Weight)
 
+	fused = applyLifecycleBoost(fused, time.Now())
+
 	fused = h.applyTemporalDecay(fused, cfg)
 
 	if searchOpts.BoostProjectID != "" {
@@ -296,6 +298,67 @@ func (h *HybridSearcher) applyProjectBoost(results []SearchResult, projectID str
 			results[i].Score *= boostActive
 		} else if pid == nil || *pid == "" {
 			results[i].Score *= boostGlobal
+		}
+	}
+	return results
+}
+
+func applyLifecycleBoost(results []SearchResult, now time.Time) []SearchResult {
+	for i := range results {
+		meta := ParseMetadata(results[i].Memory.Metadata)
+
+		if meta.Pinned {
+			results[i].Score *= 1.5
+		}
+
+		if meta.Importance > 0 {
+			results[i].Score *= 1.0 + meta.Importance*0.3
+		}
+
+		switch meta.Kind {
+		case "decision", "learning", "rule":
+			results[i].Score *= 1.15
+		case "handoff":
+			if !meta.IsExpired(now) {
+				results[i].Score *= 1.2
+			} else {
+				results[i].Score *= 0.5
+			}
+		case "precompact":
+			if !meta.IsExpired(now) {
+				results[i].Score *= 1.1
+			} else {
+				results[i].Score *= 0.3
+			}
+		}
+
+		if meta.IsSemantic() {
+			results[i].Score *= 1.1
+		}
+		if meta.IsOperational() && meta.IsExpired(now) {
+			results[i].Score *= 0.3
+		}
+		if meta.IsOperational() && !meta.IsExpired(now) {
+			results[i].Score *= 1.05
+		}
+
+		if len(meta.Supersedes) > 0 {
+			results[i].Score *= 0.7
+		}
+
+		if meta.Origin == "bootstrap" && meta.Confidence < 0.5 {
+			results[i].Score *= 0.8
+		}
+
+		if meta.ContextTier == "L0" {
+			results[i].Score *= 1.3
+		} else if meta.ContextTier == "L1" {
+			results[i].Score *= 1.15
+		}
+
+		// Clamp: multiplicative boosts can stack excessively.
+		if results[i].Score > 10.0 {
+			results[i].Score = 10.0
 		}
 	}
 	return results
