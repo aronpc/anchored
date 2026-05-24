@@ -85,7 +85,25 @@ Run `anchored init` to auto-detect and register, or configure manually:
 | Gemini CLI | `~/.gemini/settings.json` |
 | Antigravity 2.0 | `~/.gemini/config/mcp_config.json` |
 | Antigravity CLI (agy) | `~/.gemini/antigravity-cli/mcp_config.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Cline | `~/.cline/mcp.json` |
 | VS Code Copilot | `.vscode/mcp.json` |
+| Codex CLI | `~/.codex/config.toml` |
+| Devin | `.devin/config.json` |
+
+```bash
+# Auto-detect all installed tools
+anchored init
+
+# Specific tool
+anchored init --tool cursor
+anchored init --tool windsurf
+anchored init --tool cline
+anchored init --tool vscode --cwd /path/to/project
+anchored init --tool codex
+```
+
+Most tools use `mcpServers` with the same JSON shape:
 
 ```json
 {
@@ -95,6 +113,27 @@ Run `anchored init` to auto-detect and register, or configure manually:
     }
   }
 }
+```
+
+VS Code Copilot uses `servers` with a required `type` field:
+
+```json
+{
+  "servers": {
+    "anchored": {
+      "type": "stdio",
+      "command": "anchored"
+    }
+  }
+}
+```
+
+Codex CLI uses TOML:
+
+```toml
+[mcp_servers.anchored]
+command = "anchored"
+enabled = true
 ```
 
 ## CLI
