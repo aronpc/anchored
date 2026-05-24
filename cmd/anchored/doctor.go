@@ -192,6 +192,8 @@ func checkMCPRegistration(home string) {
 		{"Cursor", filepath.Join(home, ".cursor", "mcp.json"), "user", "anchored init --tool cursor"},
 		{"OpenCode", filepath.Join(home, ".config", "opencode", "opencode.json"), "user", "anchored init --tool opencode"},
 		{"Gemini CLI", filepath.Join(home, ".gemini", "settings.json"), "user", "anchored init --tool gemini"},
+		{"Antigravity 2.0", filepath.Join(home, ".gemini", "config", "mcp_config.json"), "user", "anchored init --tool agy"},
+		{"Antigravity CLI (agy)", filepath.Join(home, ".gemini", "antigravity-cli", "mcp_config.json"), "user", "anchored init --tool agy"},
 		{"VS Code Copilot (workspace)", wsVSCode, "workspace", "run from your project root and create .vscode/mcp.json with an 'anchored' entry under mcpServers"},
 	}
 

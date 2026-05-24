@@ -278,6 +278,7 @@ func ensureONNXRuntime(paths *ONNXPaths, logger *slog.Logger) error {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 	if goos == "darwin" {
+		goos = "osx" // ONNX Runtime uses "osx" not "darwin" for macOS archives
 		goarch = "x64"
 		if runtime.GOARCH == "arm64" {
 			goarch = "arm64"
@@ -475,7 +476,8 @@ func extractLibFromTgz(tgzPath, destPath string) error {
 		if !strings.Contains(name, "/lib/") {
 			continue
 		}
-		if !strings.HasPrefix(filepath.Base(name), "libonnxruntime.so") {
+		base := filepath.Base(name)
+		if !strings.HasPrefix(base, "libonnxruntime.so") && !strings.HasPrefix(base, "libonnxruntime.dylib") {
 			continue
 		}
 		if hdr.Typeflag != tar.TypeReg {

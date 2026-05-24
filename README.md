@@ -6,7 +6,7 @@
 [![Go](https://img.shields.io/badge/go-1.24+-00ADD8?style=for-the-badge&logo=go)]
 [![Release](https://img.shields.io/github/v/release/jholhewres/anchored?style=for-the-badge)](https://github.com/jholhewres/anchored/releases)
 
-Anchored is a local-first MCP memory server that gives every AI coding agent and IDE you use a shared, persistent memory on your machine. Install once, and Claude Code, Cursor, OpenCode, Gemini CLI, and any other MCP-compatible tool read, write, and search the same knowledge base.
+Anchored is a local-first MCP memory server that gives every AI coding agent and IDE you use a shared, persistent memory on your machine. Install once, and Claude Code, Cursor, OpenCode, Antigravity (agy), Gemini CLI, and any other MCP-compatible tool read, write, and search the same knowledge base.
 
 No API keys. No daemon. All embeddings run locally.
 
@@ -83,6 +83,8 @@ Run `anchored init` to auto-detect and register, or configure manually:
 | Cursor | `~/.cursor/mcp.json` |
 | OpenCode | `~/.config/opencode/opencode.json` |
 | Gemini CLI | `~/.gemini/settings.json` |
+| Antigravity 2.0 | `~/.gemini/config/mcp_config.json` |
+| Antigravity CLI (agy) | `~/.gemini/antigravity-cli/mcp_config.json` |
 | VS Code Copilot | `.vscode/mcp.json` |
 
 ```json

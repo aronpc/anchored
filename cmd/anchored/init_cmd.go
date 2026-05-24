@@ -11,7 +11,7 @@ import (
 
 func runInit(args []string) {
 	fs := newFlagSet("init")
-	tool := fs.String("tool", "all", "Target tool: claude-code, cursor, opencode, all")
+	tool := fs.String("tool", "all", "Target tool: claude-code, cursor, opencode, agy, gemini, all")
 	if err := fs.Parse(args); err != nil {
 		fs.Usage()
 		os.Exit(1)
@@ -43,8 +43,12 @@ func parseToolFlag(tool string) []string {
 		return []string{"cursor"}
 	case "opencode":
 		return []string{"opencode"}
+	case "agy":
+		return []string{"agy"}
+	case "gemini":
+		return []string{"gemini"}
 	case "all":
-		return []string{"claude-code", "cursor", "opencode"}
+		return []string{"claude-code", "cursor", "opencode", "agy"}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown tool: %s\n", tool)
 		os.Exit(1)
@@ -75,6 +79,17 @@ func isToolInstalled(t string) bool {
 		_, err1 := os.Stat(p1)
 		_, err2 := os.Stat(p2)
 		return err1 == nil || err2 == nil
+	case "agy":
+		// Antigravity 2.0 desktop config OR Antigravity CLI directory
+		p1 := filepath.Join(home, ".gemini", "config")
+		p2 := filepath.Join(home, ".gemini", "antigravity-cli")
+		_, err1 := os.Stat(p1)
+		_, err2 := os.Stat(p2)
+		return err1 == nil || err2 == nil
+	case "gemini":
+		p := filepath.Join(home, ".gemini")
+		_, err := os.Stat(p)
+		return err == nil
 	}
 	return false
 }
@@ -92,6 +107,15 @@ func getToolMCPPath(t string) string {
 			return p
 		}
 		return filepath.Join(home, ".local", "share", "opencode", "opencode.json")
+	case "agy":
+		// Prefer Antigravity 2.0 desktop config; fall back to CLI
+		p := filepath.Join(home, ".gemini", "config", "mcp_config.json")
+		if _, err := os.Stat(filepath.Dir(p)); err == nil {
+			return p
+		}
+		return filepath.Join(home, ".gemini", "antigravity-cli", "mcp_config.json")
+	case "gemini":
+		return filepath.Join(home, ".gemini", "settings.json")
 	}
 	return ""
 }
@@ -112,6 +136,9 @@ func registerMCP(t string) error {
 		} else {
 			return fmt.Errorf("read %s: %w", configPath, err)
 		}
+	} else if len(strings.TrimSpace(string(data))) == 0 {
+		// Empty file (e.g. Antigravity creates empty mcp_config.json)
+		cfg = make(map[string]json.RawMessage)
 	} else {
 		if err := json.Unmarshal(data, &cfg); err != nil {
 			return fmt.Errorf("parse %s: %w", configPath, err)
