@@ -4,7 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.4.10] - 2026-05-11
+## [0.5.0] - 2026-05-24
+
+### Added
+
+- **Memory lifecycle v2** — new `MetadataV2` struct with Kind, Scope, MemoryType, Origin, Importance, ContextTier, Pinned, ExpiresAt, Supersedes, Consolidates, Confidence, ContentHash, DreamSource fields. Constructor helpers for semantic, operational, handoff, precompact, bootstrap, and dream metadata. `ParseMetadata`/`ParseMetadataFromJSON` with `Extra` passthrough for unknown keys. `IsExpired`, `IsSemantic`, `IsOperational`, `IsRemoteSyncCandidate` classifiers.
+- **Hybrid search lifecycle boost** — `applyLifecycleBoost` runs before temporal decay so pinned/important items are not penalized before boost. Handles pinned (+1.5×), importance, kind (decision/learning/rule +1.15×, active handoff +1.2×, active precompact +1.1×), semantic (+1.1×), operational expiry, superseded (-0.7×), bootstrap confidence, and context tier (L0 +1.3×, L1 +1.15×). Score clamped at 10.0.
+- **Dream supersede/merge actions** — supersede appends related_memory_id to metadata.supersedes; merge appends to metadata.consolidates and soft-deletes the merged memory. JSON errors are now propagated instead of silently discarded.
+- **Lifecycle-aware sync preview** — `ClassifyForPreview` checks v2 metadata: episodic, precompact, handoff, user-scope, and operational memories are blocked from sync. Semantic project-scoped and dream-derived semantic memories are syncable.
+- **CLI lifecycle commands** — `anchored bootstrap` (extract seeds from README/docs/rules/tree with SHA256 content hash and project-scoped dedup), `anchored handoff` (session handoff with scope and TTL, min 1h), `anchored retention sweep` (archive operational/episodic memories past TTL using proper time.Time comparison and UTC), `anchored precompact` (capture context snapshot with project-resolved scope).
+- **SaveOptions.Metadata** — store and service accept lifecycle metadata through the save pipeline.
+- **Tool support expanded** — `anchored init --tool` now supports 10 tools: Claude Code, Cursor, OpenCode, Gemini CLI, Antigravity (agy), **Windsurf**, **Cline**, **VS Code Copilot**, **Codex CLI**, and **Devin**. VS Code Copilot uses `servers` root key with required `type: stdio` field. Codex CLI uses TOML format (`~/.codex/config.toml`). Doctor probes added for all new tools.
+- **Contributing guide** — `CONTRIBUTING.md` with development setup, PR workflow, and coding conventions.
+
+### Changed
+
+- Go 1.25 (go.mod, ci.yml, release.yml).
+
+### Fixed
+
+- **Retention sweep** — `createdAt` parsed as `time.Time` with `.Before()` comparison instead of unreliable string comparison. UTC applied.
+- **Precompact scope** — uses `svc.ResolveProject(cwd)` so scope is correctly `ScopeProject` when a project is detected (was hardcoded empty, always `ScopeUser`).
+- **Consolidator JSON errors** — `json.Unmarshal` and `json.Marshal` in supersede/merge return explicit errors instead of silently discarding failures.
+- **Bootstrap dedup** — project-scoped dedup query filters by `content_hash + project_id` instead of global content hash.
+- **Hybrid search order** — `applyLifecycleBoost` now runs before `applyTemporalDecay` so pinned/important items are not decayed before boost is applied.
+- **Handoff TTL validation** — `ttlHours` must be ≥ 1.
 
 ### Added
 
