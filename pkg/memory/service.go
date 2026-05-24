@@ -101,7 +101,13 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 	if opts.Category == "" {
 		opts.Category = Categorize(opts.Content)
 	}
-	metadata := WithPreferenceScope(nil, opts.Category, opts.PreferenceScope)
+
+	var metadata any
+	if opts.Metadata != nil {
+		metadata = opts.Metadata
+	} else {
+		metadata = WithPreferenceScope(nil, opts.Category, opts.PreferenceScope)
+	}
 
 	var projectID *string
 	if opts.CWD != "" {
