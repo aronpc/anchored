@@ -14,8 +14,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Lifecycle-aware sync preview** — `ClassifyForPreview` checks v2 metadata: episodic, precompact, handoff, user-scope, and operational memories are blocked from sync. Semantic project-scoped and dream-derived semantic memories are syncable.
 - **CLI lifecycle commands** — `anchored bootstrap` (extract seeds from README/docs/rules/tree with SHA256 content hash and project-scoped dedup), `anchored handoff` (session handoff with scope and TTL, min 1h), `anchored retention sweep` (archive operational/episodic memories past TTL using proper time.Time comparison and UTC), `anchored precompact` (capture context snapshot with project-resolved scope).
 - **SaveOptions.Metadata** — store and service accept lifecycle metadata through the save pipeline.
-- **Tool support expanded** — `anchored init --tool` now supports 10 tools: Claude Code, Cursor, OpenCode, Gemini CLI, Antigravity (agy), **Windsurf**, **Cline**, **VS Code Copilot**, **Codex CLI**, and **Devin**. VS Code Copilot uses `servers` root key with required `type: stdio` field. Codex CLI uses TOML format (`~/.codex/config.toml`). Doctor probes added for all new tools.
-- **Contributing guide** — `CONTRIBUTING.md` with development setup, PR workflow, and coding conventions.
+- **Tool support expanded** — `anchored init --tool` now supports 10 tools: Claude Code, Cursor, OpenCode, Gemini CLI, Antigravity (agy), Windsurf, Cline, VS Code Copilot, Codex CLI, and Devin. VS Code Copilot uses `servers` root key with required `type: stdio` field. Codex CLI uses TOML format (`~/.codex/config.toml`). Doctor probes added for all new tools with format-aware detection (JSON, TOML, VS Code `servers` key).
+- **Antigravity 2.0 (agy) support** — `anchored init --tool agy` detects both `~/.gemini/config/mcp_config.json` (Antigravity 2.0 desktop) and `~/.gemini/antigravity-cli/mcp_config.json` (Antigravity CLI). macOS ONNX download path fix included.
+- **Preference scope metadata** (Phase 1) — user/project/team scope metadata on preferences. `anchored save` accepts `--scope`.
+- **Sanitizer custom patterns + remote safety filter** (Phase 2) — regex-based credential redaction with configurable custom patterns. Outbound sync content is scanned for local paths, secrets, and personal preferences.
+- **Stable project identity with RemoteKey** (Phase 3) — git remote URL derived `RemoteKey` (SHA-256) for cross-machine consistency. Project identity survives directory renames.
+- **Sync metadata migration + service observers** (Phase 4) — dirty flags, sync origin, author, remote project key columns and `sync_state` table. `MemoryObserver` interface for save/update/delete side effects.
+- **Memory inspect and export CLI** (Phase 5) — `anchored inspect <id>` for full JSON details, `anchored export` with filters (JSON/JSONL, project, category, source, include-deleted).
+- **Remote config and preview command** (Phase 6) — `anchored remote status` and `anchored remote preview` to classify memories as syncable/blocked/needs-review without network access.
+- **Dream --apply single-action review** (Phase 7) — `anchored dream --apply <action-id>` for individual dream action review and application.
+- **Minimal sync client skeleton** (Phase 8) — bidirectional sync client with push/pull/tombstone support.
+- **Remote save and search** — `anchored save --remote` and `anchored search --remote` with graceful fallback when no remote is configured.
+- **RemoteProjectKey and PreferenceScope** — Memory model extended with `RemoteProjectKey` and `PreferenceScope` fields for sync protocol compatibility.
+- **Remote: paginated memory listing** — `remote` command paginates memory listing and extracts helpers for cleaner code.
+- **Config wizard** — `anchored config wizard` for interactive configuration setup.
+- **Contributing guide** — `CONTRIBUTING.md` with development setup, PR workflow, tool support guide, and coding conventions.
+- **Lifecycle roadmap docs** — `docs/memory-lifecycle-roadmap.md` documents local lifecycle phases 1-8.
 
 ### Changed
 
@@ -29,6 +43,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Bootstrap dedup** — project-scoped dedup query filters by `content_hash + project_id` instead of global content hash.
 - **Hybrid search order** — `applyLifecycleBoost` now runs before `applyTemporalDecay` so pinned/important items are not decayed before boost is applied.
 - **Handoff TTL validation** — `ttlHours` must be ≥ 1.
+- **Sync: secret detection on path-rewritten content** — safety filter now scans content after project-relative path rewriting, catching secrets in rewritten paths.
+- **Init: include gemini in --tool all** — `gemini` was missing from the `all` tool list.
+
+## [0.4.10] - 2026-05-11
 
 ### Added
 
