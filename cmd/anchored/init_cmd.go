@@ -48,7 +48,7 @@ func parseToolFlag(tool string) []string {
 	case "gemini":
 		return []string{"gemini"}
 	case "all":
-		return []string{"claude-code", "cursor", "opencode", "agy"}
+		return []string{"claude-code", "cursor", "opencode", "agy", "gemini"}
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown tool: %s\n", tool)
 		os.Exit(1)
