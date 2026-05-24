@@ -231,3 +231,109 @@ func TestApplyAction_AlreadyApplied_ReturnsError(t *testing.T) {
 		t.Fatal("expected error for already-applied action, got nil")
 	}
 }
+
+func TestApplyAction_Supersede_UpdatesMetadata(t *testing.T) {
+	ctx := context.Background()
+	db := setupConsolidatorTestDB(t)
+	c := NewConsolidator(db, nil)
+
+	insertTestMemory(t, ctx, db, "mem-new", "updated content")
+	insertTestMemory(t, ctx, db, "mem-old", "old content")
+	insertTestDreamAction(t, ctx, db, "act-sup", "mem-new", "mem-old", "supersede", 0.9, "proposed")
+
+	result, err := c.ApplyAction(ctx, "act-sup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "applied" {
+		t.Errorf("status: got %q", result.Status)
+	}
+	if result.ActionType != "supersede" {
+		t.Errorf("action_type: got %q", result.ActionType)
+	}
+
+	var meta string
+	err = db.QueryRowContext(ctx, "SELECT metadata FROM memories WHERE id = 'mem-new'").Scan(&meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta == "" || meta == "null" {
+		t.Fatalf("expected metadata with supersedes, got %q", meta)
+	}
+	if !containsSubstring(meta, "mem-old") {
+		t.Errorf("metadata should reference mem-old, got %q", meta)
+	}
+}
+
+func TestApplyAction_Supersede_NoRelatedID_Error(t *testing.T) {
+	ctx := context.Background()
+	db := setupConsolidatorTestDB(t)
+	c := NewConsolidator(db, nil)
+
+	insertTestMemory(t, ctx, db, "mem-solo", "content")
+	insertTestDreamAction(t, ctx, db, "act-no-rel", "mem-solo", "", "supersede", 0.9, "proposed")
+
+	_, err := c.ApplyAction(ctx, "act-no-rel")
+	if err == nil {
+		t.Fatal("expected error for supersede without related_memory_id")
+	}
+}
+
+func TestApplyAction_Merge_ConsolidatesAndSoftDeletes(t *testing.T) {
+	ctx := context.Background()
+	db := setupConsolidatorTestDB(t)
+	c := NewConsolidator(db, nil)
+
+	insertTestMemory(t, ctx, db, "mem-keeper", "combined content")
+	insertTestMemory(t, ctx, db, "mem-absorbed", "absorbed content")
+	insertTestDreamAction(t, ctx, db, "act-merge", "mem-keeper", "mem-absorbed", "merge", 0.95, "proposed")
+
+	result, err := c.ApplyAction(ctx, "act-merge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "applied" {
+		t.Errorf("status: got %q", result.Status)
+	}
+
+	var meta string
+	err = db.QueryRowContext(ctx, "SELECT metadata FROM memories WHERE id = 'mem-keeper'").Scan(&meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsSubstring(meta, "mem-absorbed") {
+		t.Errorf("metadata should reference mem-absorbed in consolidates, got %q", meta)
+	}
+
+	var deletedAt *string
+	err = db.QueryRowContext(ctx, "SELECT deleted_at FROM memories WHERE id = 'mem-absorbed'").Scan(&deletedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deletedAt == nil {
+		t.Error("mem-absorbed should be soft-deleted after merge")
+	}
+}
+
+func TestApplyAction_Merge_NoRelatedID_Error(t *testing.T) {
+	ctx := context.Background()
+	db := setupConsolidatorTestDB(t)
+	c := NewConsolidator(db, nil)
+
+	insertTestMemory(t, ctx, db, "mem-solo", "content")
+	insertTestDreamAction(t, ctx, db, "act-no-rel", "mem-solo", "", "merge", 0.9, "proposed")
+
+	_, err := c.ApplyAction(ctx, "act-no-rel")
+	if err == nil {
+		t.Fatal("expected error for merge without related_memory_id")
+	}
+}
+
+func containsSubstring(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
