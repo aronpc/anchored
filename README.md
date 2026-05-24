@@ -3,7 +3,7 @@
 > Persistent cross-tool memory for AI coding agents. Local-first, single binary, zero dependencies.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.24+-00ADD8?style=for-the-badge&logo=go)]
+[![Go](https://img.shields.io/badge/go-1.25+-00ADD8?style=for-the-badge&logo=go)]
 [![Release](https://img.shields.io/github/v/release/jholhewres/anchored?style=for-the-badge)](https://github.com/jholhewres/anchored/releases)
 
 Anchored is a local-first MCP memory server that gives every AI coding agent and IDE you use a shared, persistent memory on your machine. Install once, and Claude Code, Cursor, OpenCode, Antigravity (agy), Gemini CLI, and any other MCP-compatible tool read, write, and search the same knowledge base.
@@ -162,6 +162,10 @@ anchored export [--project] [--category] [--source] [--include-deleted] [--forma
                            Export memories (embeddings excluded)
 anchored remote status      Show remote sync configuration (offline)
 anchored remote preview     Preview what would sync — syncable/blocked/needs-review (offline)
+anchored remote sync        Sync memories with remote server
+anchored bootstrap [--cwd]  Extract project seeds from README, docs, rules, tree
+anchored handoff [--scope] [--ttl] Save session handoff with expiry
+anchored retention sweep    Archive operational/episodic memories past TTL
 anchored precompact         Pre-compact memory context
 anchored hook <subcommand>  Run session continuity hooks
 anchored purge              Wipe memories (--hard for full DB reset with backup)
@@ -183,8 +187,8 @@ Import sources: `claude-code` `devclaw` `opencode` `cursor` `all`
 | `anchored_list` | List memories by category, project, or time |
 | `anchored_stats` | Memory overview |
 | `anchored_session_end` | Close a tracked session |
-| `kg_query` | Query knowledge-graph relationships for an entity |
-| `kg_add` | Capture a relationship (subject — predicate — object) |
+| `anchored_kg_query` | Query knowledge-graph relationships for an entity |
+| `anchored_kg_add` | Capture a relationship (subject — predicate — object) |
 
 **Sandbox / index** (context-saving tools that keep raw data out of context)
 
@@ -225,8 +229,10 @@ No daemon. No ports. The binary runs on demand via MCP STDIO.
 - [Architecture](docs/architecture.md) — project structure and implementation details
 - [Embedding Model](docs/embedding-model.md) — model choice, quantization, inference pipeline
 - [Import Sources](docs/import-sources.md) — how each tool's data is parsed
+- [MCP Protocol](docs/mcp-protocol.md) — MCP tool schemas and protocol reference
 - [Team Sync](docs/team-sync.md) — planned local + remote architecture for team-shared memory via `anchored_oss`
 - [Improvements Roadmap](docs/improvements-roadmap.md) — local-first roadmap before/alongside Team Sync and Cloud
+- [Memory Lifecycle](docs/memory-lifecycle-roadmap.md) — lifecycle phases 1-8 for memory classification, scoring, and retention
 - [Changelog](CHANGELOG.md) — version history
 
 ## Related Projects
