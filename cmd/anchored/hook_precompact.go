@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/memory"
@@ -54,6 +55,13 @@ func runHookPreCompact(args []string) {
 
 	projectID := svc.ResolveProject(cwdVal)
 
+	expiresAt := time.Now().Add(14 * 24 * time.Hour).Format(time.RFC3339)
+	scope := memory.ScopeProject
+	if projectID == "" {
+		scope = memory.ScopeUser
+	}
+	precompactMeta := memory.PreCompactMetadata(scope, expiresAt)
+
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO session_events (id, session_id, project_id, event_type, priority, summary, metadata, created_at)
 		 VALUES (?, ?, ?, 'precompact_snapshot', 1, ?, ?, datetime('now'))`,
@@ -68,6 +76,7 @@ func runHookPreCompact(args []string) {
 		Category: "summary",
 		Source:   "precompact_hook",
 		CWD:      cwdVal,
+		Metadata: precompactMeta.ToAny(),
 	})
 	if err != nil {
 		slog.Error("failed to save precompact memory", "error", err)

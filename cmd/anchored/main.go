@@ -41,6 +41,12 @@ func main() {
 		runInit(os.Args[2:])
 	case "precompact":
 		runPrecompact(os.Args[2:])
+	case "handoff":
+		runHandoff(os.Args[2:])
+	case "bootstrap":
+		runBootstrap(os.Args[2:])
+	case "retention":
+		runRetention(os.Args[2:])
 	case "hook":
 		runHook(os.Args[2:])
 	case "dream":
@@ -80,6 +86,9 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored config [show|set|wizard] View or modify configuration\n")
 	fmt.Fprintf(os.Stderr, "  anchored init [--tool]     Initialize and register MCP server\n")
 	fmt.Fprintf(os.Stderr, "  anchored precompact         Pre-compact memory context\n")
+	fmt.Fprintf(os.Stderr, "  anchored handoff            Save a handoff snapshot for session continuity\n")
+	fmt.Fprintf(os.Stderr, "  anchored bootstrap          Bootstrap project memories from sources\n")
+	fmt.Fprintf(os.Stderr, "  anchored retention sweep    Sweep expired/episodic memories\n")
 	fmt.Fprintf(os.Stderr, "  anchored hook <subcommand>  Run session continuity hooks\n")
 	fmt.Fprintf(os.Stderr, "  anchored dream              Analyze and consolidate duplicate memories\n")
 	fmt.Fprintf(os.Stderr, "  anchored doctor             Diagnose installation, config, MCP registration\n")
