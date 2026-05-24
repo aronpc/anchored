@@ -19,7 +19,7 @@ make test
 2. **Match existing patterns** — read a few files in the package you're modifying before writing code. Follow the naming, error handling, and structure you see.
 3. **No comment sprawl** — code should be self-documenting. Comments are for security invariants, complex algorithms, regex patterns, and public API contracts.
 4. **Tests for new behavior** — at minimum, test the happy path and one edge case. Place test files next to the implementation (`foo.go` → `foo_test.go`).
-5. **No type suppression** — never use `as any`, `@ts-ignore` (in other languages), or empty catch blocks.
+5. **No type suppression** — never use unchecked type assertions (`x := iface.(T)` without the two-value form), bare error ignores (`_ = someFunc()`), or empty `recover()` without handling.
 
 ## Commit Style
 
