@@ -18,6 +18,7 @@ type SyncMemory struct {
 	Source           string `json:"source"`
 	PreferenceScope  string `json:"preference_scope,omitempty"`
 	RemoteProjectKey string `json:"remote_project_key,omitempty"`
+	Metadata         any    `json:"metadata,omitempty"`
 }
 
 // SyncPushResponse is the server's response to a push request.
@@ -59,6 +60,26 @@ type SaveRemoteResponse struct {
 	Category  string `json:"category"`
 	ProjectID string `json:"project_id,omitempty"`
 	Created   bool   `json:"created"`
+}
+
+// SyncTripleRequest pushes a batch of knowledge-graph triples to the remote
+// server. Triples are scoped to a project; the caller must have resolved the
+// remote project ID (e.g. via a prior memory sync) before calling.
+type SyncTripleRequest struct {
+	Triples []SyncTriple `json:"triples"`
+}
+
+type SyncTriple struct {
+	Subject    string  `json:"subject"`
+	Predicate  string  `json:"predicate"`
+	Object     string  `json:"object"`
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+type SyncTripleResponse struct {
+	Accepted int      `json:"accepted"`
+	Rejected int      `json:"rejected"`
+	Errors   []string `json:"errors,omitempty"`
 }
 
 type RemoteSearchResult struct {

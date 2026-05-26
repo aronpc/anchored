@@ -23,6 +23,8 @@ func runRemote(args []string) {
 		runRemotePreview(args[1:])
 	case "sync":
 		runRemoteSync(args[1:])
+	case "sync-per-project":
+		runRemoteSyncPerProject(args[1:])
 	default:
 		printRemoteUsage()
 	}
@@ -204,6 +206,7 @@ func runRemoteSync(args []string) {
 			Source:           item.Memory.Source,
 			PreferenceScope:  item.Memory.PreferenceScope,
 			RemoteProjectKey: derefString(item.Memory.RemoteProjectKey),
+			Metadata:         item.Memory.Metadata,
 		})
 	}
 
