@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.5] - 2026-05-25
+
+### Added
+
+- **Curation pipeline** — `anchored curation score [--apply] [--threshold 0.55]` computes a heuristic quality score per memory (length, category, signal patterns, project association) and marks low-signal ones with `metadata.curation_status=low_signal`. Pinned memories are always exempt. Dry-run by default; `--apply` persists.
+- **Curation clean** — `anchored curation clean [--hard] [--threshold] [--dry-run] [--yes]` removes low-signal memories. Soft-delete by default (reversible); `--hard` for permanent deletion. Prints a sample of the lowest-quality candidates before applying.
+- **Curation restore** — `anchored curation restore [--latest | --from PATH]` swaps the active DB for a backup from `~/.anchored/data/bkps/`. The current DB is snapshotted before the swap (`anchored.db.bak.pre-restore-<ts>`), so the operation is reversible. Interactive picker when no flag is given.
+- **Per-project remote sync** — `anchored remote sync-per-project [--min-memories N]` groups local memories by `project_id`, creates one remote project per local project, and pushes each subset separately. Preserves project segmentation on `anchored_oss` (devclaw, gatorllm, etc stay distinct on the team server instead of collapsing into one bucket).
+- **Knowledge-graph push** — `sync.Client.PushTriples(projectID, triples)` sends to `POST /v1/projects/{id}/triples` on the OSS server. `kg.KG.ListByProject(projectID)` enumerates live triples for a project. Server-side: idempotent (logical unique on subject+predicate+object+project), supports functional supersession, alias resolution.
+- **Hybrid-search lifecycle demotion** — `applyLifecycleBoost` multiplies score by 0.03 for `curation_status=low_signal` and by 0.15 for `quality_score < RemoteQualityThreshold` (non-pinned). Effectively buries junk from search results without deleting.
+- **Quality-aware sync filter** — `IsRemoteSyncCandidate` and `ClassifyForPreview` block `low_signal` and below-threshold `quality_score` memories. Preview surfaces them as `low_signal` / `low_quality` reasons distinct from the legacy `category_remote_blocked`.
+- **Hardened secret detection** — `pkg/sync.detectSecrets` adds explicit prefix/regex matchers for Stripe (`sk_live_`, `sk_test_`, `rk_live_`), GitHub (`ghp_`, `gho_`, `ghu_`, `ghs_`), Slack (`xoxb-`, `xoxp-`, `hooks.slack.com/services/T…`), AWS access keys (`AKIA[0-9A-Z]{16}`), Google API keys (`AIza[0-9A-Za-z_\-]{35}`), credentialed DB URIs (mongo/postgres/mysql/redis with `user:pass@`), and PEM private keys.
+- **Lifecycle-aware metadata propagation** — `SyncMemory.Metadata` is now sent over the wire; the remote server applies its own quality/lifecycle filter as defense-in-depth.
+
+### Changed
+
+- `RemoteQualityThreshold = 0.55` is now an exported constant shared by client (preview, sync, hybrid-search demotion) and consumed by `anchored_oss` server filter via metadata.
+- `Service.SaveWithOptions` and `Service.Update` automatically apply `ApplyQualityMetadata` so every save/update gets a `quality_score`, `importance`, and (if low) `curation_status`. Previously these were only set by explicit curation runs.
+- `SyncPushRequest.Memories[i].Metadata` is now `any` and propagated end-to-end. The remote can see lifecycle/curation flags it needs to enforce its own filter.
+- `SQLiteStore.UpdateMetadata` added: targeted metadata-only update (does not bump `updated_at`, does not re-index FTS). Used by `curation score --apply` to avoid hammering FTS over 25k rows.
+- `memories_fts_update` trigger now fires only on `UPDATE OF content, keywords` — metadata-only writes no longer rebuild the FTS row.
+
+### Fixed
+
+- Duplicate `switch` block removed from `SQLiteStore.List` (prior accidental copy created at refactor time; behavior unchanged).
+- `Push` short-circuits `event` and `preference` categories before the path/secret pipeline, matching the documented filter precedence and avoiding pointless sanitizer work.
+
+### Internal
+
+- New CLI files: `cmd/anchored/curation.go`, `cmd/anchored/curation_clean.go`, `cmd/anchored/remote_per_project.go`.
+- New driver dep: `modernc.org/sqlite` (used by `remote sync-per-project` to read local project names directly without going through the embedded service).
+- Pre-existing `pkg/memory` test suite still depends on FTS5 in the SQLite driver; those tests remain failing as in v0.5.0 (unrelated to this release; tracked separately).
+
 ## [0.5.0] - 2026-05-24
 
 ### Added
