@@ -51,6 +51,8 @@ func main() {
 		runHook(os.Args[2:])
 	case "dream":
 		runDream(os.Args[2:])
+	case "curation":
+		runCuration(os.Args[2:])
 	case "doctor":
 		runDoctor(os.Args[2:])
 	case "purge":
@@ -91,6 +93,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored retention sweep    Sweep expired/episodic memories\n")
 	fmt.Fprintf(os.Stderr, "  anchored hook <subcommand>  Run session continuity hooks\n")
 	fmt.Fprintf(os.Stderr, "  anchored dream              Analyze and consolidate duplicate memories\n")
+	fmt.Fprintf(os.Stderr, "  anchored curation score     Score and mark low-signal memories\n")
 	fmt.Fprintf(os.Stderr, "  anchored doctor             Diagnose installation, config, MCP registration\n")
 	fmt.Fprintf(os.Stderr, "  anchored purge              Wipe memories (--hard for full DB reset)\n")
 	fmt.Fprintf(os.Stderr, "  anchored inspect <id>      Show full memory details\n")
