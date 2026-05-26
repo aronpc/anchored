@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/sync"
@@ -17,6 +18,12 @@ func runRemote(args []string) {
 		return
 	}
 	switch args[0] {
+	case "configure":
+		runRemoteConfigure(args[1:])
+	case "link":
+		runRemoteLink(args[1:])
+	case "unlink":
+		runRemoteUnlink(args[1:])
 	case "status":
 		runRemoteStatus(args[1:])
 	case "preview":
@@ -32,9 +39,98 @@ func runRemote(args []string) {
 
 func printRemoteUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "  anchored remote status   Show remote sync config status")
-	fmt.Fprintln(os.Stderr, "  anchored remote preview  Preview which memories would sync (offline)")
-	fmt.Fprintln(os.Stderr, "  anchored remote sync     Sync memories to remote server (--dry-run for preview)")
+	fmt.Fprintln(os.Stderr, "  anchored remote configure --server URL --key KEY   Wire a remote anchored_oss server")
+	fmt.Fprintln(os.Stderr, "  anchored remote link <project_id>                   Subscribe to a remote project so its memories sync")
+	fmt.Fprintln(os.Stderr, "  anchored remote unlink <project_id>                 Stop syncing memories tied to a remote project")
+	fmt.Fprintln(os.Stderr, "  anchored remote status                              Show remote sync config status")
+	fmt.Fprintln(os.Stderr, "  anchored remote preview                             Preview which memories would sync (offline)")
+	fmt.Fprintln(os.Stderr, "  anchored remote sync                                Sync memories to remote server (--dry-run for preview)")
+}
+
+// runRemoteLink adds a remote project_id to the local config's
+// remote.projects list. Memories with a matching remote_project_key on their
+// metadata will be routed to that project during sync. Idempotent.
+func runRemoteLink(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: anchored remote link <project_id>")
+		os.Exit(1)
+	}
+	projectID := args[0]
+
+	configFile, cfg := loadWritableConfig()
+	for _, p := range cfg.Remote.Projects {
+		if p == projectID {
+			fmt.Printf("Already linked to %s\n", projectID)
+			return
+		}
+	}
+	cfg.Remote.Projects = append(cfg.Remote.Projects, projectID)
+	writeConfigFile(configFile, cfg)
+	fmt.Printf("Linked project %s\n", projectID)
+	fmt.Printf("  Total projects subscribed: %d\n", len(cfg.Remote.Projects))
+}
+
+// runRemoteUnlink removes a project_id from the local config's
+// remote.projects list. No-op if the id isn't present.
+func runRemoteUnlink(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: anchored remote unlink <project_id>")
+		os.Exit(1)
+	}
+	projectID := args[0]
+
+	configFile, cfg := loadWritableConfig()
+	out := cfg.Remote.Projects[:0]
+	removed := false
+	for _, p := range cfg.Remote.Projects {
+		if p == projectID {
+			removed = true
+			continue
+		}
+		out = append(out, p)
+	}
+	cfg.Remote.Projects = out
+	writeConfigFile(configFile, cfg)
+	if removed {
+		fmt.Printf("Unlinked project %s\n", projectID)
+	} else {
+		fmt.Printf("Project %s was not linked\n", projectID)
+	}
+}
+
+// runRemoteConfigure wires (or rewires) a remote anchored_oss server into the
+// local config. It always sets remote.enabled=true unless --disable is passed.
+// Existing values are overwritten — config rotation is via re-running this.
+func runRemoteConfigure(args []string) {
+	fs := newFlagSet("remote configure")
+	server := fs.String("server", "", "remote server URL (e.g. https://anchored.acme.com)")
+	key := fs.String("key", "", "admin/sync API key for the server")
+	disable := fs.Bool("disable", false, "turn remote sync off (other flags are ignored)")
+	fs.Parse(args)
+
+	configFile, cfg := loadWritableConfig()
+
+	if *disable {
+		cfg.Remote.Enabled = false
+		writeConfigFile(configFile, cfg)
+		fmt.Printf("Remote sync disabled (config: %s)\n", configFile)
+		return
+	}
+
+	if *server == "" || *key == "" {
+		fmt.Fprintln(os.Stderr, "Usage: anchored remote configure --server URL --key KEY [--disable]")
+		os.Exit(1)
+	}
+
+	cfg.Remote.Enabled = true
+	cfg.Remote.ServerURL = strings.TrimRight(*server, "/")
+	cfg.Remote.APIKey = *key
+
+	writeConfigFile(configFile, cfg)
+	fmt.Printf("Remote sync configured.\n")
+	fmt.Printf("  Server: %s\n", cfg.Remote.ServerURL)
+	fmt.Printf("  Key:    %s\n", maskKey(cfg.Remote.APIKey))
+	fmt.Printf("  Config: %s\n", configFile)
 }
 
 func runRemoteStatus(args []string) {
@@ -185,6 +281,16 @@ func runRemoteSync(args []string) {
 	if !cfg.Remote.Enabled {
 		fmt.Fprintln(os.Stderr, "Remote sync is disabled. Enable in config or use --dry-run.")
 		os.Exit(1)
+	}
+
+	// Fallback to the first linked project when --project-id is not given.
+	// Memories without an explicit remote_project_key in metadata would
+	// otherwise be rejected by the server with "no project_id and no
+	// remote_project_key". This lets a user run `anchored remote sync`
+	// without arguments after `anchored remote link <id>`.
+	if *projectID == "" && len(cfg.Remote.Projects) > 0 {
+		*projectID = cfg.Remote.Projects[0]
+		fmt.Printf("Using linked project %s as default (override with --project-id)\n", *projectID)
 	}
 
 	// NewClient only returns nil when cfg.Remote.Enabled is false, which is
