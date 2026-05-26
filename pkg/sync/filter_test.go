@@ -158,6 +158,30 @@ func TestRemoteSafetyFilter_SecretDetection(t *testing.T) {
 	}
 }
 
+func TestRemoteSafetyFilter_KnownTokenPrefixes(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		content string
+	}{
+		{name: "github pat", content: "token ghp_ABCDEFGHIJKLMNOP should never sync"},
+		{name: "slack bot", content: "bot xoxb-1234567890-abcdef should never sync"},
+		{name: "credential uri", content: "postgres://user:pass@example.com/db should never sync"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := RemoteSafetyFilter(tt.content, nil, "")
+			if !result.Blocked {
+				t.Fatalf("expected known token prefix to be blocked")
+			}
+			if result.Allowed {
+				t.Fatalf("expected known token prefix to be disallowed")
+			}
+			if len(result.Violations) == 0 || result.Violations[0].Reason != "secret_pattern" {
+				t.Fatalf("expected secret_pattern violation, got %+v", result.Violations)
+			}
+		})
+	}
+}
+
 func TestRemoteSafetyFilter_PersonalPreference(t *testing.T) {
 	result := RemoteSafetyFilter(
 		"prefer dark theme",

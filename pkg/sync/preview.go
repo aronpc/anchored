@@ -54,9 +54,21 @@ func ClassifyForPreview(memories []Memory, projectRoot string) PreviewResult {
 			item.Classification = ClassificationBlocked
 			item.Reason = "user_scope_blocked"
 
+		case lifecycle.CurationStatus == memory.CurationStatusLowSignal:
+			item.Classification = ClassificationBlocked
+			item.Reason = "low_signal"
+
+		case lifecycle.QualityScore > 0 && lifecycle.QualityScore < memory.RemoteQualityThreshold && !lifecycle.Pinned:
+			item.Classification = ClassificationBlocked
+			item.Reason = "low_quality"
+
 		case scope == "user":
 			item.Classification = ClassificationBlocked
 			item.Reason = "personal_preference"
+
+		case m.Category == "event" || m.Category == "preference":
+			item.Classification = ClassificationBlocked
+			item.Reason = "category_remote_blocked"
 
 		case lifecycle.IsRemoteSyncCandidate():
 			item.Classification = ClassificationSyncable

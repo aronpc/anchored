@@ -89,6 +89,10 @@ func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushRespon
 	var rejections []string
 	for i := range req.Memories {
 		m := req.Memories[i]
+		if m.Category == "event" || m.Category == "preference" {
+			rejections = append(rejections, fmt.Sprintf("memory %s blocked: category_remote_blocked", m.ID))
+			continue
+		}
 
 		if m.PreferenceScope == "user" {
 			rejections = append(rejections, fmt.Sprintf("memory %s blocked: personal_preference", m.ID))
@@ -243,6 +247,50 @@ func (c *Client) SearchRemote(ctx context.Context, projectID string, query strin
 	}
 
 	return results, nil
+}
+
+// PushTriples sends a batch of knowledge-graph triples to the remote server
+// for a previously-resolved project. The server applies the same hardening
+// rules as anchored_oss does for memories (logical dedup, functional
+// supersession, alias resolution).
+//
+// Caller is expected to have already resolved the remote projectID via a
+// memory sync (the server's project_claim flow). PushTriples does not perform
+// safety filtering — triples are entity strings, not free text, and the
+// server's quality/policy filter doesn't apply to them.
+func (c *Client) PushTriples(ctx context.Context, projectID string, triples []SyncTriple) (*SyncTripleResponse, error) {
+	if projectID == "" {
+		return nil, fmt.Errorf("PushTriples: projectID is required")
+	}
+	if len(triples) == 0 {
+		return &SyncTripleResponse{}, nil
+	}
+
+	body, err := json.Marshal(SyncTripleRequest{Triples: triples})
+	if err != nil {
+		return nil, fmt.Errorf("marshal triples request: %w", err)
+	}
+
+	path := "/v1/projects/" + urlQueryEscape(projectID) + "/triples"
+	resp, err := c.doRequest(ctx, http.MethodPost, path, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("push triples request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
+		return nil, &RemoteError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+	if resp.StatusCode >= 400 {
+		return nil, &RemoteError{StatusCode: resp.StatusCode, Body: string(respBody)}
+	}
+
+	var out SyncTripleResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("decode triples response: %w", err)
+	}
+	return &out, nil
 }
 
 func urlQueryEscape(s string) string {

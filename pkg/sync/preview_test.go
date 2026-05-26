@@ -122,6 +122,7 @@ func TestClassifyForPreview_PendingChanges(t *testing.T) {
 }
 
 func TestClassifyForPreview_ProjectPreference(t *testing.T) {
+	// preference category is always blocked for remote sync regardless of scope
 	memories := []Memory{
 		{
 			ID:       "m7",
@@ -132,8 +133,11 @@ func TestClassifyForPreview_ProjectPreference(t *testing.T) {
 		},
 	}
 	result := ClassifyForPreview(memories, "")
-	if result.Syncable != 1 {
-		t.Errorf("expected Syncable=1 for project preference, got %d", result.Syncable)
+	if result.Blocked != 1 {
+		t.Errorf("expected Blocked=1 for project preference, got %d", result.Blocked)
+	}
+	if len(result.Items) == 0 || result.Items[0].Reason != "category_remote_blocked" {
+		t.Errorf("expected reason=category_remote_blocked, got %q", result.Items[0].Reason)
 	}
 }
 
@@ -143,13 +147,16 @@ func TestClassifyForPreview_TeamPreference(t *testing.T) {
 			ID:       "m8",
 			Category: "preference",
 			Content:  "prefer small PRs",
-			Source:    "user",
+			Source:   "user",
 			Metadata: map[string]any{"scope": "team"},
 		},
 	}
 	result := ClassifyForPreview(memories, "")
-	if result.Syncable != 1 {
-		t.Errorf("expected Syncable=1 for team preference, got %d", result.Syncable)
+	if result.Blocked != 1 {
+		t.Errorf("expected Blocked=1 for team preference, got %d", result.Blocked)
+	}
+	if len(result.Items) == 0 || result.Items[0].Reason != "category_remote_blocked" {
+		t.Errorf("expected reason=category_remote_blocked, got %q", result.Items[0].Reason)
 	}
 }
 
