@@ -78,8 +78,12 @@ func TestServiceSaveWithOptions_DoesNotSetScopeForNonPreference(t *testing.T) {
 		t.Fatalf("SaveWithOptions error: %v", err)
 	}
 
-	if m.Metadata != nil {
-		t.Fatalf("expected non-preference metadata to remain nil, got %#v", m.Metadata)
+	metadata := ParseMetadata(m.Metadata)
+	if metadata.PreferenceScope != "" {
+		t.Fatalf("expected non-preference scope to remain empty, got %q", metadata.PreferenceScope)
+	}
+	if metadata.QualityScore == 0 {
+		t.Fatalf("expected non-preference memory to receive quality metadata")
 	}
 }
 

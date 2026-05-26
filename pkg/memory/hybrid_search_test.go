@@ -91,7 +91,7 @@ type hybridMockStore struct {
 	memories map[string]Memory
 }
 
-func (s *hybridMockStore) Save(ctx context.Context, m Memory) error                       { return nil }
+func (s *hybridMockStore) Save(ctx context.Context, m Memory) error { return nil }
 func (s *hybridMockStore) Get(ctx context.Context, id string) (*Memory, error) {
 	if m, ok := s.memories[id]; ok {
 		return &m, nil
@@ -101,17 +101,24 @@ func (s *hybridMockStore) Get(ctx context.Context, id string) (*Memory, error) {
 func (s *hybridMockStore) Search(ctx context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
 	return nil, nil
 }
-func (s *hybridMockStore) Delete(ctx context.Context, id string) error                     { return nil }
-func (s *hybridMockStore) List(ctx context.Context, opts ListOptions) ([]Memory, error)   { return nil, nil }
-func (s *hybridMockStore) Stats(ctx context.Context) (*StoreStats, error)                  { return nil, nil }
+func (s *hybridMockStore) Delete(ctx context.Context, id string) error { return nil }
+func (s *hybridMockStore) List(ctx context.Context, opts ListOptions) ([]Memory, error) {
+	return nil, nil
+}
+func (s *hybridMockStore) Stats(ctx context.Context) (*StoreStats, error) { return nil, nil }
 func (s *hybridMockStore) UpdateEmbedding(ctx context.Context, id string, e []float32) error {
 	return nil
 }
 func (s *hybridMockStore) DB() *sql.DB  { return nil }
 func (s *hybridMockStore) Close() error { return nil }
-func (s *hybridMockStore) ListWithoutEmbedding(ctx context.Context, limit int) ([]Memory, error) { return nil, nil }
+func (s *hybridMockStore) ListWithoutEmbedding(ctx context.Context, limit int) ([]Memory, error) {
+	return nil, nil
+}
 func (s *hybridMockStore) Update(ctx context.Context, id, content, category string) error { return nil }
-func (s *hybridMockStore) SoftDelete(ctx context.Context, id string) error                   { return nil }
+func (s *hybridMockStore) UpdateMetadata(ctx context.Context, id string, metadata any) error {
+	return nil
+}
+func (s *hybridMockStore) SoftDelete(ctx context.Context, id string) error { return nil }
 func (s *hybridMockStore) DeleteByScope(ctx context.Context, opts DeleteScopeOptions) (int, error) {
 	return 0, nil
 }

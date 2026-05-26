@@ -22,18 +22,24 @@ const (
 	ScopeProject = "project"
 	ScopeTeam    = "team"
 
-	OriginManual    = "manual"
-	OriginHook      = "hook"
-	OriginBootstrap = "bootstrap"
-	OriginDream     = "dream"
-	OriginRemote    = "remote"
-	OriginHandoff   = "handoff"
+	OriginManual     = "manual"
+	OriginHook       = "hook"
+	OriginBootstrap  = "bootstrap"
+	OriginDream      = "dream"
+	OriginRemote     = "remote"
+	OriginHandoff    = "handoff"
 	OriginPrecompact = "precompact"
-	OriginImport    = "import"
+	OriginImport     = "import"
 
 	ContextTierL0 = "L0"
 	ContextTierL1 = "L1"
 	ContextTierL2 = "L2"
+
+	CurationStatusLowSignal = "low_signal"
+
+	// RemoteQualityThreshold: minimum quality_score for remote sync eligibility.
+	// Referenced by preview, IsRemoteSyncCandidate, and hybrid search demotion.
+	RemoteQualityThreshold = 0.55
 )
 
 // MemoryMetadata provides structured metadata for memories.
@@ -51,16 +57,17 @@ type MemoryMetadata struct {
 	PreferenceScope string `json:"preference_scope,omitempty"`
 
 	// v2 lifecycle fields (all optional, zero-value means unset)
-	MemoryType  string   `json:"memory_type,omitempty"`  // "semantic", "episodic", "operational"
-	Kind        string   `json:"kind,omitempty"`          // "fact", "decision", "learning", "summary", "rule", "handoff", "precompact"
-	Scope       string   `json:"scope,omitempty"`         // "user", "project", "team"
-	Origin      string   `json:"origin,omitempty"`        // "manual", "hook", "bootstrap", "dream", "remote", "handoff", "precompact", "import"
-	Importance  float64  `json:"importance,omitempty"`    // 0.0..1.0 ranking and retention hint
-	Pinned      bool     `json:"pinned,omitempty"`        // exempt from retention and demotion
-	ExpiresAt   string   `json:"expires_at,omitempty"`    // RFC3339 timestamp for operational/episodic TTL
-	Supersedes  []string `json:"supersedes,omitempty"`    // IDs of memories this item replaces
-	ContextTier string   `json:"context_tier,omitempty"`  // "L0", "L1", "L2" context stack hint
-	Confidence  float64  `json:"confidence,omitempty"`    // 0.0..1.0 for bootstrap/import/inferred items
+	MemoryType     string   `json:"memory_type,omitempty"`  // "semantic", "episodic", "operational"
+	Kind           string   `json:"kind,omitempty"`         // "fact", "decision", "learning", "summary", "rule", "handoff", "precompact"
+	Scope          string   `json:"scope,omitempty"`        // "user", "project", "team"
+	Origin         string   `json:"origin,omitempty"`       // "manual", "hook", "bootstrap", "dream", "remote", "handoff", "precompact", "import"
+	Importance     float64  `json:"importance,omitempty"`   // 0.0..1.0 ranking and retention hint
+	Pinned         bool     `json:"pinned,omitempty"`       // exempt from retention and demotion
+	ExpiresAt      string   `json:"expires_at,omitempty"`   // RFC3339 timestamp for operational/episodic TTL
+	Supersedes     []string `json:"supersedes,omitempty"`   // IDs of memories this item replaces
+	ContextTier    string   `json:"context_tier,omitempty"` // "L0", "L1", "L2" context stack hint
+	Confidence     float64  `json:"confidence,omitempty"`   // 0.0..1.0 for bootstrap/import/inferred items
+	CurationStatus string   `json:"curation_status,omitempty"`
 
 	// Extra preserves unknown metadata keys from raw maps that are not
 	// represented in this struct. Not serialized directly; merged during
@@ -88,6 +95,7 @@ func (m MemoryMetadata) isZero() bool {
 		len(m.Supersedes) == 0 &&
 		m.ContextTier == "" &&
 		m.Confidence == 0 &&
+		m.CurationStatus == "" &&
 		len(m.Extra) == 0
 }
 
@@ -163,9 +171,10 @@ func ParseMetadata(v any) MemoryMetadata {
 			"source": true, "session_id": true, "consolidated": true,
 			"dream_version": true, "capture_reason": true, "quality_score": true,
 			"preference_scope": true,
-			"memory_type": true, "kind": true, "scope": true, "origin": true,
+			"memory_type":      true, "kind": true, "scope": true, "origin": true,
 			"importance": true, "pinned": true, "expires_at": true,
 			"supersedes": true, "context_tier": true, "confidence": true,
+			"curation_status": true,
 		}
 		for k, val := range raw {
 			if !knownKeys[k] {
@@ -237,8 +246,6 @@ func NormalizeContextTier(tier string) string {
 	}
 }
 
-
-
 func (m MemoryMetadata) IsSemantic() bool {
 	return m.MemoryType == MemoryTypeSemantic
 }
@@ -267,6 +274,12 @@ func (m MemoryMetadata) IsRemoteSyncCandidate() bool {
 	if m.Scope == ScopeUser {
 		return false
 	}
+	if m.CurationStatus == CurationStatusLowSignal {
+		return false
+	}
+	if m.QualityScore > 0 && m.QualityScore < RemoteQualityThreshold && !m.Pinned {
+		return false
+	}
 	// Episodic never syncs
 	if m.MemoryType == MemoryTypeEpisodic {
 		return false
@@ -284,8 +297,6 @@ func (m MemoryMetadata) IsRemoteSyncCandidate() bool {
 	return false
 }
 
-
-
 func WithPreferenceScope(metadata any, category, scope string) any {
 	if category != "preference" {
 		m := ParseMetadata(metadata)
@@ -299,8 +310,6 @@ func WithPreferenceScope(metadata any, category, scope string) any {
 	m.PreferenceScope = NormalizePreferenceScope(scope)
 	return m.ToAny()
 }
-
-
 
 // InferDefaultsFromCategory returns a MemoryMetadata with default v2 lifecycle
 // fields inferred from the given category. This is used when no v2 metadata is
