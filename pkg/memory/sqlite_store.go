@@ -256,27 +256,6 @@ func (s *SQLiteStore) List(ctx context.Context, opts ListOptions) ([]Memory, err
 
 	switch {
 	case len(opts.Categories) > 0:
-		marks := make([]string, len(opts.Categories))
-		for i, c := range opts.Categories {
-			marks[i] = "?"
-			args = append(args, c)
-		}
-		conditions = append(conditions, "category IN ("+strings.Join(marks, ",")+")")
-	case opts.Category != "":
-		conditions = append(conditions, "category = ?")
-		args = append(args, opts.Category)
-	}
-	if opts.ProjectID != "" {
-		conditions = append(conditions, "project_id = ?")
-		args = append(args, opts.ProjectID)
-	}
-	if opts.Source != "" {
-		conditions = append(conditions, "source = ?")
-		args = append(args, opts.Source)
-	}
-
-	switch {
-	case len(opts.Categories) > 0:
 		// Build a `category IN (?, ?, ...)` clause. ?-placeholders only —
 		// driver handles escaping; never inline category strings.
 		marks := make([]string, len(opts.Categories))
@@ -570,6 +549,27 @@ func (s *SQLiteStore) Update(ctx context.Context, id string, content string, cat
 	)
 	if err != nil {
 		return fmt.Errorf("update memory %s: %w", id, err)
+	}
+	s.cache.Remove(id)
+	return nil
+}
+
+func (s *SQLiteStore) UpdateMetadata(ctx context.Context, id string, metadata any) error {
+	var metadataJSON any
+	if metadata != nil {
+		b, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("marshal metadata: %w", err)
+		}
+		metadataJSON = string(b)
+	}
+
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE memories SET metadata = ? WHERE id = ? AND deleted_at IS NULL`,
+		metadataJSON, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update metadata %s: %w", id, err)
 	}
 	s.cache.Remove(id)
 	return nil

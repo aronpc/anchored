@@ -315,6 +315,13 @@ func applyLifecycleBoost(results []SearchResult, now time.Time) []SearchResult {
 			results[i].Score *= 1.0 + meta.Importance*0.3
 		}
 
+		if meta.CurationStatus == CurationStatusLowSignal {
+			results[i].Score *= 0.03
+		}
+		if meta.QualityScore > 0 && meta.QualityScore < RemoteQualityThreshold && !meta.Pinned {
+			results[i].Score *= 0.15
+		}
+
 		switch meta.Kind {
 		case "decision", "learning", "rule":
 			results[i].Score *= 1.15

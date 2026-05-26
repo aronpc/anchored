@@ -118,6 +118,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 			projectID = &proj.ID
 		}
 	}
+	hasProject := projectID != nil
 
 	hash := contentHash(opts.Content)
 	existing, err := s.store.FindByContentHash(ctx, hash, projectID)
@@ -125,6 +126,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 		s.logger.Warn("content hash lookup failed, proceeding with save", "error", err)
 	} else if existing != nil {
 		metadata = WithPreferenceScope(existing.Metadata, opts.Category, opts.PreferenceScope)
+		metadata = ApplyQualityMetadata(metadata, opts.Content, opts.Category, hasProject)
 		upd := Memory{
 			ID:          existing.ID,
 			Content:     opts.Content,
@@ -146,6 +148,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 		return &upd, nil
 	}
 
+	metadata = ApplyQualityMetadata(metadata, opts.Content, opts.Category, hasProject)
 	m := Memory{
 		Content:     opts.Content,
 		Category:    opts.Category,
@@ -248,9 +251,13 @@ func (s *Service) Update(ctx context.Context, id, content, category string) (*Me
 	if updateCategory == "" {
 		updateCategory = m.Category
 	}
+	updatedMetadata := ApplyQualityMetadata(m.Metadata, updateContent, updateCategory, m.ProjectID != nil)
 
 	if err := s.store.Update(ctx, id, updateContent, updateCategory); err != nil {
 		return nil, fmt.Errorf("update: %w", err)
+	}
+	if err := s.store.UpdateMetadata(ctx, id, updatedMetadata); err != nil {
+		return nil, fmt.Errorf("update metadata: %w", err)
 	}
 
 	if content != "" {
@@ -263,7 +270,12 @@ func (s *Service) Update(ctx context.Context, id, content, category string) (*Me
 
 	m.Content = updateContent
 	m.Category = updateCategory
+	m.Metadata = updatedMetadata
 	return m, nil
+}
+
+func (s *Service) UpdateMetadata(ctx context.Context, id string, metadata any) error {
+	return s.store.UpdateMetadata(ctx, id, metadata)
 }
 
 func (s *Service) SoftForget(ctx context.Context, id string) error {
