@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,7 +13,19 @@ import (
 	"github.com/jholhewres/anchored/pkg/memory"
 )
 
-const curationLastRunKey = "last_run_at"
+const (
+	curationLastRunKey = "last_run_at"
+	// curationReconciledVersionKey records the scorer version the corpus was
+	// last fully reconciled at. When it lags QualityScorerVersion (e.g. right
+	// after an upgrade), the worker performs a one-time full backlog drain on
+	// startup so the existing memories are repaired automatically — no manual
+	// `curation reconcile` needed.
+	curationReconciledVersionKey = "reconciled_version"
+	// curationBootstrapMax is an effectively-unlimited per-pass cap used only by
+	// the startup backlog drain. The metadata pass is pure SQL UPDATEs (no
+	// embeddings), so draining the whole corpus once is cheap.
+	curationBootstrapMax = 1 << 30
+)
 
 // runCurationWorker is a safe, opportunistic maintenance loop for MCP serve.
 // It never deletes or rewrites memory content; it only refreshes metadata used
@@ -30,6 +43,12 @@ func runCurationWorker(ctx context.Context, svc *memory.Service, cfg config.Cura
 	if cfg.MaxUpdates <= 0 {
 		cfg.MaxUpdates = 500
 	}
+
+	// One-time backlog drain after an upgrade: repair the existing corpus
+	// (stale low_signal flags, unscored memories) in a single pass instead of
+	// trickling through it at max_updates_per_run. Guarded by reconciled_version
+	// so it only runs once per scorer bump, even though serve starts per session.
+	curationBootstrap(ctx, svc, cfg.Threshold, logger)
 
 	interval := curationInterval(cfg)
 	tryRun := func() {
@@ -60,6 +79,42 @@ func runCurationWorker(ctx context.Context, svc *memory.Service, cfg config.Cura
 			tryRun()
 		}
 	}
+}
+
+// curationBootstrap drains the full backlog of stale/unscored memories once,
+// the first time serve runs at a new scorer version. It is safe to call on
+// every startup: when reconciled_version already matches the current scorer it
+// returns immediately. Errors are logged but never fatal — the incremental
+// ticker still runs and will eventually catch up.
+func curationBootstrap(ctx context.Context, svc *memory.Service, threshold float64, logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	done, err := getCurationReconciledVersion(ctx, svc.StoreDB())
+	if err != nil {
+		logger.Warn("curation bootstrap state read failed", "error", err)
+		return
+	}
+	if done >= memory.QualityScorerVersion {
+		return
+	}
+
+	runCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	start := time.Now()
+	updated, scanned, err := runCurationMetadataPass(runCtx, svc, threshold, curationBootstrapMax)
+	if err != nil {
+		// Partial progress is fine; do NOT record the version so the next
+		// startup retries the remaining backlog.
+		logger.Warn("curation bootstrap incomplete", "error", err, "updated", updated, "scanned", scanned)
+		return
+	}
+	if err := setCurationReconciledVersion(ctx, svc.StoreDB(), memory.QualityScorerVersion); err != nil {
+		logger.Warn("curation bootstrap version write failed", "error", err)
+	}
+	logger.Info("curation bootstrap complete",
+		"scorer_version", memory.QualityScorerVersion, "scanned", scanned, "updated", updated,
+		"duration", time.Since(start).Round(time.Millisecond))
 }
 
 func curationInterval(cfg config.CurationConfig) time.Duration {
@@ -96,21 +151,7 @@ func runCurationMetadataPass(ctx context.Context, svc *memory.Service, threshold
 		for _, m := range page {
 			scanned++
 			meta := memory.ParseMetadata(m.Metadata)
-			score := memory.ScoreQuality(m.Content, m.Category, m.ProjectID != nil)
-			changed := meta.QualityScore != score
-			meta.QualityScore = score
-			if meta.Importance == 0 || meta.Importance > score {
-				meta.Importance = score
-				changed = true
-			}
-			if score < threshold && !meta.Pinned && meta.CurationStatus != memory.CurationStatusLowSignal {
-				meta.CurationStatus = memory.CurationStatusLowSignal
-				changed = true
-			}
-			if score >= threshold && meta.CurationStatus == memory.CurationStatusLowSignal {
-				meta.CurationStatus = ""
-				changed = true
-			}
+			meta, changed := memory.RecurateMetadata(meta, m.Content, m.Category, m.ProjectID != nil, threshold)
 			if !changed {
 				continue
 			}
@@ -135,11 +176,11 @@ func listRecentCurationCandidates(ctx context.Context, db *sql.DB, limit int) ([
 		WHERE deleted_at IS NULL
 		  AND (
 		    metadata IS NULL
-		    OR json_extract(metadata, '$.quality_score') IS NULL
-		    OR json_extract(metadata, '$.importance') IS NULL
+		    OR json_extract(metadata, '$.scorer_version') IS NULL
+		    OR json_extract(metadata, '$.scorer_version') < ?
 		  )
 		ORDER BY updated_at DESC, created_at DESC
-		LIMIT ?`, limit)
+		LIMIT ?`, memory.QualityScorerVersion, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +225,34 @@ func getCurationLastRun(ctx context.Context, db *sql.DB) (time.Time, bool, error
 		return time.Time{}, false, nil
 	}
 	return t, true, nil
+}
+
+func getCurationReconciledVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var raw string
+	err := db.QueryRowContext(ctx, `SELECT value FROM curation_state WHERE key = ?`, curationReconciledVersionKey).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	if err != nil && strings.Contains(err.Error(), "no such table") {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	v, convErr := strconv.Atoi(strings.TrimSpace(raw))
+	if convErr != nil {
+		return 0, nil
+	}
+	return v, nil
+}
+
+func setCurationReconciledVersion(ctx context.Context, db *sql.DB, version int) error {
+	_, err := db.ExecContext(ctx, `
+		INSERT INTO curation_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP`,
+		curationReconciledVersionKey, strconv.Itoa(version),
+	)
+	return err
 }
 
 func setCurationLastRun(ctx context.Context, db *sql.DB, t time.Time) error {
