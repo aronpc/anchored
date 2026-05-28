@@ -150,6 +150,11 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 
 	metadata = ApplyQualityMetadata(metadata, opts.Content, opts.Category, hasProject)
 	m := Memory{
+		// Assign the ID here rather than letting store.Save generate it: Save
+		// takes Memory by value, so an ID generated there never propagates back
+		// and embedAsync/observers would run with an empty ID — leaving the
+		// embedding column unpopulated on the create path.
+		ID:          newUUID(),
 		Content:     opts.Content,
 		Category:    opts.Category,
 		Source:      opts.Source,
