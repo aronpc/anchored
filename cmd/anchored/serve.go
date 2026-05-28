@@ -65,6 +65,12 @@ func runServe() {
 	// queries fast while preserving a useful historical horizon.
 	go runEventCleanup(ctx, memSvc, logger, 30*24*time.Hour, 24*time.Hour)
 
+	if cfg.Curation.Enabled {
+		go runCurationWorker(ctx, memSvc, cfg.Curation, logger)
+	} else {
+		logger.Info("curation worker disabled")
+	}
+
 	if err := serveSTDIO(ctx, memSvc, cfg, logger); err != nil {
 		slog.Error("serve error", "error", err)
 		os.Exit(1)
