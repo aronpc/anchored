@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.6] - 2026-05-28
+
+### Added
+
+- **Default-on curation worker** — `anchored serve` now starts a safe background curation worker by default. It runs in small incremental passes, processes newest memories first (`updated_at DESC, created_at DESC`), and only refreshes lifecycle metadata (`quality_score`, `importance`, `curation_status`). It never rewrites content, soft-deletes, or hard-deletes memories automatically.
+- **Curation worker controls** — new `anchored curation status`, `anchored curation enable`, and `anchored curation disable` commands. Status is lightweight and reads config/state without booting the full memory service or ONNX/FTS stack.
+- **Curation config block** — new `curation.*` settings: `enabled`, `interval_hours`, `interval_minutes`, `threshold`, and `max_updates_per_run`. `interval_minutes` overrides `interval_hours` when set and enables short-cycle local maintenance.
+- **Curation state table** — migration `012_curation_state` stores worker state such as `last_run_at` so serve-time curation is resumable and does not depend on a long-lived daemon.
+
+### Changed
+
+- Default curation policy is now short and incremental: enabled, `interval_minutes=15`, `threshold=0.55`, and `max_updates_per_run=50`.
+- Curation now distinguishes the always-on safe path from `dream`: curation handles cheap metadata health; dream remains explicit/manual for deduplication, merge/supersede actions, and contradiction review.
+- README rewritten for clearer onboarding, CLI organization, curation/dream explanation, MCP tools, storage, configuration, and development/release flow.
+
+### Verified
+
+- Built a release test binary and ran an end-to-end curation worker pass against an isolated copy of the local database with `interval_minutes=1` and `max_updates_per_run=5`. Logs confirmed two one-minute passes, each scanning/updating 5 memories, and `curation_state.last_run_at` was written.
+- `go test ./pkg/config ./pkg/kg` passes.
+- `go test ./cmd/anchored ./pkg/memory ./pkg/mcp -run '^$'` compiles FTS-dependent packages in this environment.
+
 ## [0.5.5] - 2026-05-25
 
 ### Added
