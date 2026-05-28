@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/jholhewres/anchored/pkg/memory"
 )
@@ -16,6 +18,12 @@ func runCuration(args []string) {
 		os.Exit(1)
 	}
 	switch args[0] {
+	case "status":
+		runCurationStatus(args[1:])
+	case "enable":
+		runCurationSetEnabled(true)
+	case "disable":
+		runCurationSetEnabled(false)
 	case "score":
 		runCurationScore(args)
 	case "clean":
@@ -30,9 +38,74 @@ func runCuration(args []string) {
 
 func printCurationUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
+	fmt.Fprintln(os.Stderr, "  anchored curation status")
+	fmt.Fprintln(os.Stderr, "  anchored curation enable")
+	fmt.Fprintln(os.Stderr, "  anchored curation disable")
 	fmt.Fprintln(os.Stderr, "  anchored curation score   [--apply] [--threshold 0.55] [--limit 20]")
 	fmt.Fprintln(os.Stderr, "  anchored curation clean   [--hard] [--threshold 0.55] [--dry-run] [--yes]")
 	fmt.Fprintln(os.Stderr, "  anchored curation restore [--from PATH] [--latest] [--yes]")
+}
+
+func runCurationStatus(args []string) {
+	fs := newFlagSet("curation status")
+	configPath := fs.String("config", "", "path to config file")
+	fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	var last time.Time
+	var ok bool
+	if _, statErr := os.Stat(cfg.Memory.DatabasePath); statErr == nil {
+		db, err := sql.Open("sqlite3", cfg.Memory.DatabasePath+"?_journal_mode=WAL&_busy_timeout=5000")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+		last, ok, err = getCurationLastRun(context.Background(), db)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to read curation state: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	interval := curationInterval(cfg.Curation)
+	threshold := cfg.Curation.Threshold
+	if threshold <= 0 {
+		threshold = memory.RemoteQualityThreshold
+	}
+	maxUpdates := cfg.Curation.MaxUpdates
+	if maxUpdates <= 0 {
+		maxUpdates = 500
+	}
+
+	fmt.Printf("Curation worker: %s\n", enabledLabel(cfg.Curation.Enabled))
+	fmt.Printf("Interval: %s\n", interval)
+	fmt.Printf("Threshold: %.2f\n", threshold)
+	fmt.Printf("Max updates/run: %d\n", maxUpdates)
+	if ok {
+		fmt.Printf("Last run: %s\n", last.Format(time.RFC3339))
+	} else {
+		fmt.Println("Last run: never")
+	}
+}
+
+func runCurationSetEnabled(enabled bool) {
+	configFile, cfg := loadWritableConfig()
+	cfg.Curation.Enabled = enabled
+	writeConfigFile(configFile, cfg)
+	fmt.Printf("Curation worker %s. Wrote %s\n", enabledLabel(enabled), configFile)
+}
+
+func enabledLabel(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
 }
 
 func runCurationScore(args []string) {

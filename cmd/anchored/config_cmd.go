@@ -105,6 +105,13 @@ func runConfigWizard() {
 	cfg.ContextOptimizer.FetchCacheTTL = promptInt(reader, "Fetch cache TTL hours", cfg.ContextOptimizer.FetchCacheTTL)
 
 	fmt.Fprintln(os.Stderr)
+	cfg.Curation.Enabled = promptBool(reader, "Enable curation worker", cfg.Curation.Enabled)
+	cfg.Curation.IntervalHours = promptInt(reader, "Curation interval hours", cfg.Curation.IntervalHours)
+	cfg.Curation.IntervalMinutes = promptInt(reader, "Curation interval minutes override (0 = use hours)", cfg.Curation.IntervalMinutes)
+	cfg.Curation.Threshold = promptFloat(reader, "Curation low-signal threshold", cfg.Curation.Threshold)
+	cfg.Curation.MaxUpdates = promptInt(reader, "Curation max updates per run", cfg.Curation.MaxUpdates)
+
+	fmt.Fprintln(os.Stderr)
 	cfg.Dream.Aggressiveness = promptString(reader, "Dream aggressiveness", cfg.Dream.Aggressiveness)
 	cfg.Dream.DedupThreshold = promptFloat(reader, "Dream dedup threshold", cfg.Dream.DedupThreshold)
 	cfg.Dream.MaxDeletionsPerRun = promptInt(reader, "Dream max deletions per run", cfg.Dream.MaxDeletionsPerRun)
@@ -238,6 +245,16 @@ func setConfigValue(cfg *config.Config, key, value string) {
 		fmt.Sscanf(value, "%d", &cfg.Search.MaxResults)
 	case "sanitizer.enabled":
 		cfg.Sanitizer.Enabled = value == "true"
+	case "curation.enabled":
+		cfg.Curation.Enabled = value == "true"
+	case "curation.interval_hours":
+		fmt.Sscanf(value, "%d", &cfg.Curation.IntervalHours)
+	case "curation.interval_minutes":
+		fmt.Sscanf(value, "%d", &cfg.Curation.IntervalMinutes)
+	case "curation.threshold":
+		fmt.Sscanf(value, "%f", &cfg.Curation.Threshold)
+	case "curation.max_updates_per_run":
+		fmt.Sscanf(value, "%d", &cfg.Curation.MaxUpdates)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown config key: %s\n", key)
 		os.Exit(1)
