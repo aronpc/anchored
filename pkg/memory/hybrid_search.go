@@ -315,10 +315,15 @@ func applyLifecycleBoost(results []SearchResult, now time.Time) []SearchResult {
 			results[i].Score *= 1.0 + meta.Importance*0.3
 		}
 
-		if meta.CurationStatus == CurationStatusLowSignal {
+		// Demotion for weak memories. The two conditions are mutually
+		// exclusive: low_signal is the explicit flag and wins; the
+		// quality-score band is a softer fallback for memories scored below
+		// threshold that were never flagged. Multiplying both stacked to
+		// ~0.0045 and effectively erased legitimate hits.
+		switch {
+		case meta.CurationStatus == CurationStatusLowSignal:
 			results[i].Score *= 0.03
-		}
-		if meta.QualityScore > 0 && meta.QualityScore < RemoteQualityThreshold && !meta.Pinned {
+		case meta.QualityScore > 0 && meta.QualityScore < RemoteQualityThreshold && !meta.Pinned:
 			results[i].Score *= 0.15
 		}
 
