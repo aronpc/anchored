@@ -40,6 +40,13 @@ const (
 	// RemoteQualityThreshold: minimum quality_score for remote sync eligibility.
 	// Referenced by preview, IsRemoteSyncCandidate, and hybrid search demotion.
 	RemoteQualityThreshold = 0.55
+
+	// QualityScorerVersion identifies the current ScoreQuality formula. It is
+	// stamped onto metadata whenever a memory is (re)curated. The serve-time
+	// worker and `curation reconcile` treat any memory whose scorer_version is
+	// missing or lower than this as a candidate, so formula changes re-flow
+	// through the whole corpus instead of only touching brand-new memories.
+	QualityScorerVersion = 2
 )
 
 // MemoryMetadata provides structured metadata for memories.
@@ -68,6 +75,11 @@ type MemoryMetadata struct {
 	ContextTier    string   `json:"context_tier,omitempty"` // "L0", "L1", "L2" context stack hint
 	Confidence     float64  `json:"confidence,omitempty"`   // 0.0..1.0 for bootstrap/import/inferred items
 	CurationStatus string   `json:"curation_status,omitempty"`
+	// ScorerVersion records which ScoreQuality formula last curated this memory.
+	// Drives re-curation: a value below QualityScorerVersion means stale. Also
+	// acts as the "has been scored" marker so a legitimate quality_score of 0
+	// (omitempty would otherwise drop it) does not look like an unscored memory.
+	ScorerVersion int `json:"scorer_version,omitempty"`
 
 	// Extra preserves unknown metadata keys from raw maps that are not
 	// represented in this struct. Not serialized directly; merged during
@@ -96,6 +108,7 @@ func (m MemoryMetadata) isZero() bool {
 		m.ContextTier == "" &&
 		m.Confidence == 0 &&
 		m.CurationStatus == "" &&
+		m.ScorerVersion == 0 &&
 		len(m.Extra) == 0
 }
 
@@ -174,7 +187,7 @@ func ParseMetadata(v any) MemoryMetadata {
 			"memory_type":      true, "kind": true, "scope": true, "origin": true,
 			"importance": true, "pinned": true, "expires_at": true,
 			"supersedes": true, "context_tier": true, "confidence": true,
-			"curation_status": true,
+			"curation_status": true, "scorer_version": true,
 		}
 		for k, val := range raw {
 			if !knownKeys[k] {
