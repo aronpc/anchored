@@ -4,23 +4,24 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"path"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
-	Memory          MemoryConfig          `yaml:"memory"`
-	Embedding       EmbeddingConfig       `yaml:"embedding"`
-	Search          SearchConfig          `yaml:"search"`
-	Sanitizer       SanitizerConfig       `yaml:"sanitizer"`
-	Indexer         IndexerConfig         `yaml:"indexer"`
-	Dream           DreamConfig           `yaml:"dream"`
+	Memory           MemoryConfig           `yaml:"memory"`
+	Embedding        EmbeddingConfig        `yaml:"embedding"`
+	Search           SearchConfig           `yaml:"search"`
+	Sanitizer        SanitizerConfig        `yaml:"sanitizer"`
+	Indexer          IndexerConfig          `yaml:"indexer"`
+	Curation         CurationConfig         `yaml:"curation"`
+	Dream            DreamConfig            `yaml:"dream"`
 	ContextOptimizer ContextOptimizerConfig `yaml:"context_optimizer"`
-	Debug           DebugConfig           `yaml:"debug"`
-	Plugin          PluginConfig          `yaml:"plugin"`
-	Remote          RemoteConfig          `yaml:"remote"`
+	Debug            DebugConfig            `yaml:"debug"`
+	Plugin           PluginConfig           `yaml:"plugin"`
+	Remote           RemoteConfig           `yaml:"remote"`
 	// Remotes maps named remotes. When non-empty, takes precedence over Remote.
 	Remotes map[string]RemoteEntry `yaml:"remotes,omitempty"`
 }
@@ -80,12 +81,12 @@ type DebugConfig struct {
 }
 
 type ContextOptimizerConfig struct {
-	Enabled         bool `yaml:"enabled"`
-	DefaultTTL      int  `yaml:"default_ttl_hours"`
-	LRUCapMB        int  `yaml:"lru_cap_mb"`
-	SandboxTimeout  int  `yaml:"sandbox_timeout_seconds"`
-	MaxOutputKB     int  `yaml:"max_output_kb"`
-	FetchCacheTTL   int  `yaml:"fetch_cache_ttl_hours"`
+	Enabled        bool `yaml:"enabled"`
+	DefaultTTL     int  `yaml:"default_ttl_hours"`
+	LRUCapMB       int  `yaml:"lru_cap_mb"`
+	SandboxTimeout int  `yaml:"sandbox_timeout_seconds"`
+	MaxOutputKB    int  `yaml:"max_output_kb"`
+	FetchCacheTTL  int  `yaml:"fetch_cache_ttl_hours"`
 }
 
 type DreamConfig struct {
@@ -99,6 +100,20 @@ type IndexerConfig struct {
 	Enabled  bool     `yaml:"enabled"`
 	Paths    []string `yaml:"paths"`
 	Interval string   `yaml:"interval"`
+}
+
+// CurationConfig controls the lightweight serve-time maintenance pass.
+// It is intentionally safe by default: the worker only refreshes lifecycle
+// metadata such as quality_score/importance/curation_status. Destructive
+// cleanup still requires explicit CLI commands.
+type CurationConfig struct {
+	Enabled       bool `yaml:"enabled"`
+	IntervalHours int  `yaml:"interval_hours"`
+	// IntervalMinutes overrides IntervalHours when > 0. Useful for tests and
+	// users who want more aggressive local-only maintenance.
+	IntervalMinutes int     `yaml:"interval_minutes,omitempty"`
+	Threshold       float64 `yaml:"threshold"`
+	MaxUpdates      int     `yaml:"max_updates_per_run"`
 }
 
 type MemoryConfig struct {
@@ -149,6 +164,13 @@ func Defaults() *Config {
 		},
 		Sanitizer: SanitizerConfig{
 			Enabled: false,
+		},
+		Curation: CurationConfig{
+			Enabled:         true,
+			IntervalHours:   24,
+			IntervalMinutes: 15,
+			Threshold:       0.55,
+			MaxUpdates:      50,
 		},
 		Dream: DreamConfig{
 			Aggressiveness:      "moderate",
