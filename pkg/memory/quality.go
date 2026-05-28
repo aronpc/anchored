@@ -84,18 +84,55 @@ func ApplyQualityMetadata(metadata any, content, category string, hasProject boo
 		m.Origin = OriginManual
 	}
 
-	quality := ScoreQuality(content, category, hasProject)
-	m.QualityScore = quality
-	if m.Importance == 0 {
-		m.Importance = quality
-	}
-	if quality < 0.55 && !m.Pinned {
-		m.CurationStatus = CurationStatusLowSignal
-	}
-	if quality >= 0.7 && m.CurationStatus == CurationStatusLowSignal {
-		m.CurationStatus = ""
-	}
+	m, _ = RecurateMetadata(m, content, category, hasProject, RemoteQualityThreshold)
 	return m.ToAny()
+}
+
+// RecurateMetadata is the single canonical pass that refreshes the quality
+// lifecycle fields (quality_score, importance, curation_status, scorer_version)
+// for a memory. It is shared by the save path (ApplyQualityMetadata), the
+// serve-time worker, and the `curation` CLI so the three never diverge.
+//
+// It is intentionally non-destructive: importance is only initialized when
+// unset (never ratcheted down toward the mechanical quality score), and only
+// the lifecycle fields above are touched. The returned bool reports whether any
+// field actually changed, so callers can skip no-op writes.
+func RecurateMetadata(m MemoryMetadata, content, category string, hasProject bool, threshold float64) (MemoryMetadata, bool) {
+	if threshold <= 0 {
+		threshold = RemoteQualityThreshold
+	}
+
+	score := ScoreQuality(content, category, hasProject)
+	changed := false
+
+	if m.QualityScore != score {
+		m.QualityScore = score
+		changed = true
+	}
+	if m.ScorerVersion != QualityScorerVersion {
+		m.ScorerVersion = QualityScorerVersion
+		changed = true
+	}
+	// Initialize importance only; never reduce a value someone (user/dream) set
+	// deliberately. importance is a retention/ranking hint, not the text score.
+	if m.Importance == 0 {
+		m.Importance = score
+		changed = true
+	}
+
+	switch {
+	case score < threshold && !m.Pinned:
+		if m.CurationStatus != CurationStatusLowSignal {
+			m.CurationStatus = CurationStatusLowSignal
+			changed = true
+		}
+	case m.CurationStatus == CurationStatusLowSignal:
+		// Score recovered (or memory pinned): lift the demotion flag.
+		m.CurationStatus = ""
+		changed = true
+	}
+
+	return m, changed
 }
 
 func punctuationRatio(s string) float64 {
