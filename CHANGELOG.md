@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.8] - 2026-05-28
+
+### Added
+
+- **Versioned quality scorer** — memories now carry a `scorer_version` in metadata. When the scoring formula changes, the worker and the new reconcile command re-flow scores through the whole corpus instead of only touching brand-new memories.
+- **Automatic backlog bootstrap** — on `anchored serve` startup, the curation worker performs a one-time full re-curation of the existing corpus when `scorer_version` lags (guarded by `reconciled_version` in `curation_state`), then settles into incremental passes. Repairs legacy memories with no manual command required.
+- **`anchored curation reconcile`** — re-scores the entire corpus in a single pass and repairs stale `low_signal` flags; records `reconciled_version` so the serve bootstrap does not redundantly re-drain.
+- **Richer `curation status`** — now shows the scorer version, corpus reconcile state, and pending candidate count.
+
+### Changed
+
+- **Curation worker selects by `scorer_version`** (missing or below current) rather than only unscored memories, so an existing corpus is actually re-curated after a scorer change.
+- **Single canonical scoring path** — `RecurateMetadata` is now shared by the save path, the worker, and the CLI, replacing three divergent implementations with different `low_signal` clear thresholds.
+- **`importance` is only initialized, never reduced** — the worker no longer ratchets a deliberately-set importance down toward the mechanical quality score.
+- **MCP routing guidance** — the server instructions and `anchored_save` description now assert anchored as the authoritative memory store and treat an explicit "remember/save" request as an unconditional trigger, so agents stop routing memory to native features or local files.
+
+### Fixed
+
+- **Search demotion no longer stacks** — `low_signal` (×0.03) and the sub-threshold quality band (×0.15) were multiplied together (~0.0045), effectively erasing legitimate hits. They are now mutually exclusive, which unburies the large share of the corpus that older formula versions had over-flagged.
+- **Embeddings persist on save** — the create path assigned the memory ID to a by-value copy, so `embedAsync`/observers ran with an empty ID and the embedding column was never populated. The ID is now assigned before save.
+
 ## [0.5.7] - 2026-05-28
 
 ### Added
