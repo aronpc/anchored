@@ -94,6 +94,13 @@ func Migrate(db *sql.DB) error {
 				client_id TEXT NOT NULL
 			);
 		`},
+		{Name: "012_curation_state", Up: `
+			CREATE TABLE IF NOT EXISTS curation_state (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL,
+				updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			);
+		`},
 	}
 
 	for _, m := range migrations {
