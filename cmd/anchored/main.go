@@ -96,6 +96,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored curation status    Show curation worker state\n")
 	fmt.Fprintf(os.Stderr, "  anchored curation disable   Disable serve-time curation worker\n")
 	fmt.Fprintf(os.Stderr, "  anchored curation score     Score and mark low-signal memories\n")
+	fmt.Fprintf(os.Stderr, "  anchored curation reconcile Re-score entire corpus, repair stale flags\n")
 	fmt.Fprintf(os.Stderr, "  anchored doctor             Diagnose installation, config, MCP registration\n")
 	fmt.Fprintf(os.Stderr, "  anchored purge              Wipe memories (--hard for full DB reset)\n")
 	fmt.Fprintf(os.Stderr, "  anchored inspect <id>      Show full memory details\n")
