@@ -6,40 +6,49 @@
 [![Go](https://img.shields.io/badge/go-1.25+-00ADD8?style=for-the-badge&logo=go)]
 [![Release](https://img.shields.io/github/v/release/jholhewres/anchored?style=for-the-badge)](https://github.com/jholhewres/anchored/releases)
 
-Anchored is a local-first MCP memory server that gives every AI coding agent and IDE you use a shared, persistent memory on your machine. Install once, and Claude Code, Cursor, OpenCode, Antigravity (agy), Gemini CLI, and any other MCP-compatible tool read, write, and search the same knowledge base.
+Anchored gives Claude Code, Cursor, OpenCode, Gemini CLI, Codex, VS Code Copilot, and other MCP-compatible tools one shared memory database on your machine.
 
-No API keys. No daemon. All embeddings run locally.
+- Local-first: no account, no cloud dependency, no required API key.
+- One binary: `anchored` is both the CLI and MCP server.
+- Fast retrieval: SQLite FTS5 + local ONNX embeddings + knowledge graph.
+- Safe lifecycle: memories are scored, curated, inspected, exported, forgotten, and synced with privacy filters.
 
-For team-shared project memory, the planned self-hosted/open distribution lives in [`anchored_oss`](../anchored_oss): organization-owned projects, team permissions, remote sync, privacy guardrails, and a future cloud-compatible protocol.
+For team-shared project memory, the optional self-hosted/server side lives in [`anchored_oss`](../anchored_oss). Local Anchored remains the source of truth and the hot retrieval path.
 
-## Features
+## What Anchored remembers
 
-- **Cross-tool memory** — one knowledge base, every AI tool and IDE shares it
-- **Multilingual embeddings** — `paraphrase-multilingual-MiniLM-L12-v2` (50+ languages, PT-BR and EN parity)
-- **Hybrid search** — RRF fusion of vector similarity (384-dim ONNX) and BM25 (FTS5), with entity and project boost
-- **Knowledge graph** — automatic pattern-based extraction of entities and relationships (no LLM needed)
-- **Smart categorization** — bilingual PT+EN regex auto-classifies memories into 7 categories (fact, preference, decision, event, learning, plan, summary)
-- **Memory stack** — L0 identity + L1 essential stories + L2 on-demand retrieval, budget-enforced (~900 tokens)
-- **Sandbox tools** — `anchored_execute`/`anchored_execute_file` run code in 11 languages with stdout-only capture, hardened env, FILE_PATH/FILE_CONTENT injection
-- **Knowledge indexing** — `anchored_fetch_and_index` mirrors URLs to a local FTS5 store; sandbox keeps raw data out of context
-- **Background auto-updater** — checks GitHub releases on startup; new binary atomically replaced, current process unaffected
-- **Credential redaction** — regex-based secret sanitization with configurable custom patterns
-- **Preference scopes** — `user`/`project`/`team` scope metadata on preferences (defaults to `user`)
-- **Stable project identity** — git remote URL derived `RemoteKey` (SHA-256) for cross-machine consistency
-- **Remote safety filter** — detects local paths, secrets, and personal preferences in outbound content
-- **Sync-ready schema** — dirty flags, sync origin, author, remote project key columns and `sync_state` table
-- **Memory inspection** — `inspect` for full JSON details, `export` with filters (JSON/JSONL)
-- **Remote preview** — classify memories as syncable/blocked/needs-review without network access
-- **Dream review** — apply individual dream actions, dedup soft-deletes, contradictions require manual review
-- **Multi-source import** — Claude Code (JSONL), OpenCode (SQLite), Cursor (.mdc rules), DevClaw
-- **Team sync ready** — design work for self-hosted and cloud-compatible shared project memory lives in `docs/team-sync.md` and the sibling `anchored_oss` repo
+Anchored stores small durable memories, not raw chat dumps by default. The public categories stay intentionally simple:
+
+| Category | Use for |
+|---|---|
+| `fact` | Stable truths about a user, project, team, stack, API, or system. |
+| `preference` | Personal preferences, project conventions, or team rules. Preferences have `user`/`project`/`team` scope. |
+| `decision` | Architecture, tooling, naming, process, or product decisions. |
+| `event` | Time-bound events: deploys, meetings, incidents, releases. |
+| `learning` | Non-obvious lessons, gotchas, root causes, post-mortems. |
+| `plan` | Intent, backlog, next steps, TODOs. |
+| `summary` | Handoffs, recaps, precompact snapshots, daily/project summaries. |
+
+Behind those categories, Anchored stores lifecycle metadata (`memory_type`, `kind`, `scope`, `origin`, `importance`, `confidence`, `expires_at`, `context_tier`, `curation_status`) so search, context injection, retention, curation, and remote sync make consistent decisions without making the MCP API harder for agents to use.
+
+## Core features
+
+- **Cross-tool memory** — all supported agents read/write the same local memory store.
+- **Hybrid search** — RRF fusion of BM25, local multilingual embeddings, entity detection, project boost, topic diversity, and lifecycle scoring.
+- **Knowledge graph** — pattern-based and explicit subject/predicate/object relationships, scoped by project.
+- **Memory stack** — `anchored_context` returns identity, project stats, recent durable knowledge, and recent important session events under a tight budget.
+- **Curated lifecycle** — default-on background curation scores recent memories in small batches and marks low-signal entries without deleting anything.
+- **Dream review** — explicit/manual duplicate and contradiction analysis. Dedup can soft-delete; contradictions require manual review.
+- **Privacy-first sync** — remote preview/sync block local paths, secrets, personal preferences, episodic/operational data, and low-quality memories by default.
+- **Sandbox and indexing tools** — run code, process files, fetch docs, and index large output without flooding the model context.
+- **Inspection and export** — inspect exact metadata, list memories, export JSON/JSONL, restore curation backups, and purge safely.
+- **Multi-source import** — Claude Code JSONL, OpenCode SQLite, Cursor `.mdc`, and DevClaw.
 
 ## Install
 
-From [GitHub Releases](https://github.com/jholhewres/anchored/releases):
+From GitHub Releases:
 
 ```bash
-# Linux / macOS
 curl -fsSL https://raw.githubusercontent.com/jholhewres/anchored/main/install/install.sh | bash
 ```
 
@@ -47,63 +56,73 @@ From source:
 
 ```bash
 git clone https://github.com/jholhewres/anchored.git
-cd anchored && make build
+cd anchored
+make build
 sudo cp bin/anchored /usr/local/bin/
 ```
 
-First run auto-downloads the embedding model (~470MB) and creates `~/.anchored/`.
+First run creates `~/.anchored/` and downloads the local embedding model when needed (~470 MB).
 
 ## Setup
 
-### Claude Code (plugin)
+### Claude Code plugin
 
-The fastest path. Installs the MCP server, six `/anchored:*` slash commands, and an auto-trigger skill in one step:
+The plugin is the easiest path because it installs MCP registration, slash commands, hooks, and the auto-trigger skill together:
 
-```
+```text
 /plugin marketplace add jholhewres/anchored
 /plugin install anchored@anchored
 ```
 
-Then restart Claude Code. From any project: `/anchored:context`, `/anchored:search <query>`, `/anchored:save <content>`, `/anchored:stats`, `/anchored:doctor`, `/anchored:purge`. The skill triggers `anchored_*` tools proactively when memory is relevant — no need to ask.
+Restart Claude Code after installation. Available slash commands include `/anchored:context`, `/anchored:search`, `/anchored:save`, `/anchored:stats`, `/anchored:doctor`, and `/anchored:purge`.
 
-### Claude Code (MCP only, no slash commands)
+### MCP only
 
 ```bash
 claude mcp add -s user anchored anchored
 ```
 
-The `-s user` flag registers Anchored at user scope so it's available in every project. Without it, `claude mcp add` defaults to local. Entry lives at `~/.claude.json` (not `~/.claude/mcp.json`). Restart Claude Code to pick up the new server.
+The `-s user` flag makes Anchored available in every project. Without it, Claude Code registers the server only for the current project.
 
 ### Other tools
 
-Run `anchored init` to auto-detect and register, or configure manually:
+Run auto-detection:
+
+```bash
+anchored init
+```
+
+Or target one tool:
+
+```bash
+anchored init --tool cursor
+anchored init --tool opencode
+anchored init --tool gemini
+anchored init --tool agy
+anchored init --tool windsurf
+anchored init --tool cline
+anchored init --tool vscode --cwd /path/to/project
+anchored init --tool codex
+anchored init --tool devin
+```
+
+Supported config locations:
 
 | Tool | Config file |
 |---|---|
+| Claude Code | `~/.claude.json` |
 | Cursor | `~/.cursor/mcp.json` |
 | OpenCode | `~/.config/opencode/opencode.json` |
 | Gemini CLI | `~/.gemini/settings.json` |
 | Antigravity 2.0 | `~/.gemini/config/mcp_config.json` |
-| Antigravity CLI (agy) | `~/.gemini/antigravity-cli/mcp_config.json` |
+| Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/mcp_config.json` |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` |
 | Cline | `~/.cline/mcp.json` |
 | VS Code Copilot | `.vscode/mcp.json` |
 | Codex CLI | `~/.codex/config.toml` |
 | Devin | `.devin/config.json` |
 
-```bash
-# Auto-detect all installed tools
-anchored init
-
-# Specific tool
-anchored init --tool cursor
-anchored init --tool windsurf
-anchored init --tool cline
-anchored init --tool vscode --cwd /path/to/project
-anchored init --tool codex
-```
-
-Most tools use `mcpServers` with the same JSON shape:
+Most tools use this JSON shape:
 
 ```json
 {
@@ -115,7 +134,7 @@ Most tools use `mcpServers` with the same JSON shape:
 }
 ```
 
-VS Code Copilot uses `servers` with a required `type` field:
+VS Code Copilot uses `servers` and requires `type: "stdio"`:
 
 ```json
 {
@@ -136,108 +155,169 @@ command = "anchored"
 enabled = true
 ```
 
-## CLI
+## CLI overview
 
+```text
+anchored                         Start MCP server over STDIO
+anchored serve                   Start MCP server over STDIO
+anchored init [--tool]           Register Anchored with supported tools
+anchored doctor [--cwd]          Diagnose binary, model, DB, and MCP registration
+anchored stats                   Show memory counts and import status
+
+anchored save <content>          Save a memory
+anchored search <query>          Search memories
+anchored list                    List memories
+anchored inspect <id>            Show full JSON metadata
+anchored update <id>             Revise a memory in place
+anchored forget <id>             Soft-delete a memory; --hard for permanent delete
+anchored export                  Export memories as JSON/JSONL
+
+anchored curation status         Show background curation worker state
+anchored curation enable         Enable serve-time curation worker
+anchored curation disable        Disable serve-time curation worker
+anchored curation score          Score and optionally mark low-signal memories
+anchored curation clean          Soft-delete or hard-delete low-signal memories
+anchored curation restore        Restore a DB backup made before curation cleanup
+
+anchored dream                   Analyze duplicate/contradictory memories
+anchored dream --apply <id>      Apply one proposed dream action
+anchored retention sweep         Archive expired operational/episodic memories
+anchored bootstrap [--cwd]       Extract project seed memories from README/docs/rules/tree
+anchored handoff [--scope]       Save a short session handoff with TTL
+anchored precompact              Save a pre-compaction recovery snapshot
+anchored hook <subcommand>       Run session continuity hooks
+
+anchored remote status           Show remote sync configuration
+anchored remote configure        Configure a remote server
+anchored remote link|unlink      Link/unlink remote project IDs
+anchored remote preview          Offline preview of syncable/blocked memories
+anchored remote sync             Push syncable memories and KG triples
+anchored purge                   Wipe memories; --hard resets DB with backup
 ```
-anchored                    Start MCP server (STDIO, default when no arg)
-anchored serve              Start MCP server (STDIO)
-anchored init [--tool]      Auto-detect tools and register MCP
-anchored doctor             Diagnose installation, config, MCP registration
-anchored stats              Show memory statistics
 
-anchored search <query>     Search memories
-anchored save <content>     Save a memory (auto-categorized if --category omitted)
-anchored update <id>        Update a memory
-anchored forget <id>        Remove a memory (soft delete; --hard for permanent)
-anchored list               List memories
+Import sources: `claude-code`, `devclaw`, `opencode`, `cursor`, `all`.
 
-anchored import [sources]   Import memories from detected sources
-anchored identity [edit]    View or edit identity file
-anchored config [show|set|wizard] View or modify configuration
+## Curation vs dream
 
-anchored dream              Analyze and consolidate duplicate memories
-anchored dream --apply <action-id>  Apply a single dream action
-anchored inspect <id>       Show full memory details (JSON)
-anchored export [--project] [--category] [--source] [--include-deleted] [--format json|jsonl] [--output]
-                           Export memories (embeddings excluded)
-anchored remote status      Show remote sync configuration (offline)
-anchored remote preview     Preview what would sync — syncable/blocked/needs-review (offline)
-anchored remote sync        Sync memories with remote server
-anchored bootstrap [--cwd]  Extract project seeds from README, docs, rules, tree
-anchored handoff [--scope] [--ttl] Save session handoff with expiry
-anchored retention sweep    Archive operational/episodic memories past TTL
-anchored precompact         Pre-compact memory context
-anchored hook <subcommand>  Run session continuity hooks
-anchored purge              Wipe memories (--hard for full DB reset with backup)
+Anchored has two maintenance paths because they solve different problems:
+
+| Path | Default | What it does | Safety model |
+|---|---:|---|---|
+| `curation` | On | Scores recent memories in small batches, sets `importance`, and marks `low_signal`. | Non-destructive. No content rewrites or deletes. |
+| `dream` | Manual | Finds duplicates, merge/supersede opportunities, and contradictions. | Proposed actions; destructive operations require explicit apply/review. |
+
+The curation worker starts with `anchored serve`. By default it runs every 15 minutes, processes newest candidates first, and updates at most 50 memories per pass. Tune or disable it with:
+
+```bash
+anchored curation status
+anchored curation disable
+anchored curation enable
+anchored config set curation.interval_minutes 5
+anchored config set curation.max_updates_per_run 25
+anchored config set curation.threshold 0.55
 ```
 
-Import sources: `claude-code` `devclaw` `opencode` `cursor` `all`
+Use `anchored curation clean --dry-run` when you want to remove low-signal memories. Cleanup is never automatic.
 
-## MCP Tools
+## MCP tools
 
-**Memory**
+### Memory tools
 
-| Tool | When to use |
+| Tool | Purpose |
 |---|---|
-| `anchored_context` | First call of every conversation — loads identity, project, recent decisions |
-| `anchored_search` | Before answering domain questions (hybrid vector + BM25) |
-| `anchored_save` | Capture facts, preferences, decisions, learnings (category required) |
-| `anchored_update` | Revise an existing memory in place |
-| `anchored_forget` | Remove a memory (soft delete by default) |
-| `anchored_list` | List memories by category, project, or time |
-| `anchored_stats` | Memory overview |
-| `anchored_session_end` | Close a tracked session |
-| `anchored_kg_query` | Query knowledge-graph relationships for an entity |
-| `anchored_kg_add` | Capture a relationship (subject — predicate — object) |
+| `anchored_context` | First call in a conversation; loads identity, project snapshot, recent durable memory. |
+| `anchored_search` | Hybrid memory search, project-aware and remote-capable. |
+| `anchored_save` | Save fact/preference/decision/event/learning/plan/summary memories. |
+| `anchored_update` | Revise an existing memory instead of duplicating it. |
+| `anchored_forget` | Soft-delete or hard-delete a memory. |
+| `anchored_list` | List memories by category/project/time. |
+| `anchored_stats` | Show memory statistics. |
+| `anchored_session_end` | Close a tracked session and optionally save a summary. |
+| `anchored_kg_query` | Query entity relationships from the knowledge graph. |
+| `anchored_kg_add` | Add a relationship such as `repo — uses → Postgres`. |
 
-**Sandbox / index** (context-saving tools that keep raw data out of context)
+### Sandbox and indexing tools
 
-| Tool | When to use |
+| Tool | Purpose |
 |---|---|
-| `anchored_execute` | Run code in 11 languages; only stdout enters context |
-| `anchored_execute_file` | Process a file; `FILE_PATH` and `FILE_CONTENT` auto-injected |
-| `anchored_batch_execute` | Run multiple commands and run search queries in one call |
-| `anchored_index` | Index documentation into FTS5 knowledge base |
-| `anchored_ctx_search` | Search indexed content with batched queries |
-| `anchored_fetch_and_index` | Fetch URL → markdown → index (`force=true` bypasses 24h cache) |
+| `anchored_execute` | Run code in a sandboxed subprocess; stdout only enters context. |
+| `anchored_execute_file` | Process one file with injected `FILE_PATH`/`FILE_CONTENT`. |
+| `anchored_batch_execute` | Run multiple commands, index large output, and search it in one call. |
+| `anchored_index` | Index local markdown/prose into the sandbox FTS corpus. |
+| `anchored_ctx_search` | Search the indexed sandbox corpus. |
+| `anchored_fetch_and_index` | Fetch URL → markdown → index, with cache and batch support. |
 
 ## How it works
 
-- **Hybrid search** — RRF fusion of vector similarity (ONNX, multilingual) and BM25 (FTS5), with entity boost and project boost
-- **Entity detection** — extracts project names, tools, and topics from queries to boost relevant results
-- **Topic change detection** — identifies conversation shifts and increases retrieval diversity
-- **Memory stack** — L0 identity + L1 essential stories + L2 on-demand, budget-enforced
-- **Knowledge graph** — bitemporal triples with functional predicates and alias resolution, auto-extracted from memory text
-- **Credential redaction** — regex-based secret sanitization with configurable custom patterns
-- **Observer hooks** — `MemoryObserver` interface for save/update/delete side effects (sync, audit)
+1. **Project detection** maps a working directory to a stable project record. Git remotes derive a cross-machine `remote_key` without leaking local paths.
+2. **Memory save** sanitizes content, auto-categorizes when needed, attaches lifecycle metadata, stores SQLite/FTS rows, embeds asynchronously, and extracts KG triples when possible.
+3. **Search** combines BM25, vector similarity, query expansion, entity boost, project boost, topic diversity, and lifecycle scoring.
+4. **Context** renders a bounded XML-like bundle with identity, project stats, recent durable memories, and important recent session events.
+5. **Curation** incrementally improves metadata quality so bad memories are demoted and sync filters can block them.
+6. **Dream/retention** provide explicit deeper cleanup and lifecycle archiving.
+7. **Remote sync** replicates project/team-safe semantic memories and KG triples when configured; local remains complete without remote.
 
 ## Storage
 
-```
+```text
 ~/.anchored/
-├── data/
-│   ├── anchored.db        # SQLite (FTS5 + vector cache + knowledge graph)
-│   └── onnx/              # local embedding model (~470MB)
-└── config.yaml
+├── config.yaml
+├── debug.log                  # optional, only when debug.enabled=true
+└── data/
+    ├── anchored.db            # SQLite: memories, FTS5, vector cache, KG, sessions
+    ├── bkps/                  # backups made by purge/restore/curation flows
+    └── onnx/                  # local embedding model and ONNX runtime
 ```
 
-No daemon. No ports. The binary runs on demand via MCP STDIO.
+No ports are opened. There is no always-on system daemon; the MCP server runs while the client keeps the `anchored` process alive.
+
+## Configuration examples
+
+```yaml
+curation:
+  enabled: true
+  interval_minutes: 15
+  threshold: 0.55
+  max_updates_per_run: 50
+
+sanitizer:
+  enabled: true
+  patterns:
+    - 'ACME_[A-Z0-9]{32}'
+
+context_optimizer:
+  enabled: false
+```
+
+Show or edit config:
+
+```bash
+anchored config show
+anchored config set curation.enabled false
+anchored config wizard
+```
+
+## Development
+
+```bash
+make build
+make test
+./bin/anchored serve
+```
+
+Before a release, bump `VERSION`, run `make sync-version`, update `CHANGELOG.md`, then tag `vX.Y.Z`.
 
 ## Docs
 
-- [Design](docs/design.md) — memory stack, hybrid search, knowledge graph, quantization
-- [Architecture](docs/architecture.md) — project structure and implementation details
-- [Embedding Model](docs/embedding-model.md) — model choice, quantization, inference pipeline
-- [Import Sources](docs/import-sources.md) — how each tool's data is parsed
-- [MCP Protocol](docs/mcp-protocol.md) — MCP tool schemas and protocol reference
-- [Team Sync](docs/team-sync.md) — planned local + remote architecture for team-shared memory via `anchored_oss`
-- [Improvements Roadmap](docs/improvements-roadmap.md) — local-first roadmap before/alongside Team Sync and Cloud
-- [Memory Lifecycle](docs/memory-lifecycle-roadmap.md) — lifecycle phases 1-8 for memory classification, scoring, and retention
-- [Changelog](CHANGELOG.md) — version history
-
-## Related Projects
-
-- [`anchored_oss`](../anchored_oss) — planned self-hosted/open team sync server for organizations, teams, project memory, policies, and remote guardrails.
+- [Design](docs/design.md) — memory stack, hybrid search, knowledge graph, quantization.
+- [Architecture](docs/architecture.md) — project structure and implementation details.
+- [Embedding Model](docs/embedding-model.md) — model choice, quantization, inference pipeline.
+- [Import Sources](docs/import-sources.md) — supported importers and parsing behavior.
+- [MCP Protocol](docs/mcp-protocol.md) — tool schemas and protocol reference.
+- [Team Sync](docs/team-sync.md) — local + remote architecture for shared project memory.
+- [Improvements Roadmap](docs/improvements-roadmap.md) — local-first roadmap before/alongside team sync.
+- [Memory Lifecycle](docs/memory-lifecycle-roadmap.md) — lifecycle classification, scoring, retention, and curation.
+- [Changelog](CHANGELOG.md) — version history.
 
 ## License
 
