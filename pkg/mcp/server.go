@@ -807,6 +807,35 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 				}
 			}
 		}
+	} else if p.Remote == "" && s.cfg != nil {
+		// Auto write-through: when the resolved remote has auto_sync on, push
+		// this memory best-effort and async. Local-first — the local save above
+		// already succeeded, so a remote failure never affects the result. The
+		// safety filter gates eligibility and redacts content, so user-scoped /
+		// personal / secret memories never leave the machine.
+		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil && entry.AutoSync {
+			if redacted, ok := remotesync.ClassifyForAutoSync(*m, p.CWD); ok {
+				// Target the linked remote project (same default as `remote
+				// sync`), not the local project id the server wouldn't know.
+				projectID := ""
+				if len(entry.Projects) > 0 {
+					projectID = entry.Projects[0]
+				}
+				if projectID == "" && m.ProjectID != nil {
+					projectID = *m.ProjectID
+				}
+				if projectID != "" {
+					go func(e config.RemoteEntry, id, category, content, pid string) {
+						client := remotesync.NewClientFromEntry(e, "mcp")
+						rm := remotesync.RemoteMemory{ID: id, Category: category, Content: content, Source: "mcp", ProjectID: pid}
+						if _, err := client.SaveRemote(context.Background(), rm); err != nil {
+							s.logger.Warn("auto-sync push failed", "memory_id", id, "remote", e.Name, "error", err)
+						}
+					}(*entry, m.ID, m.Category, redacted, projectID)
+					result += fmt.Sprintf(" (auto-sync → %s)", entry.Name)
+				}
+			}
+		}
 	}
 
 	return result, nil
