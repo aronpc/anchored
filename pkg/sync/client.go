@@ -293,6 +293,36 @@ func (c *Client) PushTriples(ctx context.Context, projectID string, triples []Sy
 	return &out, nil
 }
 
+// RemoteProject is a minimal view of a project as returned by GET /v1/projects.
+type RemoteProject struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Slug string `json:"slug"`
+}
+
+// ListProjects returns the projects the configured API key can access on the
+// remote server. Used by `remote sync` to validate linked project IDs (and pick
+// a live default) instead of blindly trusting the local link list, which can go
+// stale when the server's projects change.
+func (c *Client) ListProjects(ctx context.Context) ([]RemoteProject, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/v1/projects", nil)
+	if err != nil {
+		return nil, fmt.Errorf("list projects request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, &RemoteError{StatusCode: resp.StatusCode, Body: string(body)}
+	}
+
+	var projects []RemoteProject
+	if err := json.Unmarshal(body, &projects); err != nil {
+		return nil, fmt.Errorf("decode projects response: %w", err)
+	}
+	return projects, nil
+}
+
 func urlQueryEscape(s string) string {
 	var buf bytes.Buffer
 	for i := 0; i < len(s); i++ {

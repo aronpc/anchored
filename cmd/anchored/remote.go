@@ -122,8 +122,18 @@ func runRemoteConfigure(args []string) {
 		os.Exit(1)
 	}
 
+	newURL := strings.TrimRight(*server, "/")
+	// Project IDs are server-scoped, so pointing at a different server makes the
+	// existing links meaningless — clear them to avoid stale "project not found"
+	// pushes. Re-pointing at the same server keeps the links.
+	if cfg.Remote.ServerURL != "" && cfg.Remote.ServerURL != newURL && len(cfg.Remote.Projects) > 0 {
+		fmt.Printf("Server changed (%s → %s); cleared %d stale project link(s).\n",
+			cfg.Remote.ServerURL, newURL, len(cfg.Remote.Projects))
+		cfg.Remote.Projects = nil
+	}
+
 	cfg.Remote.Enabled = true
-	cfg.Remote.ServerURL = strings.TrimRight(*server, "/")
+	cfg.Remote.ServerURL = newURL
 	cfg.Remote.APIKey = *key
 
 	writeConfigFile(configFile, cfg)
@@ -283,19 +293,27 @@ func runRemoteSync(args []string) {
 		os.Exit(1)
 	}
 
-	// Fallback to the first linked project when --project-id is not given.
-	// Memories without an explicit remote_project_key in metadata would
-	// otherwise be rejected by the server with "no project_id and no
-	// remote_project_key". This lets a user run `anchored remote sync`
-	// without arguments after `anchored remote link <id>`.
-	if *projectID == "" && len(cfg.Remote.Projects) > 0 {
-		*projectID = cfg.Remote.Projects[0]
-		fmt.Printf("Using linked project %s as default (override with --project-id)\n", *projectID)
-	}
-
 	// NewClient only returns nil when cfg.Remote.Enabled is false, which is
 	// guarded above — no nil check needed here.
 	client := sync.NewClient(cfg.Remote, "cli")
+
+	// Resolve the default remote project when --project-id is not given. Rather
+	// than blindly using the first linked id (which goes stale when the server's
+	// projects change — e.g. after a re-provision), validate the linked ids
+	// against the server and pick the first that still exists, reporting stale
+	// links with an unlink hint. This prevents every memory failing with
+	// "project not found" because the default pointed at a deleted project.
+	if *projectID == "" {
+		resolved, err := resolveDefaultProject(ctx, client, cfg.Remote.Projects, cfg.Remote.ServerURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		if resolved != "" {
+			*projectID = resolved
+			fmt.Printf("Using linked project %s as default (override with --project-id)\n", resolved)
+		}
+	}
 
 	pushMemories := make([]sync.SyncMemory, 0, preview.Syncable)
 	for _, item := range preview.Items {
@@ -335,6 +353,54 @@ func runRemoteSync(args []string) {
 			fmt.Fprintf(os.Stderr, "  error: %s\n", e)
 		}
 	}
+}
+
+// resolveDefaultProject picks the first linked project that still exists on the
+// server. Stale links (projects deleted/changed server-side) are reported with
+// an unlink hint rather than silently failing every push. Returns "" with no
+// error when there are no links (each memory then routes via its own
+// remote_project_key, and the server validates per memory).
+func resolveDefaultProject(ctx context.Context, client *sync.Client, linked []string, serverURL string) (string, error) {
+	if len(linked) == 0 {
+		return "", nil
+	}
+
+	serverProjects, err := client.ListProjects(ctx)
+	if err != nil {
+		// Could not verify (transient/endpoint issue). Fall back to the first
+		// link rather than blocking sync — the server still validates per memory.
+		fmt.Fprintf(os.Stderr, "warning: could not verify linked projects against the server (%v); using first link\n", err)
+		return linked[0], nil
+	}
+
+	live := make(map[string]struct{}, len(serverProjects))
+	for _, p := range serverProjects {
+		live[p.ID] = struct{}{}
+	}
+
+	var firstValid string
+	var stale []string
+	for _, id := range linked {
+		if _, ok := live[id]; ok {
+			if firstValid == "" {
+				firstValid = id
+			}
+		} else {
+			stale = append(stale, id)
+		}
+	}
+
+	if len(stale) > 0 {
+		fmt.Fprintf(os.Stderr, "note: %d linked project(s) no longer exist on the server and were ignored:\n", len(stale))
+		for _, id := range stale {
+			fmt.Fprintf(os.Stderr, "  %s   (remove with: anchored remote unlink %s)\n", id, id)
+		}
+	}
+
+	if firstValid == "" {
+		return "", fmt.Errorf("none of your linked projects exist on %s — link a current project id (from the dashboard) with: anchored remote link <project_id>", serverURL)
+	}
+	return firstValid, nil
 }
 
 // listAllMemories paginates through every non-deleted memory.
