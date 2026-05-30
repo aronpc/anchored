@@ -118,6 +118,24 @@ Automatic project creation must use a stable, non-personal identifier such as a 
 | `event` | No | Lifecycle data, stays local |
 | No `project_id` | No | Personal/global memories stay local |
 
+### Auto write-through (`auto_sync`)
+
+When the configured remote has `auto_sync: true`, `anchored_save` (MCP **and** CLI) pushes each newly-saved memory to the linked remote project automatically — no manual `anchored remote sync` needed. It is **local-first**: the local save always completes synchronously and the remote push is best-effort/async, so a server outage never blocks or fails a save.
+
+Eligibility is decided by the same classification as `remote sync` (`ClassifyForAutoSync`): only `Syncable` memories leave the machine, and the content is the **redacted** form (home paths → `<user-home>`). User-scoped/personal/secret memories are never pushed. The target is the linked remote project (`remote.projects[0]`), not the local project id.
+
+Enable it in `~/.anchored/config.yaml`:
+
+```yaml
+remote:
+  enabled: true
+  auto_sync: true          # off by default
+  server_url: https://memory.yourteam.com
+  api_key: anc_live_...
+  projects:
+    - <remote-project-uuid>
+```
+
 ### Pull (server → local)
 
 Server returns all non-deleted memories for the project that the client hasn't seen yet (based on watermark). Client upserts into local SQLite with `sync_origin = 'remote'`.
