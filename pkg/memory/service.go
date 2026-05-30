@@ -340,6 +340,17 @@ func (s *Service) ResolveProject(cwd string) string {
 	return proj.ID
 }
 
+// ResolveProjectInfo returns the full project for a working directory (ID,
+// Name and git-origin RemoteKey), or nil when cwd is not inside a git repo.
+// Repo-scoped sync uses RemoteKey to identify a repository independent of its
+// local directory name.
+func (s *Service) ResolveProjectInfo(cwd string) (*project.Project, error) {
+	if cwd == "" || s.projDet == nil {
+		return nil, nil
+	}
+	return s.projDet.Detect(cwd)
+}
+
 func (s *Service) SaveMemory(ctx context.Context, content, category, source string, cwd string) error {
 	_, err := s.SaveWithOptions(ctx, SaveOptions{
 		Content:  content,
