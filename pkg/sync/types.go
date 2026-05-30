@@ -4,10 +4,17 @@ package sync
 // ProjectRoot is a client-side hint used by the local safety filter to rewrite
 // in-project paths to relative form. It is intentionally not serialized.
 type SyncPushRequest struct {
-	ClientID    string       `json:"client_id"`
-	ProjectID   string       `json:"project_id"`
-	Memories    []SyncMemory `json:"memories"`
-	ProjectRoot string       `json:"-"`
+	ClientID  string `json:"client_id"`
+	ProjectID string `json:"project_id"`
+	// ProjectClaim lets the client route a push to a remote project by its
+	// git-origin remote_key instead of a server-side project_id. When set and
+	// ProjectID is empty, the server resolves-or-creates the project by
+	// remote_key, using Name for a human-readable label. This is how
+	// repo-scoped sync identifies a repository regardless of its local
+	// directory name.
+	ProjectClaim *ProjectClaim `json:"project_claim,omitempty"`
+	Memories     []SyncMemory  `json:"memories"`
+	ProjectRoot  string        `json:"-"`
 }
 
 // SyncMemory is a memory ready for remote sync (no embeddings, no local paths).
