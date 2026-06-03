@@ -125,7 +125,7 @@ func (c *DreamConsolidator) ApplyAction(ctx context.Context, actionID string) (*
 
 		var metaJSON string
 		err := c.db.QueryRowContext(ctx,
-			"SELECT metadata FROM memories WHERE id = ? AND deleted_at IS NULL", action.MemoryID,
+			"SELECT COALESCE(metadata, '') FROM memories WHERE id = ? AND deleted_at IS NULL", action.MemoryID,
 		).Scan(&metaJSON)
 		if err != nil {
 			return nil, fmt.Errorf("lookup memory for supersede: %w", err)
@@ -179,7 +179,7 @@ func (c *DreamConsolidator) ApplyAction(ctx context.Context, actionID string) (*
 
 		var metaJSON string
 		err := c.db.QueryRowContext(ctx,
-			"SELECT metadata FROM memories WHERE id = ? AND deleted_at IS NULL", action.MemoryID,
+			"SELECT COALESCE(metadata, '') FROM memories WHERE id = ? AND deleted_at IS NULL", action.MemoryID,
 		).Scan(&metaJSON)
 		if err != nil {
 			return nil, fmt.Errorf("lookup memory for merge: %w", err)
