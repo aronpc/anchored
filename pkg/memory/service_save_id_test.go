@@ -19,6 +19,10 @@ func (s *captureSaveStore) FindByContentHash(_ context.Context, _ string, _ *str
 	return nil, nil
 }
 
+func (s *captureSaveStore) Search(_ context.Context, _ string, _ SearchOptions) ([]SearchResult, error) {
+	return nil, nil
+}
+
 // Regression: the create path must assign the ID before store.Save, because
 // Save takes Memory by value. Otherwise embedAsync/observers run with an empty
 // ID and the embedding is never persisted to the memory row.

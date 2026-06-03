@@ -71,7 +71,11 @@ func newUUID() string {
 }
 
 func contentHash(content string) string {
-	h := sha256.Sum256([]byte(content))
+	// Normalize before hashing so trivial variants collapse to one hash:
+	// lowercase and collapse all whitespace runs to single spaces. "Postgres",
+	// "postgres " and "Postgres\n" therefore dedup to the same memory.
+	normalized := strings.ToLower(strings.Join(strings.Fields(content), " "))
+	h := sha256.Sum256([]byte(normalized))
 	return hex.EncodeToString(h[:])
 }
 
