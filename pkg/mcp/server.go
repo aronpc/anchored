@@ -872,7 +872,7 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		// already succeeded, so a remote failure never affects the result. The
 		// safety filter gates eligibility and redacts content, so user-scoped /
 		// personal / secret memories never leave the machine.
-		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil && entry.AutoSync {
+		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil && entry.AutoSyncEnabled() {
 			if redacted, ok := remotesync.ClassifyForAutoSync(*m, p.CWD); ok {
 				// Target the linked remote project (same default as `remote
 				// sync`), not the local project id the server wouldn't know.

@@ -2,6 +2,25 @@ package config
 
 import "testing"
 
+func TestRemoteEntry_AutoSyncEnabled(t *testing.T) {
+	// nil => default true: a configured remote auto-syncs unless explicitly
+	// turned off. Backward-compatible default for the *bool field.
+	var e RemoteEntry
+	if !e.AutoSyncEnabled() {
+		t.Error("nil AutoSync should default to enabled (true)")
+	}
+	f := false
+	e.AutoSync = &f
+	if e.AutoSyncEnabled() {
+		t.Error("AutoSync=false should be disabled")
+	}
+	tr := true
+	e.AutoSync = &tr
+	if !e.AutoSyncEnabled() {
+		t.Error("AutoSync=true should be enabled")
+	}
+}
+
 func TestRemoteConfig_Defaults(t *testing.T) {
 	cfg := Defaults()
 	if cfg.Remote.Enabled {
