@@ -70,12 +70,15 @@ func newUUID() string {
 	return hex.EncodeToString(b)
 }
 
+// contentHash is the exact-dedup key. It hashes content verbatim (no
+// normalization) ON PURPOSE: the same hash is sent in the sync payload
+// (SyncMemory.ContentHash) and the server + older clients dedup on it, so the
+// algorithm must stay byte-identical across versions for backwards
+// compatibility. Trivial case/whitespace variants are folded by the
+// near-duplicate merge on the save path instead (Service.findNearDuplicate),
+// which keeps the sync contract stable.
 func contentHash(content string) string {
-	// Normalize before hashing so trivial variants collapse to one hash:
-	// lowercase and collapse all whitespace runs to single spaces. "Postgres",
-	// "postgres " and "Postgres\n" therefore dedup to the same memory.
-	normalized := strings.ToLower(strings.Join(strings.Fields(content), " "))
-	h := sha256.Sum256([]byte(normalized))
+	h := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(h[:])
 }
 

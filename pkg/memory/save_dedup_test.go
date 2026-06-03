@@ -6,9 +6,16 @@ import (
 	"testing"
 )
 
-func TestContentHash_NormalizesCaseAndWhitespace(t *testing.T) {
-	if contentHash("We use Postgres.") != contentHash("we  use   postgres.\n") {
-		t.Error("case/whitespace variants should hash equal")
+// contentHash is verbatim (no normalization) to stay byte-compatible with the
+// sync protocol and older clients. Case/whitespace variants therefore hash
+// DIFFERENTLY here and are instead folded by the near-duplicate merge
+// (TestFindNearDuplicate). This test pins that contract.
+func TestContentHash_Verbatim(t *testing.T) {
+	if contentHash("We use Postgres.") == contentHash("we use postgres.") {
+		t.Error("contentHash must be verbatim (case-sensitive) for sync compatibility")
+	}
+	if contentHash("we use postgres") != contentHash("we use postgres") {
+		t.Error("identical content must hash equal")
 	}
 	if contentHash("we use postgres") == contentHash("we use mysql") {
 		t.Error("distinct content must hash differently")
