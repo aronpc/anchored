@@ -66,7 +66,7 @@ func runSave(args []string) {
 func autoSyncRemote(ctx context.Context, cfg *config.Config, svc *memory.Service, m *memory.Memory, projectOverride string) {
 	cwd, _ := os.Getwd()
 	entry := cfg.ResolveRemote(cwd)
-	if entry == nil || !entry.AutoSync {
+	if entry == nil || !entry.AutoSyncEnabled() {
 		return
 	}
 	redacted, ok := sync.ClassifyForAutoSync(*m, cwd)

@@ -35,11 +35,13 @@ type RemoteConfig struct {
 	ServerURL string   `yaml:"server_url"`
 	APIKey    string   `yaml:"api_key"`
 	Projects  []string `yaml:"projects"`
-	// AutoSync, when true, makes anchored_save push each newly-saved memory to
-	// the remote automatically (local-first: local save always succeeds, the
-	// remote push is best-effort and async). The sync safety filter still
+	// AutoSync controls whether anchored_save pushes each newly-saved memory
+	// to the remote automatically (local-first: local save always succeeds,
+	// the remote push is best-effort and async). The sync safety filter still
 	// applies, so user-scoped/personal/secret memories never leave the machine.
-	AutoSync bool `yaml:"auto_sync"`
+	// Defaults to true when a remote is configured; set explicitly to false
+	// to disable.
+	AutoSync *bool `yaml:"auto_sync"`
 }
 
 // RemoteEntry is a single named remote server in the remotes map.
@@ -49,7 +51,7 @@ type RemoteEntry struct {
 	APIKey    string   `yaml:"api_key"`
 	Default   bool     `yaml:"default,omitempty"`
 	Projects  []string `yaml:"projects,omitempty"`
-	AutoSync  bool     `yaml:"auto_sync,omitempty"`
+	AutoSync  *bool    `yaml:"auto_sync,omitempty"`
 }
 
 // PluginConfig controls how anchored handles drift between the binary version
@@ -288,6 +290,13 @@ func (c *Config) ResolveRemote(projectPath string) *RemoteEntry {
 		}
 	}
 	return nil
+}
+
+func (e *RemoteEntry) AutoSyncEnabled() bool {
+	if e.AutoSync == nil {
+		return true
+	}
+	return *e.AutoSync
 }
 
 func globMatch(pattern, s string) bool {
