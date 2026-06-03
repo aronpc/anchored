@@ -101,6 +101,23 @@ func Migrate(db *sql.DB) error {
 				updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 			);
 		`},
+		// Rebuild the FTS index with a multilingual tokenizer. The old
+		// 'porter unicode61' applied English-only stemming to a PT/ES/EN corpus,
+		// degrading lexical recall for non-English memories. Drop + recreate +
+		// repopulate; the existing INSERT/UPDATE/DELETE triggers reference the
+		// table by name and keep working after the rebuild.
+		{Name: "013_fts_multilingual_tokenizer", Up: `
+			DROP TABLE IF EXISTS memories_fts;
+			CREATE VIRTUAL TABLE memories_fts USING fts5(
+				content,
+				keywords,
+				content='memories',
+				content_rowid='rowid',
+				tokenize='unicode61 remove_diacritics 2'
+			);
+			INSERT INTO memories_fts(rowid, content, keywords)
+				SELECT rowid, content, keywords FROM memories;
+		`},
 	}
 
 	for _, m := range migrations {

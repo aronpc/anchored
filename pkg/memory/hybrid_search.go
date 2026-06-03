@@ -213,12 +213,17 @@ func (h *HybridSearcher) searchVector(ctx context.Context, query string, maxResu
 }
 
 func (h *HybridSearcher) searchBM25(ctx context.Context, query string, maxResults int, queryEntities []string, opts SearchOptions) ([]SearchResult, error) {
-	keywords := ExtractKeywords(query)
-	if len(keywords) == 0 {
-		return nil, nil
+	// Prefer the advanced expansion (synonyms, accent-folding, NEAR/phrase
+	// handling). Fall back to the simple keyword expansion when it yields
+	// nothing (e.g. query is only stopwords).
+	ftsQuery := ExpandQueryAdvanced(query)
+	if ftsQuery == "" {
+		keywords := ExtractKeywords(query)
+		if len(keywords) == 0 {
+			return nil, nil
+		}
+		ftsQuery = ExpandQueryForFTS(keywords)
 	}
-
-	ftsQuery := ExpandQueryForFTS(keywords)
 	if ftsQuery == "" {
 		return nil, nil
 	}
