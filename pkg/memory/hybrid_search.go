@@ -77,7 +77,7 @@ func (h *HybridSearcher) Search(ctx context.Context, query string, opts ...Searc
 		h.logger.Warn("BM25 search failed, using vector only", "error", bm25Err)
 	}
 
-	fused := h.rrfFuse(vecResults, bm25Results, cfg.VectorWeight, cfg.BM25Weight)
+	fused := h.fuse(vecResults, bm25Results, cfg.VectorWeight, cfg.BM25Weight)
 
 	fused = applyLifecycleBoost(fused, time.Now())
 
@@ -89,15 +89,16 @@ func (h *HybridSearcher) Search(ctx context.Context, query string, opts ...Searc
 		fused = h.applyProjectBoost(fused, searchOpts.ProjectID)
 	}
 
-	mmrLambda := cfg.MMRLambda
-	if h.topicChangeDetector != nil {
-		changed, _ := h.topicChangeDetector.Check(ctx, query)
-		if changed {
-			mmrLambda = 0.9
+	if cfg.MMREnabled {
+		mmrLambda := cfg.MMRLambda
+		if h.topicChangeDetector != nil {
+			changed, _ := h.topicChangeDetector.Check(ctx, query)
+			if changed {
+				mmrLambda = 0.9
+			}
 		}
+		fused = h.applyMMR(fused, mmrLambda, maxResults)
 	}
-
-	fused = h.applyMMR(fused, mmrLambda, maxResults)
 
 	sort.Slice(fused, func(i, j int) bool {
 		return fused[i].Score > fused[j].Score
@@ -250,7 +251,14 @@ func matchesSearchOptions(m Memory, opts SearchOptions) bool {
 	return true
 }
 
-func (h *HybridSearcher) rrfFuse(vecResults, bm25Results []SearchResult, vectorWeight, bm25Weight float64) []SearchResult {
+// fuse combines the vector and BM25 result lists into a single ranking.
+// Unlike pure rank-based RRF (which throws away the actual relevance and is
+// dominated by whichever signal ranked an item #1), it preserves the magnitude
+// of each signal: scores within each list are normalized to [0,1] by that
+// list's max, then combined as a weighted sum. A 0.95-cosine hit therefore
+// stays clearly ahead of a 0.55 one, and MinScore becomes a stable relevance
+// cutoff (fraction of the best hit) instead of being coupled to list length.
+func (h *HybridSearcher) fuse(vecResults, bm25Results []SearchResult, vectorWeight, bm25Weight float64) []SearchResult {
 	type scored struct {
 		memory Memory
 		score  float64
@@ -259,12 +267,21 @@ func (h *HybridSearcher) rrfFuse(vecResults, bm25Results []SearchResult, vectorW
 	scoreMap := make(map[string]*scored)
 
 	merge := func(results []SearchResult, weight float64) {
-		for i, r := range results {
-			key := r.Memory.ID
-			if existing, ok := scoreMap[key]; ok {
-				existing.score += weight * (1.0 / float64(i+1))
+		var max float64
+		for _, r := range results {
+			if r.Score > max {
+				max = r.Score
+			}
+		}
+		if max <= 0 {
+			max = 1
+		}
+		for _, r := range results {
+			contrib := weight * (r.Score / max)
+			if existing, ok := scoreMap[r.Memory.ID]; ok {
+				existing.score += contrib
 			} else {
-				scoreMap[key] = &scored{memory: r.Memory, score: weight * (1.0 / float64(i+1))}
+				scoreMap[r.Memory.ID] = &scored{memory: r.Memory, score: contrib}
 			}
 		}
 	}
@@ -376,19 +393,35 @@ func applyLifecycleBoost(results []SearchResult, now time.Time) []SearchResult {
 	return results
 }
 
+// categoryDecayMultiplier scales the half-life by category so durable knowledge
+// barely decays while time-bound entries decay at the base rate. Without this,
+// a 60-day-old "decision" would lose ~75% of its score at a 30-day half-life
+// and get buried under fresh noise.
+func categoryDecayMultiplier(category string) float64 {
+	switch category {
+	case "fact", "decision", "preference":
+		return 6 // durable: ~6x the base half-life
+	case "learning", "summary":
+		return 3
+	default: // event, plan, or uncategorized: decay at the base rate
+		return 1
+	}
+}
+
 func (h *HybridSearcher) applyTemporalDecay(results []SearchResult, cfg HybridSearchConfig) []SearchResult {
 	if !cfg.TemporalDecayEnabled || len(results) == 0 {
 		return results
 	}
 
-	halfLife := float64(cfg.TemporalDecayHalfLifeDays)
-	if halfLife <= 0 {
-		halfLife = 30
+	baseHalfLife := float64(cfg.TemporalDecayHalfLifeDays)
+	if baseHalfLife <= 0 {
+		baseHalfLife = 30
 	}
-	lambda := math.Log(2) / halfLife
 	now := time.Now()
 
 	for i := range results {
+		halfLife := baseHalfLife * categoryDecayMultiplier(results[i].Memory.Category)
+		lambda := math.Log(2) / halfLife
 		ageDays := now.Sub(results[i].Memory.CreatedAt).Hours() / 24
 		if ageDays < 0 {
 			ageDays = 0
@@ -399,8 +432,13 @@ func (h *HybridSearcher) applyTemporalDecay(results []SearchResult, cfg HybridSe
 	return results
 }
 
+// applyMMR re-selects results for relevance + diversity (Maximal Marginal
+// Relevance) and drops near-identical hits. Similarity uses embedding cosine
+// when both vectors are cached (semantic dedup — catches paraphrases that share
+// no tokens) and falls back to lexical Jaccard otherwise. It runs even when the
+// result set is small so duplicates are removed regardless of count.
 func (h *HybridSearcher) applyMMR(results []SearchResult, lambda float64, maxResults int) []SearchResult {
-	if len(results) <= maxResults {
+	if len(results) <= 1 {
 		return results
 	}
 
@@ -410,13 +448,12 @@ func (h *HybridSearcher) applyMMR(results []SearchResult, lambda float64, maxRes
 	if lambda > 1 {
 		lambda = 1
 	}
+	const nearDupThreshold = 0.97 // drop a candidate that is ~identical to one already selected
 
-	selected := make([]SearchResult, 0, maxResults)
-	remaining := make([]SearchResult, len(results))
-	copy(remaining, results)
-
-	selected = append(selected, remaining[0])
-	remaining = remaining[1:]
+	limit := maxResults
+	if limit <= 0 || limit > len(results) {
+		limit = len(results)
+	}
 
 	tokenCache := make(map[string]map[string]bool)
 	tokenize := func(text string) map[string]bool {
@@ -432,21 +469,38 @@ func (h *HybridSearcher) applyMMR(results []SearchResult, lambda float64, maxRes
 		tokenCache[text] = tokens
 		return tokens
 	}
+	sim := func(a, b SearchResult) float64 {
+		if h.vectorCache != nil {
+			va, oka := h.vectorCache.Get(a.Memory.ID)
+			vb, okb := h.vectorCache.Get(b.Memory.ID)
+			if oka && okb && len(va) > 0 && len(vb) > 0 {
+				return cosineSimilarityFloat32(va, vb)
+			}
+		}
+		return jaccardSimilarity(tokenize(a.Memory.Content), tokenize(b.Memory.Content))
+	}
 
-	for len(selected) < maxResults && len(remaining) > 0 {
-		bestIdx := 0
-		bestScore := -1.0
+	selected := make([]SearchResult, 0, limit)
+	remaining := make([]SearchResult, len(results))
+	copy(remaining, results)
+
+	selected = append(selected, remaining[0])
+	remaining = remaining[1:]
+
+	for len(selected) < limit && len(remaining) > 0 {
+		bestIdx := -1
+		bestScore := -math.MaxFloat64
 
 		for i, candidate := range remaining {
 			maxSim := 0.0
-			candidateTokens := tokenize(candidate.Memory.Content)
 			for _, sel := range selected {
-				sim := jaccardSimilarity(candidateTokens, tokenize(sel.Memory.Content))
-				if sim > maxSim {
-					maxSim = sim
+				if s := sim(candidate, sel); s > maxSim {
+					maxSim = s
 				}
 			}
-
+			if maxSim >= nearDupThreshold {
+				continue // near-duplicate of an already-selected result — skip
+			}
 			mmrScore := lambda*candidate.Score - (1-lambda)*maxSim
 			if mmrScore > bestScore {
 				bestScore = mmrScore
@@ -454,6 +508,9 @@ func (h *HybridSearcher) applyMMR(results []SearchResult, lambda float64, maxRes
 			}
 		}
 
+		if bestIdx < 0 {
+			break // everything remaining is a near-duplicate
+		}
 		selected = append(selected, remaining[bestIdx])
 		remaining = append(remaining[:bestIdx], remaining[bestIdx+1:]...)
 	}

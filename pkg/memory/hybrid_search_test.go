@@ -358,3 +358,77 @@ func TestApplyLifecycleBoost_NilMetadata(t *testing.T) {
 		t.Errorf("nil metadata should not change score: got %f", out[0].Score)
 	}
 }
+
+// --- core-memory-improvements: score-aware fusion, category decay, MMR dedup ---
+
+func TestFuse_PreservesMagnitude(t *testing.T) {
+	// Pure rank-based RRF would score these 1.0 vs 0.5 (ratio 2.0) regardless of
+	// the real similarity gap. Score-aware fusion must preserve the 0.9/0.5 gap.
+	h := NewHybridSearcher(nil, nil, nil, nil, DefaultHybridSearchConfig(), nil, nil, nil)
+	vec := []SearchResult{
+		{Memory: Memory{ID: "a", CreatedAt: time.Now()}, Score: 0.9},
+		{Memory: Memory{ID: "b", CreatedAt: time.Now()}, Score: 0.5},
+	}
+	fused := h.fuse(vec, nil, 0.7, 0.3)
+	m := map[string]float64{}
+	for _, r := range fused {
+		m[r.Memory.ID] = r.Score
+	}
+	if m["a"] <= m["b"] {
+		t.Fatalf("a should rank above b: %+v", m)
+	}
+	ratio := m["a"] / m["b"]
+	if ratio < 1.75 || ratio > 1.85 { // 0.9/0.5 = 1.8, not RRF's 2.0
+		t.Errorf("magnitude not preserved: ratio=%.3f want ~1.8", ratio)
+	}
+}
+
+func TestCategoryDecayMultiplier(t *testing.T) {
+	if categoryDecayMultiplier("fact") != 6 || categoryDecayMultiplier("decision") != 6 {
+		t.Error("durable categories should decay ~6x slower")
+	}
+	if categoryDecayMultiplier("event") != 1 || categoryDecayMultiplier("") != 1 {
+		t.Error("events/uncategorized decay at base rate")
+	}
+}
+
+func TestApplyTemporalDecay_CategoryAware(t *testing.T) {
+	h := NewHybridSearcher(nil, nil, nil, nil, DefaultHybridSearchConfig(), nil, nil, nil)
+	old := time.Now().AddDate(0, 0, -60) // 60 days old, base half-life 30d
+	res := []SearchResult{
+		{Memory: Memory{ID: "fact", Category: "fact", CreatedAt: old}, Score: 1.0},
+		{Memory: Memory{ID: "event", Category: "event", CreatedAt: old}, Score: 1.0},
+	}
+	out := h.applyTemporalDecay(res, DefaultHybridSearchConfig())
+	m := map[string]float64{}
+	for _, r := range out {
+		m[r.Memory.ID] = r.Score
+	}
+	if m["fact"] <= m["event"] {
+		t.Errorf("a 60-day fact should outlive a 60-day event: fact=%.3f event=%.3f", m["fact"], m["event"])
+	}
+}
+
+func TestApplyMMR_DropsNearDuplicate(t *testing.T) {
+	vc := NewVectorCache(nil)
+	vc.Put("a", []float32{1, 0, 0, 0})
+	vc.Put("b", []float32{1, 0, 0, 0}) // identical to a → near-dup
+	vc.Put("c", []float32{0, 1, 0, 0}) // distinct
+	h := NewHybridSearcher(nil, nil, nil, vc, DefaultHybridSearchConfig(), nil, nil, nil)
+	res := []SearchResult{
+		{Memory: Memory{ID: "a", Content: "x"}, Score: 1.0},
+		{Memory: Memory{ID: "b", Content: "y"}, Score: 0.9},
+		{Memory: Memory{ID: "c", Content: "z"}, Score: 0.8},
+	}
+	out := h.applyMMR(res, 0.7, 20)
+	ids := map[string]bool{}
+	for _, r := range out {
+		ids[r.Memory.ID] = true
+	}
+	if ids["b"] {
+		t.Errorf("near-duplicate 'b' should be dropped, got %v", ids)
+	}
+	if !ids["a"] || !ids["c"] {
+		t.Errorf("distinct results a and c should survive, got %v", ids)
+	}
+}
