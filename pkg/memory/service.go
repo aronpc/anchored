@@ -124,7 +124,14 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 	existing, err := s.store.FindByContentHash(ctx, hash, projectID)
 	if err != nil {
 		s.logger.Warn("content hash lookup failed, proceeding with save", "error", err)
-	} else if existing != nil {
+	}
+	// Exact-hash miss: look for a near-duplicate (a restatement of an existing
+	// memory). Updating it in place keeps the store from accumulating
+	// paraphrased duplicates that exact hashing can't catch.
+	if existing == nil {
+		existing = s.findNearDuplicate(ctx, opts.Content, projectID)
+	}
+	if existing != nil {
 		metadata = WithPreferenceScope(existing.Metadata, opts.Category, opts.PreferenceScope)
 		metadata = ApplyQualityMetadata(metadata, opts.Content, opts.Category, hasProject)
 		upd := Memory{
@@ -499,4 +506,50 @@ func (s *Service) Close() {
 	if s.store != nil {
 		s.store.Close()
 	}
+}
+
+// nearDupSaveThreshold is the lexical-Jaccard cutoff above which a new memory is
+// treated as a restatement of an existing one and merged in place. Kept high so
+// only near-identical content merges (distinct facts sharing vocabulary do not).
+const nearDupSaveThreshold = 0.9
+
+func tokenSet(text string) map[string]bool {
+	set := make(map[string]bool)
+	for _, w := range strings.Fields(strings.ToLower(text)) {
+		if len(w) > 2 {
+			set[w] = true
+		}
+	}
+	return set
+}
+
+// findNearDuplicate returns an existing memory that is a near-restatement of
+// content (lexical Jaccard >= nearDupSaveThreshold) within the same project, or
+// nil. It fetches a few BM25 candidates so the check stays cheap (no
+// synchronous embedding on the save path).
+func (s *Service) findNearDuplicate(ctx context.Context, content string, projectID *string) *Memory {
+	kws := ExtractKeywords(content)
+	if len(kws) == 0 {
+		return nil
+	}
+	fts := ExpandQueryForFTS(kws)
+	if fts == "" {
+		return nil
+	}
+	opts := SearchOptions{MaxResults: 5}
+	if projectID != nil {
+		opts.ProjectID = *projectID
+	}
+	cands, err := s.store.Search(ctx, fts, opts)
+	if err != nil {
+		return nil
+	}
+	want := tokenSet(content)
+	for i := range cands {
+		if jaccardSimilarity(want, tokenSet(cands[i].Memory.Content)) >= nearDupSaveThreshold {
+			m := cands[i].Memory
+			return &m
+		}
+	}
+	return nil
 }

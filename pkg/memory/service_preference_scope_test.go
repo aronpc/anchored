@@ -20,6 +20,12 @@ func (s *capturePreferenceScopeStore) FindByContentHash(_ context.Context, _ str
 	return s.existing, nil
 }
 
+// Search is exercised by the near-duplicate check on the save path; this mock
+// has no candidates to return.
+func (s *capturePreferenceScopeStore) Search(_ context.Context, _ string, _ SearchOptions) ([]SearchResult, error) {
+	return nil, nil
+}
+
 func TestServiceSaveWithOptions_DefaultsPreferenceScopeToUser(t *testing.T) {
 	store := &capturePreferenceScopeStore{}
 	svc := &Service{store: store}
