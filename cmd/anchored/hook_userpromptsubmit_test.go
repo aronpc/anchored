@@ -9,35 +9,6 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-func TestMemoryTriggerRE(t *testing.T) {
-	yes := []string{
-		"você lembra do bug que vimos?",
-		"como decidimos lidar com X?",
-		"do you remember the migration?",
-		"like we discussed yesterday",
-		"from now on we use X",
-		"de agora em diante prefiro Y",
-		"a gente fechou em qual stack?",
-		"our convention for naming",
-	}
-	no := []string{
-		"summarize this file",
-		"run the tests",
-		"deploy to staging",
-		"memorize the alphabet", // no \b match on "memory" prefix
-	}
-	for _, p := range yes {
-		if !memoryTriggerRE.MatchString(p) {
-			t.Errorf("trigger should fire for %q", p)
-		}
-	}
-	for _, p := range no {
-		if memoryTriggerRE.MatchString(p) {
-			t.Errorf("trigger should NOT fire for %q", p)
-		}
-	}
-}
-
 func TestSanitizeFTSQuery(t *testing.T) {
 	cases := map[string]string{
 		"how did we decide on RRF?":            "how did decide rrf",

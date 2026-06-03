@@ -1,5 +1,5 @@
 {
-  "description": "Anchored hooks — SessionStart + UserPromptSubmit inject the persistent-memory routing block (with pre-search hits when prompts mention memory); PostToolUse / PreCompact capture session events; PreToolUse blocks dangerous code inside anchored sandbox tools.",
+  "description": "Anchored hooks — SessionStart injects the full persistent-memory routing block; UserPromptSubmit injects a compact reminder plus always-on BM25 pre-search hits; PostToolUse captures state-changing tool events; PreCompact snapshots the conversation; PreToolUse blocks dangerous code inside anchored sandbox tools.",
   "hooks": {
     "SessionStart": [
       {
@@ -36,7 +36,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Read|Write|Edit|Grep|Glob|TodoWrite|Skill|Agent|mcp__",
+        "matcher": "Write|Edit|Bash|mcp__anchored__",
         "hooks": [
           {
             "type": "command",

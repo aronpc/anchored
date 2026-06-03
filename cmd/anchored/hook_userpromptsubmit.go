@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strings"
 	"time"
 	"unicode"
@@ -16,22 +15,6 @@ import (
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/mcp"
 )
-
-// memoryTriggerRE matches casual memory-related cues in PT-BR and EN that
-// should pre-fetch top hits from anchored memory before the agent answers.
-// Word-bounded to avoid in-substring matches ("memorize" should not fire,
-// neither should "remembered the dream"). Case-insensitive via (?i).
-var memoryTriggerRE = regexp.MustCompile(`(?i)\b(` +
-	`memória|memoria|memórias|memorias|memory|memories|` +
-	`lembra|lembre|lembrar|lembramos|lembrei|lembrava|` +
-	`remember|recall|recalled|` +
-	`decidimos|decidiu|fechamos|combinamos|acertamos|` +
-	`decided|settled\s+on|agreed|chose|` +
-	`a\s+gente|nosso|nossa|` +
-	`our|we\s+(?:have|had|did|do|use|used|prefer|like|always|never)|` +
-	`as\s+we|like\s+we\s+discussed|what\s+did\s+we|` +
-	`from\s+now\s+on|going\s+forward|de\s+agora\s+em\s+diante` +
-	`)\b`)
 
 // preSearchTimeout caps how long we wait on the BM25 query so a slow DB
 // never blocks the user's prompt from reaching the model. Pre-search is
@@ -64,15 +47,17 @@ func runHookUserPromptSubmit(args []string) {
 	}
 	_ = json.Unmarshal(body, &parsed)
 
-	additional := mcp.AnchoredRoutingBlock
+	// Compact reminder each turn; the full routing block is injected once per
+	// session (SessionStart + MCP initialize), so we don't re-pay ~2KB here.
+	additional := mcp.AnchoredRoutingReminder
 
-	// Pre-search is gated on a trigger word — re-injecting hits on every
-	// turn would inflate context for prompts that don't need them, and the
-	// routing block alone already nudges the model to query when relevant.
-	if memoryTriggerRE.MatchString(parsed.Prompt) {
-		if preview := preSearchPreview(*configPath, parsed.Cwd, parsed.Prompt, dlog); preview != "" {
-			additional += "\n\n" + preview
-		}
+	// Pre-search runs on EVERY prompt within a tight budget. It's the most
+	// reliable retrieval path (it puts hits in front of the model rather than
+	// hoping it calls anchored_search), and it self-gates: sanitizeFTSQuery
+	// drops trivial prompts to an empty query and preSearchPreview returns ""
+	// when there are no hits, so non-memory prompts add nothing.
+	if preview := preSearchPreview(*configPath, parsed.Cwd, parsed.Prompt, dlog); preview != "" {
+		additional += "\n\n" + preview
 	}
 
 	dlog.Event("hook.userpromptsubmit", map[string]any{
