@@ -508,25 +508,21 @@ func (s *Service) Close() {
 	}
 }
 
-// nearDupSaveThreshold is the lexical-Jaccard cutoff above which a new memory is
-// treated as a restatement of an existing one and merged in place. Kept high so
-// only near-identical content merges (distinct facts sharing vocabulary do not).
-const nearDupSaveThreshold = 0.9
-
-func tokenSet(text string) map[string]bool {
-	set := make(map[string]bool)
-	for _, w := range strings.Fields(strings.ToLower(text)) {
-		if len(w) > 2 {
-			set[w] = true
-		}
-	}
-	return set
+// normalizeForDedup folds the trivial variations exact hashing misses:
+// case and whitespace. It deliberately does NOT tokenize or measure fuzzy
+// similarity — two memories merge only when they are the SAME text modulo
+// case/spacing, never when they merely share vocabulary (e.g. "deployed v1"
+// and "deployed v2", or "...decision A..." and "...decision B...", stay
+// distinct).
+func normalizeForDedup(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
 }
 
-// findNearDuplicate returns an existing memory that is a near-restatement of
-// content (lexical Jaccard >= nearDupSaveThreshold) within the same project, or
+// findNearDuplicate returns an existing memory whose content is identical to
+// `content` after case/whitespace normalization, within the same project, or
 // nil. It fetches a few BM25 candidates so the check stays cheap (no
-// synchronous embedding on the save path).
+// synchronous embedding). This catches "Postgres" vs "postgres " without the
+// false-merge risk of fuzzy similarity.
 func (s *Service) findNearDuplicate(ctx context.Context, content string, projectID *string) *Memory {
 	kws := ExtractKeywords(content)
 	if len(kws) == 0 {
@@ -536,7 +532,7 @@ func (s *Service) findNearDuplicate(ctx context.Context, content string, project
 	if fts == "" {
 		return nil
 	}
-	opts := SearchOptions{MaxResults: 5}
+	opts := SearchOptions{MaxResults: 10}
 	if projectID != nil {
 		opts.ProjectID = *projectID
 	}
@@ -544,9 +540,9 @@ func (s *Service) findNearDuplicate(ctx context.Context, content string, project
 	if err != nil {
 		return nil
 	}
-	want := tokenSet(content)
+	want := normalizeForDedup(content)
 	for i := range cands {
-		if jaccardSimilarity(want, tokenSet(cands[i].Memory.Content)) >= nearDupSaveThreshold {
+		if normalizeForDedup(cands[i].Memory.Content) == want {
 			m := cands[i].Memory
 			return &m
 		}
