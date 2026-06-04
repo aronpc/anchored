@@ -46,12 +46,19 @@ type RemoteConfig struct {
 
 // RemoteEntry is a single named remote server in the remotes map.
 type RemoteEntry struct {
-	Name      string   `yaml:"-"`
-	ServerURL string   `yaml:"server_url"`
-	APIKey    string   `yaml:"api_key"`
-	Default   bool     `yaml:"default,omitempty"`
-	Projects  []string `yaml:"projects,omitempty"`
-	AutoSync  *bool    `yaml:"auto_sync,omitempty"`
+	Name      string `yaml:"-"`
+	ServerURL string `yaml:"server_url"`
+	APIKey    string `yaml:"api_key"`
+	Default   bool   `yaml:"default,omitempty"`
+	// Paths are glob patterns matched against a project's local path to
+	// route it to this remote (e.g. "/home/me/work/*"). path.Match
+	// semantics: `*` does not cross `/`.
+	Paths []string `yaml:"paths,omitempty"`
+	// Projects are remote project IDs linked to THIS server via
+	// `anchored remote link --remote <name> <id>`. IDs are server-scoped,
+	// so each entry carries its own links.
+	Projects []string `yaml:"projects,omitempty"`
+	AutoSync *bool    `yaml:"auto_sync,omitempty"`
 }
 
 // PluginConfig controls how anchored handles drift between the binary version
@@ -253,30 +260,43 @@ func expandHome(path, home string) string {
 }
 
 func (c *Config) migrateRemotes() {
-	if len(c.Remotes) > 0 {
-		for name, entry := range c.Remotes {
-			entry.Name = name
-			c.Remotes[name] = entry
-		}
+	for name, entry := range c.Remotes {
+		entry.Name = name
+		c.Remotes[name] = entry
+	}
+	// Merge the legacy singular `remote:` block into the named map as
+	// "default" so it keeps resolving alongside named entries. Without
+	// this, adding a second (named) server would silently drop the first
+	// from routing. An explicit "default" entry in the map wins.
+	if c.Remote.ServerURL == "" {
 		return
 	}
-	if c.Remote.ServerURL != "" {
-		c.Remotes = map[string]RemoteEntry{
-			"default": {
-				Name:      "default",
-				ServerURL: c.Remote.ServerURL,
-				APIKey:    c.Remote.APIKey,
-				Default:   true,
-				Projects:  c.Remote.Projects,
-				AutoSync:  c.Remote.AutoSync,
-			},
+	if _, exists := c.Remotes["default"]; exists {
+		return
+	}
+	hasDefault := false
+	for _, entry := range c.Remotes {
+		if entry.Default {
+			hasDefault = true
+			break
 		}
+	}
+	if c.Remotes == nil {
+		c.Remotes = map[string]RemoteEntry{}
+	}
+	c.Remotes["default"] = RemoteEntry{
+		Name:      "default",
+		ServerURL: c.Remote.ServerURL,
+		APIKey:    c.Remote.APIKey,
+		Default:   !hasDefault,
+		Projects:  c.Remote.Projects,
+		AutoSync:  c.Remote.AutoSync,
 	}
 }
 
 func (c *Config) ResolveRemote(projectPath string) *RemoteEntry {
 	for name, entry := range c.Remotes {
-		for _, pattern := range entry.Projects {
+		for _, pattern := range entry.Paths {
 			if globMatch(pattern, projectPath) {
 				entry.Name = name
 				return &entry
