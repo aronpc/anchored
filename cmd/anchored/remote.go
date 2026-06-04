@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/sync"
 )
@@ -282,7 +283,7 @@ func runRemoteSync(args []string) {
 		return
 	}
 
-	cfg, _, svc, err := initService(*configPath)
+	cfg, logger, svc, err := initService(*configPath)
 	if err != nil {
 		slog.Error("failed to initialize", "error", err)
 		os.Exit(1)
@@ -296,9 +297,6 @@ func runRemoteSync(args []string) {
 		projectRoot, _ = os.Getwd()
 	}
 
-	// Resolve the current repository. Identity is the git-origin remote_key,
-	// never the directory name — so a repo synced from /a/anchored and
-	// /b/anchored-fork (same origin) routes to one remote project.
 	proj, err := svc.ResolveProjectInfo(projectRoot)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "resolve project error: %v\n", err)
@@ -425,6 +423,38 @@ func runRemoteSync(args []string) {
 	if len(resp.Errors) > 0 {
 		for _, e := range resp.Errors {
 			fmt.Fprintf(os.Stderr, "  error: %s\n", e)
+		}
+	}
+
+	if proj != nil {
+		kgInst := kg.New(svc.StoreDB(), logger)
+		localTriples, kgErr := kgInst.ListByProject(ctx, proj.ID)
+		if kgErr != nil {
+			fmt.Fprintf(os.Stderr, "KG sync: warning: list triples failed: %v\n", kgErr)
+		} else if len(localTriples) > 0 {
+			syncTriples := make([]sync.SyncTriple, len(localTriples))
+			for i, t := range localTriples {
+				syncTriples[i] = sync.SyncTriple{
+					Subject:    t.Subject,
+					Predicate:  t.Predicate,
+					Object:     t.Object,
+					Confidence: t.Confidence,
+				}
+			}
+			remoteProjID := *projectID
+			kgResp, kgPushErr := client.PushTriples(ctx, remoteProjID, syncTriples)
+			if kgPushErr != nil {
+				fmt.Fprintf(os.Stderr, "KG sync: warning: push triples failed: %v\n", kgPushErr)
+			} else {
+				fmt.Printf("KG sync: %d accepted, %d rejected\n", kgResp.Accepted, kgResp.Rejected)
+				if len(kgResp.Errors) > 0 {
+					for _, e := range kgResp.Errors {
+						fmt.Fprintf(os.Stderr, "  KG error: %s\n", e)
+					}
+				}
+			}
+		} else {
+			fmt.Println("KG sync: no local triples to push")
 		}
 	}
 }
