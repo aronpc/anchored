@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 
+	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/sync"
@@ -275,6 +277,7 @@ func runRemoteSync(args []string) {
 	project := fs.String("project", "", "project path filter (default: cwd)")
 	dryRun := fs.Bool("dry-run", false, "preview what would be pushed without making network calls")
 	projectID := fs.String("project-id", "", "force a specific remote project ID (overrides git-origin routing)")
+	remoteName := fs.String("remote", "", "use a specific named remote (default: resolve by project path, then the default remote)")
 	all := fs.Bool("all", false, "sync every local project (each routed by its own git origin), not just the current repo")
 	fs.Parse(args)
 
@@ -303,6 +306,27 @@ func runRemoteSync(args []string) {
 		os.Exit(1)
 	}
 
+	// Multi-server: pick the remote the same way search/save do — an explicit
+	// --remote name wins, then the project-path match from the named remotes
+	// map, then the default entry. Each repo can therefore sync to a
+	// different server (e.g. personal vs company) from one config.
+	var entry *config.RemoteEntry
+	if *remoteName != "" {
+		if e, ok := cfg.Remotes[*remoteName]; ok {
+			e.Name = *remoteName
+			entry = &e
+		} else {
+			fmt.Fprintf(os.Stderr, "remote %q not found in config (available: %s)\n", *remoteName, remoteNames(cfg))
+			os.Exit(1)
+		}
+	} else {
+		entry = cfg.ResolveRemote(projectRoot)
+	}
+	var entryProjects []string
+	if entry != nil {
+		entryProjects = entry.Projects
+	}
+
 	// When forcing a remote project id, the git-origin guard is bypassed
 	// intentionally (manual override). Otherwise we require a git repo with an
 	// origin so we can confirm the repository identity before pushing.
@@ -313,11 +337,11 @@ func runRemoteSync(args []string) {
 		// repo's memories (and KG triples) into one remote project. It is
 		// only used as a fallback when the cwd has no matchable git origin.
 		if proj != nil && proj.RemoteKey != "" {
-			if len(cfg.Remote.Projects) > 0 {
-				fmt.Printf("Repo has a git origin — routing by origin (ignoring linked project %s; use --project-id to force one)\n", cfg.Remote.Projects[0])
+			if len(entryProjects) > 0 {
+				fmt.Printf("Repo has a git origin — routing by origin (ignoring linked project %s; use --project-id to force one)\n", entryProjects[0])
 			}
-		} else if len(cfg.Remote.Projects) > 0 {
-			*projectID = cfg.Remote.Projects[0]
+		} else if len(entryProjects) > 0 {
+			*projectID = entryProjects[0]
 			fmt.Printf("Using linked project %s (use --project-id to override)\n", *projectID)
 		} else {
 			if proj == nil {
@@ -369,14 +393,22 @@ func runRemoteSync(args []string) {
 		return
 	}
 
-	if !cfg.Remote.Enabled {
+	// The Enabled flag only exists on the legacy singular `remote:` block —
+	// honor it when that block is what resolved (named `remotes:` entries
+	// are enabled by definition; remove the entry to disable it).
+	if entry != nil && entry.Name == "default" && cfg.Remote.ServerURL != "" && !cfg.Remote.Enabled {
 		fmt.Fprintln(os.Stderr, "Remote sync is disabled. Enable in config or use --dry-run.")
 		os.Exit(1)
 	}
+	if entry == nil {
+		fmt.Fprintln(os.Stderr, "No remote configured. Run `anchored remote configure --server <url> --key <key>` or add a `remotes:` entry to the config.")
+		os.Exit(1)
+	}
 
-	// NewClient only returns nil when cfg.Remote.Enabled is false, which is
-	// guarded above — no nil check needed here.
-	client := sync.NewClient(cfg.Remote, "cli")
+	if len(cfg.Remotes) > 1 || *remoteName != "" {
+		fmt.Printf("Remote: %s (%s)\n", entry.Name, entry.ServerURL)
+	}
+	client := sync.NewClientFromEntry(*entry, "cli")
 
 	pushMemories := make([]sync.SyncMemory, 0, preview.Syncable)
 	for _, item := range preview.Items {
@@ -482,6 +514,20 @@ func runRemoteSync(args []string) {
 			fmt.Println("KG sync: no local triples to push")
 		}
 	}
+}
+
+// remoteNames returns the configured remote names, comma-separated, for
+// error messages.
+func remoteNames(cfg *config.Config) string {
+	if len(cfg.Remotes) == 0 {
+		return "none"
+	}
+	names := make([]string, 0, len(cfg.Remotes))
+	for name := range cfg.Remotes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }
 
 // listProjectMemories paginates through every non-deleted memory belonging to a
