@@ -126,20 +126,25 @@ func searchRemote(ctx context.Context, svc *memory.Service, configPath, remoteNa
 		return nil, false
 	}
 
-	client := sync.NewClientFromEntry(*entry, "cli")
 	if projectID == "" {
-		// Resolve the REMOTE project: the server only knows its own IDs, so
-		// match the cwd repo's git-origin remote_key against the server's
-		// project list (same precedence as sync: origin first, then a linked
-		// project for non-repo contexts).
+		// Resolve the REMOTE project: the server only knows its own IDs. With
+		// an explicit --remote name, match the repo's git-origin key against
+		// that server only; otherwise probe every configured remote so a
+		// freshly-configured second server works with zero routing setup.
 		rCwd := cwd
 		if rCwd == "" {
 			rCwd, _ = os.Getwd()
 		}
 		originRouted := false
 		if proj, pErr := svc.ResolveProjectInfo(rCwd); pErr == nil && proj != nil && proj.RemoteKey != "" {
-			projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
 			originRouted = true
+			if remoteName != "" {
+				client := sync.NewClientFromEntry(*entry, "cli")
+				projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
+			} else if target, pid := sync.ResolveProjectAcrossRemotes(ctx, cfg, rCwd, proj.RemoteKey, "cli"); target != nil && pid != "" {
+				entry = target
+				projectID = pid
+			}
 		}
 		if projectID == "" && !originRouted && len(entry.Projects) > 0 {
 			projectID = entry.Projects[0]
@@ -150,6 +155,7 @@ func searchRemote(ctx context.Context, svc *memory.Service, configPath, remoteNa
 		}
 	}
 
+	client := sync.NewClientFromEntry(*entry, "cli")
 	results, err := client.SearchRemote(ctx, projectID, query, limit)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "remote search unavailable: %v — falling back to local\n", err)

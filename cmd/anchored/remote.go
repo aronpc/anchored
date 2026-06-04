@@ -513,6 +513,17 @@ func runRemoteSync(args []string) {
 		return
 	}
 
+	// Cross-remote origin probe: when no remote was forced and the resolved
+	// one doesn't know this repository, ask the other configured remotes —
+	// a freshly-configured second server (no routing paths yet) is found
+	// automatically instead of the push failing with "project not found".
+	if *remoteName == "" && proj != nil && proj.RemoteKey != "" && len(cfg.Remotes) > 1 {
+		if target, _ := sync.ResolveProjectAcrossRemotes(ctx, cfg, projectRoot, proj.RemoteKey, "cli"); target != nil && (entry == nil || target.Name != entry.Name) {
+			fmt.Printf("Repository is registered on remote %q — using it (force another with --remote)\n", target.Name)
+			entry = target
+		}
+	}
+
 	// The Enabled flag only exists on the legacy singular `remote:` block —
 	// honor it when that block is what resolved (named `remotes:` entries
 	// are enabled by definition; remove the entry to disable it).
