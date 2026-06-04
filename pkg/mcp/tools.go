@@ -49,7 +49,7 @@ func ToolDefinitions() []Tool {
 					},
 					"remote": map[string]any{
 						"type":        "string",
-						"description": "Search on remote server instead of local. Pass empty string for default remote, or a named remote. Falls back to local on error.",
+						"description": "Usually OMIT this: when the project has a remote configured, remote results are merged into every search automatically. Set it only to search the remote EXCLUSIVELY (empty string or \"default\" for the default remote, or a named remote). Falls back to local on error.",
 					},
 				},
 				"required": []string{"query"},
@@ -81,7 +81,7 @@ func ToolDefinitions() []Tool {
 					},
 					"remote": map[string]any{
 						"type":        "string",
-						"description": "Also save to remote server. Pass empty string for default remote, or a named remote. Falls back gracefully on remote error — local save always succeeds.",
+						"description": "Usually OMIT this: when the project's remote has auto_sync on, the save is mirrored to it automatically. Set it only to force a synchronous save to a specific remote (empty string or \"default\" for the default remote, or a named remote). Local save always succeeds regardless.",
 					},
 				},
 				"required": []string{"content", "category"},
