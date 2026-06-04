@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/sync"
 
 	_ "modernc.org/sqlite"
@@ -32,7 +33,7 @@ func runRemoteSyncPerProject(args []string) {
 	fallback := fs.String("fallback-name", "misc", "remote project name for memories without a local project")
 	fs.Parse(args)
 
-	cfg, _, svc, err := initService(*configPath)
+	cfg, logger, svc, err := initService(*configPath)
 	if err != nil {
 		slog.Error("failed to initialize", "error", err)
 		os.Exit(1)
@@ -132,6 +133,7 @@ func runRemoteSyncPerProject(args []string) {
 
 	client := sync.NewClient(cfg.Remote, "cli-per-project")
 	httpAPI := newAdminAPI(cfg.Remote.ServerURL, cfg.Remote.APIKey)
+	kgInst := kg.New(svc.StoreDB(), logger)
 
 	totalAccepted := 0
 	totalRejected := 0
@@ -161,6 +163,27 @@ func runRemoteSyncPerProject(args []string) {
 		fmt.Printf("  [%s] %d accepted, %d rejected\n", p.b.name, resp.Accepted, resp.Rejected)
 		totalAccepted += resp.Accepted
 		totalRejected += resp.Rejected
+
+		localTriples, kgErr := kgInst.ListByProject(ctx, p.key)
+		if kgErr != nil {
+			fmt.Fprintf(os.Stderr, "  [%s] KG sync: warning: list triples failed: %v\n", p.b.name, kgErr)
+		} else if len(localTriples) > 0 {
+			syncTriples := make([]sync.SyncTriple, len(localTriples))
+			for i, t := range localTriples {
+				syncTriples[i] = sync.SyncTriple{
+					Subject:    t.Subject,
+					Predicate:  t.Predicate,
+					Object:     t.Object,
+					Confidence: t.Confidence,
+				}
+			}
+			kgResp, kgPushErr := client.PushTriples(ctx, projID, syncTriples)
+			if kgPushErr != nil {
+				fmt.Fprintf(os.Stderr, "  [%s] KG sync: warning: push triples failed: %v\n", p.b.name, kgPushErr)
+			} else {
+				fmt.Printf("  [%s] KG sync: %d accepted, %d rejected\n", p.b.name, kgResp.Accepted, kgResp.Rejected)
+			}
+		}
 	}
 
 	fmt.Printf("\nDone. %d accepted, %d rejected total.\n", totalAccepted, totalRejected)
