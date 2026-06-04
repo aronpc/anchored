@@ -41,7 +41,10 @@ type RemoteConfig struct {
 	// applies, so user-scoped/personal/secret memories never leave the machine.
 	// Defaults to true when a remote is configured; set explicitly to false
 	// to disable.
-	AutoSync *bool `yaml:"auto_sync"`
+	// omitempty keeps an unset value out of the file entirely — marshaling a
+	// nil *bool without it writes a confusing "auto_sync: null" (which still
+	// means enabled, but reads like something is broken).
+	AutoSync *bool `yaml:"auto_sync,omitempty"`
 }
 
 // RemoteEntry is a single named remote server in the remotes map.
