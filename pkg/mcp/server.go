@@ -20,6 +20,7 @@ import (
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/memory"
+	"github.com/jholhewres/anchored/pkg/project"
 	"github.com/jholhewres/anchored/pkg/session"
 	remotesync "github.com/jholhewres/anchored/pkg/sync"
 )
@@ -1208,7 +1209,9 @@ func (s *Server) toolKGAdd(ctx context.Context, args json.RawMessage) (string, e
 func (s *Server) resolveRemoteProjectID(ctx context.Context, client *remotesync.Client, entry config.RemoteEntry, cwd string) (string, bool) {
 	if s.mem != nil {
 		if proj, err := s.mem.ResolveProjectInfo(cwd); err == nil && proj != nil && proj.RemoteKey != "" {
-			return client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey), true
+			canonicalKey, legacyKey := project.RemoteKeysFromDir(proj.Path)
+			pid, _ := client.ResolveProjectIDByRemoteKeys(ctx, canonicalKey, legacyKey)
+			return pid, true
 		}
 	}
 	if len(entry.Projects) > 0 {
@@ -1228,7 +1231,9 @@ func (s *Server) resolveAutoRemoteTarget(ctx context.Context, cwd string) (*conf
 	}
 	if s.mem != nil {
 		if proj, err := s.mem.ResolveProjectInfo(cwd); err == nil && proj != nil && proj.RemoteKey != "" {
-			return remotesync.ResolveProjectAcrossRemotes(ctx, s.cfg, cwd, proj.RemoteKey, "mcp")
+			canonicalKey, legacyKey := project.RemoteKeysFromDir(proj.Path)
+			target, pid, _ := remotesync.ResolveProjectAcrossRemotes(ctx, s.cfg, cwd, "mcp", canonicalKey, legacyKey)
+			return target, pid
 		}
 	}
 	if entry := s.cfg.ResolveRemote(cwd); entry != nil && len(entry.Projects) > 0 {

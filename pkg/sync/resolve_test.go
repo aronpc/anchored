@@ -41,22 +41,22 @@ func TestResolveProjectAcrossRemotes(t *testing.T) {
 		"company": {Name: "company", ServerURL: company.URL, APIKey: "k2"}, // no paths, no default
 	}
 
-	entry, pid := ResolveProjectAcrossRemotes(context.Background(), cfg, "/some/repo", key, "test")
-	if entry == nil || entry.Name != "company" || pid != "proj-on-this-server" {
-		t.Fatalf("probe should find the company remote, got entry=%+v pid=%q", entry, pid)
+	entry, pid, matched := ResolveProjectAcrossRemotes(context.Background(), cfg, "/some/repo", "test", key)
+	if entry == nil || entry.Name != "company" || pid != "proj-on-this-server" || matched != key {
+		t.Fatalf("probe should find the company remote, got entry=%+v pid=%q matched=%q", entry, pid, matched)
 	}
 
 	// When the resolved (default) remote knows the key, it wins — the probe
 	// must not jump to another server.
 	both := fakeProjectsServer(t, key)
 	cfg.Remotes["default"] = config.RemoteEntry{Name: "default", ServerURL: both.URL, APIKey: "k1", Default: true}
-	entry, _ = ResolveProjectAcrossRemotes(context.Background(), cfg, "/some/repo", key, "test")
+	entry, _, _ = ResolveProjectAcrossRemotes(context.Background(), cfg, "/some/repo", "test", key)
 	if entry == nil || entry.Name != "default" {
 		t.Fatalf("resolved remote should win when it knows the key, got %+v", entry)
 	}
 
 	// Unknown key everywhere → nothing.
-	if e, p := ResolveProjectAcrossRemotes(context.Background(), cfg, "/some/repo", "nope", "test"); e != nil || p != "" {
-		t.Fatalf("unknown key should resolve to nothing, got %+v %q", e, p)
+	if e, p, m := ResolveProjectAcrossRemotes(context.Background(), cfg, "/some/repo", "test", "nope"); e != nil || p != "" || m != "" {
+		t.Fatalf("unknown key should resolve to nothing, got %+v %q %q", e, p, m)
 	}
 }

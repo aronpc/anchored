@@ -325,23 +325,44 @@ func (c *Client) ListProjects(ctx context.Context) ([]RemoteProject, error) {
 }
 
 // ResolveProjectIDByRemoteKey returns the ID of the remote project whose
-// remote_key matches, or "" when none does (or the listing fails). Used by
-// auto-sync paths that need a concrete remote project ID but only know the
-// repo's git-origin key — the local project ID is meaningless to the server.
+// remote_key matches, or "" when none does (or the listing fails). Thin
+// wrapper over ResolveProjectIDByRemoteKeys for single-key callers.
 func (c *Client) ResolveProjectIDByRemoteKey(ctx context.Context, remoteKey string) string {
-	if remoteKey == "" {
-		return ""
+	pid, _ := c.ResolveProjectIDByRemoteKeys(ctx, remoteKey)
+	return pid
+}
+
+// ResolveProjectIDByRemoteKeys probes the remote project listing for the first
+// of keys (in order) that matches, returning the project ID and the key that
+// matched, or ("", "") when none does (or the listing fails). The listing is
+// fetched once and matched in memory, so passing multiple keys (e.g. canonical
+// then legacy) costs a single round-trip. Empty keys are skipped.
+func (c *Client) ResolveProjectIDByRemoteKeys(ctx context.Context, keys ...string) (projectID, matchedKey string) {
+	hasKey := false
+	for _, k := range keys {
+		if k != "" {
+			hasKey = true
+			break
+		}
+	}
+	if !hasKey {
+		return "", ""
 	}
 	projects, err := c.ListProjects(ctx)
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	for _, p := range projects {
-		if p.RemoteKey == remoteKey {
-			return p.ID
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		for _, p := range projects {
+			if p.RemoteKey == k {
+				return p.ID, k
+			}
 		}
 	}
-	return ""
+	return "", ""
 }
 
 func urlQueryEscape(s string) string {

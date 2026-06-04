@@ -10,6 +10,7 @@ import (
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/memory"
+	"github.com/jholhewres/anchored/pkg/project"
 	"github.com/jholhewres/anchored/pkg/sync"
 )
 
@@ -138,10 +139,11 @@ func searchRemote(ctx context.Context, svc *memory.Service, configPath, remoteNa
 		originRouted := false
 		if proj, pErr := svc.ResolveProjectInfo(rCwd); pErr == nil && proj != nil && proj.RemoteKey != "" {
 			originRouted = true
+			canonicalKey, legacyKey := project.RemoteKeysFromDir(proj.Path)
 			if remoteName != "" {
 				client := sync.NewClientFromEntry(*entry, "cli")
-				projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
-			} else if target, pid := sync.ResolveProjectAcrossRemotes(ctx, cfg, rCwd, proj.RemoteKey, "cli"); target != nil && pid != "" {
+				projectID, _ = client.ResolveProjectIDByRemoteKeys(ctx, canonicalKey, legacyKey)
+			} else if target, pid, _ := sync.ResolveProjectAcrossRemotes(ctx, cfg, rCwd, "cli", canonicalKey, legacyKey); target != nil && pid != "" {
 				entry = target
 				projectID = pid
 			}

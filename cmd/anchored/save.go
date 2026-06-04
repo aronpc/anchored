@@ -9,6 +9,7 @@ import (
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/memory"
+	"github.com/jholhewres/anchored/pkg/project"
 	"github.com/jholhewres/anchored/pkg/sync"
 )
 
@@ -83,7 +84,8 @@ func autoSyncRemote(ctx context.Context, cfg *config.Config, svc *memory.Service
 	if projectID == "" {
 		if proj, err := svc.ResolveProjectInfo(cwd); err == nil && proj != nil && proj.RemoteKey != "" {
 			originRouted = true
-			if target, pid := sync.ResolveProjectAcrossRemotes(ctx, cfg, cwd, proj.RemoteKey, "cli"); target != nil && pid != "" {
+			canonicalKey, legacyKey := project.RemoteKeysFromDir(proj.Path)
+			if target, pid, _ := sync.ResolveProjectAcrossRemotes(ctx, cfg, cwd, "cli", canonicalKey, legacyKey); target != nil && pid != "" {
 				if !target.AutoSyncEnabled() {
 					return
 				}
@@ -137,7 +139,8 @@ func pushRemote(ctx context.Context, cfg *config.Config, svc *memory.Service, m 
 	if projectID == "" {
 		cwd, _ := os.Getwd()
 		if proj, rErr := svc.ResolveProjectInfo(cwd); rErr == nil && proj != nil && proj.RemoteKey != "" {
-			projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
+			canonicalKey, legacyKey := project.RemoteKeysFromDir(proj.Path)
+			projectID, _ = client.ResolveProjectIDByRemoteKeys(ctx, canonicalKey, legacyKey)
 			originRouted = true
 		}
 	}
