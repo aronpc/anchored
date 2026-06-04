@@ -706,10 +706,10 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		}
 		if entry != nil {
 			client := remotesync.NewClientFromEntry(*entry, "mcp")
-			projectID := ""
-			if p.CWD != "" {
-				projectID = s.mem.ResolveProject(p.CWD)
-			}
+			// Resolve the REMOTE project — the server only knows its own IDs.
+			// Same precedence as sync: git-origin remote_key first, linked
+			// project for non-repo contexts.
+			projectID, _ := s.resolveRemoteProjectID(ctx, client, *entry, p.CWD)
 			limit := p.MaxResults
 			if limit <= 0 {
 				limit = 10

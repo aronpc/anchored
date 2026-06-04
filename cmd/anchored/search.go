@@ -128,11 +128,26 @@ func searchRemote(ctx context.Context, svc *memory.Service, configPath, remoteNa
 
 	client := sync.NewClientFromEntry(*entry, "cli")
 	if projectID == "" {
-		cwd := cwd
-		if cwd == "" {
-			cwd, _ = os.Getwd()
+		// Resolve the REMOTE project: the server only knows its own IDs, so
+		// match the cwd repo's git-origin remote_key against the server's
+		// project list (same precedence as sync: origin first, then a linked
+		// project for non-repo contexts).
+		rCwd := cwd
+		if rCwd == "" {
+			rCwd, _ = os.Getwd()
 		}
-		projectID = svc.ResolveProject(cwd)
+		originRouted := false
+		if proj, pErr := svc.ResolveProjectInfo(rCwd); pErr == nil && proj != nil && proj.RemoteKey != "" {
+			projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
+			originRouted = true
+		}
+		if projectID == "" && !originRouted && len(entry.Projects) > 0 {
+			projectID = entry.Projects[0]
+		}
+		if projectID == "" {
+			fmt.Fprintln(os.Stderr, "remote search unavailable: no matching remote project for this repo — falling back to local")
+			return nil, false
+		}
 	}
 
 	results, err := client.SearchRemote(ctx, projectID, query, limit)
