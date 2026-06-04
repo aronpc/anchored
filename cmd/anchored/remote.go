@@ -43,27 +43,52 @@ func runRemote(args []string) {
 
 func printRemoteUsage() {
 	fmt.Fprintln(os.Stderr, "Usage:")
-	fmt.Fprintln(os.Stderr, "  anchored remote configure --server URL --key KEY   Wire a remote anchored_oss server")
-	fmt.Fprintln(os.Stderr, "  anchored remote link <project_id>                   Subscribe to a remote project so its memories sync")
-	fmt.Fprintln(os.Stderr, "  anchored remote unlink <project_id>                 Stop syncing memories tied to a remote project")
+	fmt.Fprintln(os.Stderr, "  anchored remote configure --server URL --key KEY   Wire a remote anchored_oss server (--name for a 2nd server)")
+	fmt.Fprintln(os.Stderr, "  anchored remote link <project_id> [--remote NAME]   Subscribe to a remote project so its memories sync")
+	fmt.Fprintln(os.Stderr, "  anchored remote unlink <project_id> [--remote NAME] Stop syncing memories tied to a remote project")
 	fmt.Fprintln(os.Stderr, "  anchored remote status                              Show remote config + how the current repo routes (git origin)")
 	fmt.Fprintln(os.Stderr, "  anchored remote preview                             Preview which memories would sync (offline)")
-	fmt.Fprintln(os.Stderr, "  anchored remote sync                                Sync the CURRENT repo by its git origin (--dry-run to preview)")
+	fmt.Fprintln(os.Stderr, "  anchored remote sync [--remote NAME]                Sync the CURRENT repo by its git origin (--dry-run to preview)")
 	fmt.Fprintln(os.Stderr, "  anchored remote sync --all                          Sync every local project, each routed by its own git origin")
 	fmt.Fprintln(os.Stderr, "  anchored remote sync --project-id <id>              Force all current-repo memories into a specific remote project")
 }
 
-// runRemoteLink adds a remote project_id to the local config's
-// remote.projects list. Memories with a matching remote_project_key on their
-// metadata will be routed to that project during sync. Idempotent.
+// runRemoteLink adds a remote project_id to a remote's linked-projects list.
+// Project IDs are server-scoped, so the link is stored on the specific remote
+// it belongs to: --remote <name> targets a named entry, the default is the
+// legacy singular block. Idempotent.
 func runRemoteLink(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: anchored remote link <project_id>")
+	fs := newFlagSet("remote link")
+	remoteName := fs.String("remote", "", "named remote this project belongs to (default: the default remote)")
+	fs.Parse(reorderArgsForFlag(fs, args))
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: anchored remote link <project_id> [--remote <name>]")
 		os.Exit(1)
 	}
-	projectID := args[0]
+	projectID := fs.Arg(0)
 
 	configFile, cfg := loadWritableConfig()
+
+	if *remoteName != "" && *remoteName != "default" {
+		entry, ok := cfg.Remotes[*remoteName]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "remote %q not found in config (available: %s)\n", *remoteName, remoteNames(cfg))
+			os.Exit(1)
+		}
+		for _, p := range entry.Projects {
+			if p == projectID {
+				fmt.Printf("Already linked to %s on remote %q\n", projectID, *remoteName)
+				return
+			}
+		}
+		entry.Projects = append(entry.Projects, projectID)
+		cfg.Remotes[*remoteName] = entry
+		writeConfigFile(configFile, cfg)
+		fmt.Printf("Linked project %s to remote %q (%s)\n", projectID, *remoteName, entry.ServerURL)
+		fmt.Printf("  Projects linked to this remote: %d\n", len(entry.Projects))
+		return
+	}
+
 	for _, p := range cfg.Remote.Projects {
 		if p == projectID {
 			fmt.Printf("Already linked to %s\n", projectID)
@@ -72,20 +97,50 @@ func runRemoteLink(args []string) {
 	}
 	cfg.Remote.Projects = append(cfg.Remote.Projects, projectID)
 	writeConfigFile(configFile, cfg)
-	fmt.Printf("Linked project %s\n", projectID)
+	fmt.Printf("Linked project %s to the default remote (%s)\n", projectID, orEmpty(cfg.Remote.ServerURL, "not configured yet"))
 	fmt.Printf("  Total projects subscribed: %d\n", len(cfg.Remote.Projects))
 }
 
-// runRemoteUnlink removes a project_id from the local config's
-// remote.projects list. No-op if the id isn't present.
+// runRemoteUnlink removes a project_id from a remote's linked-projects list.
+// No-op if the id isn't present. --remote <name> targets a named entry.
 func runRemoteUnlink(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "Usage: anchored remote unlink <project_id>")
+	fs := newFlagSet("remote unlink")
+	remoteName := fs.String("remote", "", "named remote the link lives on (default: the default remote)")
+	fs.Parse(reorderArgsForFlag(fs, args))
+	if fs.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: anchored remote unlink <project_id> [--remote <name>]")
 		os.Exit(1)
 	}
-	projectID := args[0]
+	projectID := fs.Arg(0)
 
 	configFile, cfg := loadWritableConfig()
+
+	if *remoteName != "" && *remoteName != "default" {
+		entry, ok := cfg.Remotes[*remoteName]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "remote %q not found in config (available: %s)\n", *remoteName, remoteNames(cfg))
+			os.Exit(1)
+		}
+		out := entry.Projects[:0]
+		removed := false
+		for _, p := range entry.Projects {
+			if p == projectID {
+				removed = true
+				continue
+			}
+			out = append(out, p)
+		}
+		entry.Projects = out
+		cfg.Remotes[*remoteName] = entry
+		writeConfigFile(configFile, cfg)
+		if removed {
+			fmt.Printf("Unlinked project %s from remote %q\n", projectID, *remoteName)
+		} else {
+			fmt.Printf("Project %s was not linked on remote %q\n", projectID, *remoteName)
+		}
+		return
+	}
+
 	out := cfg.Remote.Projects[:0]
 	removed := false
 	for _, p := range cfg.Remote.Projects {
@@ -111,6 +166,7 @@ func runRemoteConfigure(args []string) {
 	fs := newFlagSet("remote configure")
 	server := fs.String("server", "", "remote server URL (e.g. https://anchored.acme.com)")
 	key := fs.String("key", "", "admin/sync API key for the server")
+	name := fs.String("name", "", "name for this remote (e.g. company). Omitted: updates the default, or auto-names default-2, default-3… when a different default server already exists")
 	disable := fs.Bool("disable", false, "turn remote sync off (other flags are ignored)")
 	fs.Parse(args)
 
@@ -124,29 +180,69 @@ func runRemoteConfigure(args []string) {
 	}
 
 	if *server == "" || *key == "" {
-		fmt.Fprintln(os.Stderr, "Usage: anchored remote configure --server URL --key KEY [--disable]")
+		fmt.Fprintln(os.Stderr, "Usage: anchored remote configure --server URL --key KEY [--name NAME] [--disable]")
 		os.Exit(1)
 	}
 
 	newURL := strings.TrimRight(*server, "/")
-	// Project IDs are server-scoped, so pointing at a different server makes the
-	// existing links meaningless — clear them to avoid stale "project not found"
-	// pushes. Re-pointing at the same server keeps the links.
-	if cfg.Remote.ServerURL != "" && cfg.Remote.ServerURL != newURL && len(cfg.Remote.Projects) > 0 {
-		fmt.Printf("Server changed (%s → %s); cleared %d stale project link(s).\n",
-			cfg.Remote.ServerURL, newURL, len(cfg.Remote.Projects))
-		cfg.Remote.Projects = nil
+	target := *name
+
+	// No name: update the default in place when it's unset or already points
+	// at this server. When the default points somewhere ELSE, keep it and
+	// auto-name the new server (default-2, default-3, …) instead of silently
+	// overwriting — users running configure twice for two servers (personal +
+	// company) end up with both.
+	if target == "" || target == "default" {
+		if target == "default" || cfg.Remote.ServerURL == "" || cfg.Remote.ServerURL == newURL {
+			// Project IDs are server-scoped, so pointing at a different
+			// server makes the existing links meaningless — clear them to
+			// avoid stale "project not found" pushes.
+			if cfg.Remote.ServerURL != "" && cfg.Remote.ServerURL != newURL && len(cfg.Remote.Projects) > 0 {
+				fmt.Printf("Server changed (%s → %s); cleared %d stale project link(s).\n",
+					cfg.Remote.ServerURL, newURL, len(cfg.Remote.Projects))
+				cfg.Remote.Projects = nil
+			}
+			cfg.Remote.Enabled = true
+			cfg.Remote.ServerURL = newURL
+			cfg.Remote.APIKey = *key
+			writeConfigFile(configFile, cfg)
+			fmt.Printf("Remote sync configured.\n")
+			fmt.Printf("  Name:   default\n")
+			fmt.Printf("  Server: %s\n", cfg.Remote.ServerURL)
+			fmt.Printf("  Key:    %s\n", maskKey(cfg.Remote.APIKey))
+			fmt.Printf("  Config: %s\n", configFile)
+			return
+		}
+		for n := 2; ; n++ {
+			candidate := fmt.Sprintf("default-%d", n)
+			if _, ok := cfg.Remotes[candidate]; !ok {
+				target = candidate
+				break
+			}
+		}
+		fmt.Printf("The default remote already points at %s — adding this server as %q.\n", cfg.Remote.ServerURL, target)
+		fmt.Printf("Tip: give it a meaningful name with --name (or rename it under remotes: in the config).\n")
 	}
 
-	cfg.Remote.Enabled = true
-	cfg.Remote.ServerURL = newURL
-	cfg.Remote.APIKey = *key
+	if cfg.Remotes == nil {
+		cfg.Remotes = map[string]config.RemoteEntry{}
+	}
+	entry := cfg.Remotes[target]
+	if entry.ServerURL != "" && entry.ServerURL != newURL && len(entry.Projects) > 0 {
+		fmt.Printf("Server changed for %q (%s → %s); cleared %d stale project link(s).\n",
+			target, entry.ServerURL, newURL, len(entry.Projects))
+		entry.Projects = nil
+	}
+	entry.ServerURL = newURL
+	entry.APIKey = *key
+	cfg.Remotes[target] = entry
 
 	writeConfigFile(configFile, cfg)
-	fmt.Printf("Remote sync configured.\n")
-	fmt.Printf("  Server: %s\n", cfg.Remote.ServerURL)
-	fmt.Printf("  Key:    %s\n", maskKey(cfg.Remote.APIKey))
+	fmt.Printf("Remote %q configured.\n", target)
+	fmt.Printf("  Server: %s\n", entry.ServerURL)
+	fmt.Printf("  Key:    %s\n", maskKey(entry.APIKey))
 	fmt.Printf("  Config: %s\n", configFile)
+	fmt.Printf("\nRoute repos to it with path globs (remotes.%s.paths) or use --remote %s on sync/link.\n", target, target)
 }
 
 func runRemoteStatus(args []string) {
@@ -164,6 +260,30 @@ func runRemoteStatus(args []string) {
 	fmt.Printf("Server URL:  %s\n", orEmpty(cfg.Remote.ServerURL, "(not configured)"))
 	fmt.Printf("API Key:     %s\n", maskKey(cfg.Remote.APIKey))
 	fmt.Printf("Projects:    %d configured\n", len(cfg.Remote.Projects))
+
+	// Multi-server view: loadConfig migrates the singular block into the
+	// named map, so this lists every server (default included) with its
+	// own routing paths and per-server project links.
+	if len(cfg.Remotes) > 1 {
+		fmt.Println("\nConfigured remotes:")
+		names := make([]string, 0, len(cfg.Remotes))
+		for name := range cfg.Remotes {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			e := cfg.Remotes[name]
+			marker := ""
+			if e.Default {
+				marker = " (default)"
+			}
+			fmt.Printf("  %-12s %s%s\n", name, e.ServerURL, marker)
+			if len(e.Paths) > 0 {
+				fmt.Printf("  %-12s   paths: %s\n", "", strings.Join(e.Paths, ", "))
+			}
+			fmt.Printf("  %-12s   linked projects: %d\n", "", len(e.Projects))
+		}
+	}
 
 	// Show how the current repo would route, so the user can confirm the
 	// git-origin match before syncing. Best-effort: needs an initialized store.
