@@ -763,31 +763,29 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	var remoteHits []remotesync.RemoteSearchResult
 	remoteName := ""
 	if p.Remote == nil && s.cfg != nil {
-		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil {
-			rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			client := remotesync.NewClientFromEntry(*entry, "mcp")
-			if rpid, _ := s.resolveRemoteProjectID(rctx, client, *entry, p.CWD); rpid != "" {
-				if rs, rErr := client.SearchRemote(rctx, rpid, p.Query, limit); rErr == nil {
-					seen := make(map[string]bool, len(results))
-					for _, lr := range results {
-						seen[lr.Memory.ID] = true
-					}
-					for _, r := range rs {
-						if seen[r.ID] {
-							continue
-						}
-						if p.Category != "" && r.Category != p.Category {
-							continue
-						}
-						remoteHits = append(remoteHits, r)
-					}
-					remoteName = entry.Name
-				} else {
-					s.logger.Debug("remote merge skipped", "remote", entry.Name, "error", rErr)
+		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if target, rpid := s.resolveAutoRemoteTarget(rctx, p.CWD); target != nil && rpid != "" {
+			client := remotesync.NewClientFromEntry(*target, "mcp")
+			if rs, rErr := client.SearchRemote(rctx, rpid, p.Query, limit); rErr == nil {
+				seen := make(map[string]bool, len(results))
+				for _, lr := range results {
+					seen[lr.Memory.ID] = true
 				}
+				for _, r := range rs {
+					if seen[r.ID] {
+						continue
+					}
+					if p.Category != "" && r.Category != p.Category {
+						continue
+					}
+					remoteHits = append(remoteHits, r)
+				}
+				remoteName = target.Name
+			} else {
+				s.logger.Debug("remote merge skipped", "remote", target.Name, "error", rErr)
 			}
-			cancel()
 		}
+		cancel()
 	}
 
 	if len(results) == 0 && len(remoteHits) == 0 {
@@ -940,33 +938,35 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 			}
 		}
 	} else if p.Remote == nil && s.cfg != nil {
-		// Auto write-through: when the resolved remote has auto_sync on, push
-		// this memory best-effort and async. Local-first — the local save above
-		// already succeeded, so a remote failure never affects the result. The
+		// Auto write-through: when a remote is configured, push this memory
+		// best-effort and async. Local-first — the local save above already
+		// succeeded, so a remote failure never affects the result. The
 		// safety filter gates eligibility and redacts content, so user-scoped /
-		// personal / secret memories never leave the machine.
-		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil && entry.AutoSyncEnabled() {
+		// personal / secret memories never leave the machine. The actual
+		// target remote (and its auto_sync gate) is resolved inside the
+		// goroutine via the cross-remote origin probe.
+		if s.cfg.ResolveRemote(p.CWD) != nil {
 			if redacted, ok := remotesync.ClassifyForAutoSync(*m, p.CWD); ok {
-				// Target the linked remote project (same default as `remote
-				// sync`) or resolve it by the repo's git-origin remote_key —
-				// the local project id is meaningless to the server.
-				// Resolution happens inside the goroutine: it may need a
-				// network round-trip and must never block the local save.
-				go func(e config.RemoteEntry, id, category, content, cwd string) {
+				go func(id, category, content, cwd string) {
 					gctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 					defer cancel()
-					client := remotesync.NewClientFromEntry(e, "mcp")
-					pid, _ := s.resolveRemoteProjectID(gctx, client, e, cwd)
-					if pid == "" {
-						s.logger.Debug("auto-sync skipped: no remote project resolved", "memory_id", id, "remote", e.Name)
+					target, pid := s.resolveAutoRemoteTarget(gctx, cwd)
+					if target == nil || pid == "" {
+						s.logger.Debug("auto-sync skipped: no remote project resolved", "memory_id", id)
 						return
 					}
+					if !target.AutoSyncEnabled() {
+						s.logger.Debug("auto-sync skipped: disabled on target remote", "memory_id", id, "remote", target.Name)
+						return
+					}
+					client := remotesync.NewClientFromEntry(*target, "mcp")
+					e := *target
 					rm := remotesync.RemoteMemory{ID: id, Category: category, Content: content, Source: "mcp", ProjectID: pid}
 					if _, err := client.SaveRemote(gctx, rm); err != nil {
 						s.logger.Warn("auto-sync push failed", "memory_id", id, "remote", e.Name, "error", err)
 					}
-				}(*entry, m.ID, m.Category, redacted, p.CWD)
-				result += fmt.Sprintf(" (auto-sync → %s)", entry.Name)
+				}(m.ID, m.Category, redacted, p.CWD)
+				result += " (auto-sync)"
 			}
 		}
 	}
@@ -1183,24 +1183,26 @@ func (s *Server) toolKGAdd(ctx context.Context, args json.RawMessage) (string, e
 
 	result := fmt.Sprintf("Added relationship: %s — %s → %s (id: %s)", triple.Subject, triple.Predicate, triple.Object, triple.ID)
 
-	// Auto write-through: mirror the just-added triple to the resolved remote
-	// when auto_sync is on, same local-first contract as toolSave — the local
-	// add already succeeded, so a remote failure never affects the result.
+	// Auto write-through: mirror the just-added triple to the remote, same
+	// local-first contract as toolSave — the local add already succeeded, so
+	// a remote failure never affects the result. The target remote (and its
+	// auto_sync gate) is resolved inside via the cross-remote origin probe.
 	// Triples are entity strings, not free text, so no safety classification.
 	if s.cfg != nil {
-		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil && entry.AutoSyncEnabled() {
-			go s.pushTripleRemote(*entry, p.CWD, *triple)
-			result += fmt.Sprintf(" (auto-sync → %s)", entry.Name)
+		if s.cfg.ResolveRemote(p.CWD) != nil {
+			go s.pushTripleRemote(p.CWD, *triple)
+			result += " (auto-sync)"
 		}
 	}
 
 	return result, nil
 }
 
-// resolveRemoteProjectID resolves the remote project a push should target,
-// with the same precedence as `remote sync`: the cwd repo's git-origin
-// remote_key first, then a linked project — but the link is only a fallback
-// for non-repo contexts, so one global link can't funnel every repo's pushes
+// resolveRemoteProjectID resolves the remote project a push should target on
+// a SPECIFIC remote (explicit `remote: <name>` flows), with the same
+// precedence as `remote sync`: the cwd repo's git-origin remote_key first,
+// then the entry's linked projects — but the link is only a fallback for
+// non-repo contexts, so one global link can't funnel every repo's pushes
 // into a single remote project. Returns "" when nothing resolves. The second
 // return reports whether the cwd had a matchable git origin.
 func (s *Server) resolveRemoteProjectID(ctx context.Context, client *remotesync.Client, entry config.RemoteEntry, cwd string) (string, bool) {
@@ -1215,20 +1217,44 @@ func (s *Server) resolveRemoteProjectID(ctx context.Context, client *remotesync.
 	return "", false
 }
 
-// pushTripleRemote pushes a single triple to the remote, resolving the remote
-// project ID via resolveRemoteProjectID. Best-effort: failures are logged,
-// never surfaced to the caller.
-func (s *Server) pushTripleRemote(entry config.RemoteEntry, cwd string, t kg.Triple) {
+// resolveAutoRemoteTarget picks the remote AND the server-side project for
+// the automatic flows (search merge, save write-through, kg write-through):
+// probe every configured remote by the repo's git-origin remote_key — so a
+// freshly-configured server works with zero routing setup — falling back to
+// the path/default remote's linked project for non-repo contexts.
+func (s *Server) resolveAutoRemoteTarget(ctx context.Context, cwd string) (*config.RemoteEntry, string) {
+	if s.cfg == nil {
+		return nil, ""
+	}
+	if s.mem != nil {
+		if proj, err := s.mem.ResolveProjectInfo(cwd); err == nil && proj != nil && proj.RemoteKey != "" {
+			return remotesync.ResolveProjectAcrossRemotes(ctx, s.cfg, cwd, proj.RemoteKey, "mcp")
+		}
+	}
+	if entry := s.cfg.ResolveRemote(cwd); entry != nil && len(entry.Projects) > 0 {
+		return entry, entry.Projects[0]
+	}
+	return nil, ""
+}
+
+// pushTripleRemote pushes a single triple to the remote, resolving the
+// target remote and project via the cross-remote origin probe. Best-effort:
+// failures are logged, never surfaced to the caller.
+func (s *Server) pushTripleRemote(cwd string, t kg.Triple) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	client := remotesync.NewClientFromEntry(entry, "mcp")
-
-	remoteProjID, _ := s.resolveRemoteProjectID(ctx, client, entry, cwd)
-	if remoteProjID == "" {
-		s.logger.Debug("kg auto-sync skipped: no remote project resolved", "remote", entry.Name)
+	target, remoteProjID := s.resolveAutoRemoteTarget(ctx, cwd)
+	if target == nil || remoteProjID == "" {
+		s.logger.Debug("kg auto-sync skipped: no remote project resolved")
 		return
 	}
+	if !target.AutoSyncEnabled() {
+		s.logger.Debug("kg auto-sync skipped: disabled on target remote", "remote", target.Name)
+		return
+	}
+	client := remotesync.NewClientFromEntry(*target, "mcp")
+	entry := *target
 
 	syncTriples := []remotesync.SyncTriple{{
 		Subject:    t.Subject,

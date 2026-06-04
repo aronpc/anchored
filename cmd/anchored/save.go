@@ -73,18 +73,23 @@ func autoSyncRemote(ctx context.Context, cfg *config.Config, svc *memory.Service
 	if !ok {
 		return
 	}
-	// Routing precedence mirrors `remote sync`: explicit override, then the
-	// repo's git-origin remote_key, then a linked project — and the link is
-	// only a fallback for non-repo contexts, so one global link can't funnel
-	// every repo's memories into a single remote project. The local project
-	// id is meaningless to the server and is never used.
-	client := sync.NewClientFromEntry(*entry, "cli")
+	// Routing: explicit override first, then the cross-remote origin probe —
+	// every configured remote is asked whether it knows the repo's git-origin
+	// key, so a freshly-configured second server works with zero extra
+	// routing setup. The linked-project fallback only applies to non-repo
+	// contexts. The local project id is meaningless to the server.
 	projectID := projectOverride
 	originRouted := false
 	if projectID == "" {
 		if proj, err := svc.ResolveProjectInfo(cwd); err == nil && proj != nil && proj.RemoteKey != "" {
-			projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
 			originRouted = true
+			if target, pid := sync.ResolveProjectAcrossRemotes(ctx, cfg, cwd, proj.RemoteKey, "cli"); target != nil && pid != "" {
+				if !target.AutoSyncEnabled() {
+					return
+				}
+				entry = target
+				projectID = pid
+			}
 		}
 	}
 	if projectID == "" && !originRouted && len(entry.Projects) > 0 {
@@ -93,6 +98,7 @@ func autoSyncRemote(ctx context.Context, cfg *config.Config, svc *memory.Service
 	if projectID == "" {
 		return
 	}
+	client := sync.NewClientFromEntry(*entry, "cli")
 	mem := sync.RemoteMemory{ID: m.ID, Category: m.Category, Content: redacted, Source: m.Source, ProjectID: projectID}
 	if _, err := client.SaveRemote(ctx, mem); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: auto-sync skipped: %v\n", err)
@@ -123,8 +129,9 @@ func pushRemote(ctx context.Context, cfg *config.Config, svc *memory.Service, m 
 	client := sync.NewClientFromEntry(*entry, "cli")
 
 	// Same routing precedence as auto-sync: explicit override, then the
-	// repo's git-origin remote_key, then a linked project (non-repo
-	// contexts only). The local project id is meaningless to the server.
+	// repo's git-origin remote_key (against the explicitly chosen remote),
+	// then a linked project (non-repo contexts only). The local project id
+	// is meaningless to the server.
 	projectID := projectOverride
 	originRouted := false
 	if projectID == "" {
