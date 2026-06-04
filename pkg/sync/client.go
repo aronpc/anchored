@@ -295,9 +295,10 @@ func (c *Client) PushTriples(ctx context.Context, projectID string, triples []Sy
 
 // RemoteProject is a minimal view of a project as returned by GET /v1/projects.
 type RemoteProject struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Slug string `json:"slug"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Slug      string `json:"slug"`
+	RemoteKey string `json:"remote_key"`
 }
 
 // ListProjects returns the projects the configured API key can access on the
@@ -321,6 +322,26 @@ func (c *Client) ListProjects(ctx context.Context) ([]RemoteProject, error) {
 		return nil, fmt.Errorf("decode projects response: %w", err)
 	}
 	return projects, nil
+}
+
+// ResolveProjectIDByRemoteKey returns the ID of the remote project whose
+// remote_key matches, or "" when none does (or the listing fails). Used by
+// auto-sync paths that need a concrete remote project ID but only know the
+// repo's git-origin key — the local project ID is meaningless to the server.
+func (c *Client) ResolveProjectIDByRemoteKey(ctx context.Context, remoteKey string) string {
+	if remoteKey == "" {
+		return ""
+	}
+	projects, err := c.ListProjects(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, p := range projects {
+		if p.RemoteKey == remoteKey {
+			return p.ID
+		}
+	}
+	return ""
 }
 
 func urlQueryEscape(s string) string {

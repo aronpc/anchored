@@ -838,31 +838,32 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 			result += " (remote: no remote configured, skipped)"
 		} else {
 			client := remotesync.NewClientFromEntry(*entry, "mcp")
-			projectID := ""
-			if m.ProjectID != nil {
-				projectID = *m.ProjectID
-			}
+			// Routing precedence mirrors `remote sync`: the repo's git-origin
+			// remote_key first, then a linked project (non-repo contexts
+			// only). The local project id is meaningless to the server.
+			projectID, _ := s.resolveRemoteProjectID(ctx, client, *entry, p.CWD)
 			if projectID == "" {
-				projectID = s.mem.ResolveProject(p.CWD)
-			}
-			remoteMem := remotesync.RemoteMemory{
-				ID:        m.ID,
-				Category:  m.Category,
-				Content:   m.Content,
-				Source:    "mcp",
-				ProjectID: projectID,
-			}
-			resp, err := client.SaveRemote(ctx, remoteMem)
-			if err != nil {
-				if remotesync.IsRemoteForbidden(err) || remotesync.IsRemoteUnavailable(err) {
-					result += fmt.Sprintf(" (remote: unavailable, local save preserved)")
-				} else {
-					result += fmt.Sprintf(" (remote: %v)", err)
-				}
+				result += " (remote: no remote project resolved, skipped — link one with `anchored remote link <id>` or create it on the server)"
 			} else {
-				result += fmt.Sprintf(" (remote: saved to %s)", entry.Name)
-				if !resp.Created {
-					result += " [updated existing]"
+				remoteMem := remotesync.RemoteMemory{
+					ID:        m.ID,
+					Category:  m.Category,
+					Content:   m.Content,
+					Source:    "mcp",
+					ProjectID: projectID,
+				}
+				resp, err := client.SaveRemote(ctx, remoteMem)
+				if err != nil {
+					if remotesync.IsRemoteForbidden(err) || remotesync.IsRemoteUnavailable(err) {
+						result += fmt.Sprintf(" (remote: unavailable, local save preserved)")
+					} else {
+						result += fmt.Sprintf(" (remote: %v)", err)
+					}
+				} else {
+					result += fmt.Sprintf(" (remote: saved to %s)", entry.Name)
+					if !resp.Created {
+						result += " [updated existing]"
+					}
 				}
 			}
 		}
@@ -875,24 +876,25 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil && entry.AutoSyncEnabled() {
 			if redacted, ok := remotesync.ClassifyForAutoSync(*m, p.CWD); ok {
 				// Target the linked remote project (same default as `remote
-				// sync`), not the local project id the server wouldn't know.
-				projectID := ""
-				if len(entry.Projects) > 0 {
-					projectID = entry.Projects[0]
-				}
-				if projectID == "" && m.ProjectID != nil {
-					projectID = *m.ProjectID
-				}
-				if projectID != "" {
-					go func(e config.RemoteEntry, id, category, content, pid string) {
-						client := remotesync.NewClientFromEntry(e, "mcp")
-						rm := remotesync.RemoteMemory{ID: id, Category: category, Content: content, Source: "mcp", ProjectID: pid}
-						if _, err := client.SaveRemote(context.Background(), rm); err != nil {
-							s.logger.Warn("auto-sync push failed", "memory_id", id, "remote", e.Name, "error", err)
-						}
-					}(*entry, m.ID, m.Category, redacted, projectID)
-					result += fmt.Sprintf(" (auto-sync → %s)", entry.Name)
-				}
+				// sync`) or resolve it by the repo's git-origin remote_key —
+				// the local project id is meaningless to the server.
+				// Resolution happens inside the goroutine: it may need a
+				// network round-trip and must never block the local save.
+				go func(e config.RemoteEntry, id, category, content, cwd string) {
+					gctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+					defer cancel()
+					client := remotesync.NewClientFromEntry(e, "mcp")
+					pid, _ := s.resolveRemoteProjectID(gctx, client, e, cwd)
+					if pid == "" {
+						s.logger.Debug("auto-sync skipped: no remote project resolved", "memory_id", id, "remote", e.Name)
+						return
+					}
+					rm := remotesync.RemoteMemory{ID: id, Category: category, Content: content, Source: "mcp", ProjectID: pid}
+					if _, err := client.SaveRemote(gctx, rm); err != nil {
+						s.logger.Warn("auto-sync push failed", "memory_id", id, "remote", e.Name, "error", err)
+					}
+				}(*entry, m.ID, m.Category, redacted, p.CWD)
+				result += fmt.Sprintf(" (auto-sync → %s)", entry.Name)
 			}
 		}
 	}
@@ -1107,7 +1109,64 @@ func (s *Server) toolKGAdd(ctx context.Context, args json.RawMessage) (string, e
 		return "", err
 	}
 
-	return fmt.Sprintf("Added relationship: %s — %s → %s (id: %s)", triple.Subject, triple.Predicate, triple.Object, triple.ID), nil
+	result := fmt.Sprintf("Added relationship: %s — %s → %s (id: %s)", triple.Subject, triple.Predicate, triple.Object, triple.ID)
+
+	// Auto write-through: mirror the just-added triple to the resolved remote
+	// when auto_sync is on, same local-first contract as toolSave — the local
+	// add already succeeded, so a remote failure never affects the result.
+	// Triples are entity strings, not free text, so no safety classification.
+	if s.cfg != nil {
+		if entry := s.cfg.ResolveRemote(p.CWD); entry != nil && entry.AutoSyncEnabled() {
+			go s.pushTripleRemote(*entry, p.CWD, *triple)
+			result += fmt.Sprintf(" (auto-sync → %s)", entry.Name)
+		}
+	}
+
+	return result, nil
+}
+
+// resolveRemoteProjectID resolves the remote project a push should target,
+// with the same precedence as `remote sync`: the cwd repo's git-origin
+// remote_key first, then a linked project — but the link is only a fallback
+// for non-repo contexts, so one global link can't funnel every repo's pushes
+// into a single remote project. Returns "" when nothing resolves. The second
+// return reports whether the cwd had a matchable git origin.
+func (s *Server) resolveRemoteProjectID(ctx context.Context, client *remotesync.Client, entry config.RemoteEntry, cwd string) (string, bool) {
+	if s.mem != nil {
+		if proj, err := s.mem.ResolveProjectInfo(cwd); err == nil && proj != nil && proj.RemoteKey != "" {
+			return client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey), true
+		}
+	}
+	if len(entry.Projects) > 0 {
+		return entry.Projects[0], false
+	}
+	return "", false
+}
+
+// pushTripleRemote pushes a single triple to the remote, resolving the remote
+// project ID via resolveRemoteProjectID. Best-effort: failures are logged,
+// never surfaced to the caller.
+func (s *Server) pushTripleRemote(entry config.RemoteEntry, cwd string, t kg.Triple) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	client := remotesync.NewClientFromEntry(entry, "mcp")
+
+	remoteProjID, _ := s.resolveRemoteProjectID(ctx, client, entry, cwd)
+	if remoteProjID == "" {
+		s.logger.Debug("kg auto-sync skipped: no remote project resolved", "remote", entry.Name)
+		return
+	}
+
+	syncTriples := []remotesync.SyncTriple{{
+		Subject:    t.Subject,
+		Predicate:  t.Predicate,
+		Object:     t.Object,
+		Confidence: t.Confidence,
+	}}
+	if _, err := client.PushTriples(ctx, remoteProjID, syncTriples); err != nil {
+		s.logger.Warn("kg auto-sync push failed", "remote", entry.Name, "error", err)
+	}
 }
 
 func (s *Server) toolCtxExecute(ctx context.Context, args json.RawMessage) (string, error) {

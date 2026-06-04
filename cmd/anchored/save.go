@@ -73,19 +73,26 @@ func autoSyncRemote(ctx context.Context, cfg *config.Config, svc *memory.Service
 	if !ok {
 		return
 	}
-	// Target the linked remote project (same default as `remote sync`), not the
-	// local project id, which the server wouldn't recognize.
+	// Routing precedence mirrors `remote sync`: explicit override, then the
+	// repo's git-origin remote_key, then a linked project — and the link is
+	// only a fallback for non-repo contexts, so one global link can't funnel
+	// every repo's memories into a single remote project. The local project
+	// id is meaningless to the server and is never used.
+	client := sync.NewClientFromEntry(*entry, "cli")
 	projectID := projectOverride
-	if projectID == "" && len(entry.Projects) > 0 {
-		projectID = entry.Projects[0]
+	originRouted := false
+	if projectID == "" {
+		if proj, err := svc.ResolveProjectInfo(cwd); err == nil && proj != nil && proj.RemoteKey != "" {
+			projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
+			originRouted = true
+		}
 	}
-	if projectID == "" && m.ProjectID != nil {
-		projectID = *m.ProjectID
+	if projectID == "" && !originRouted && len(entry.Projects) > 0 {
+		projectID = entry.Projects[0]
 	}
 	if projectID == "" {
 		return
 	}
-	client := sync.NewClientFromEntry(*entry, "cli")
 	mem := sync.RemoteMemory{ID: m.ID, Category: m.Category, Content: redacted, Source: m.Source, ProjectID: projectID}
 	if _, err := client.SaveRemote(ctx, mem); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: auto-sync skipped: %v\n", err)
@@ -115,9 +122,24 @@ func pushRemote(ctx context.Context, cfg *config.Config, svc *memory.Service, m 
 
 	client := sync.NewClientFromEntry(*entry, "cli")
 
+	// Same routing precedence as auto-sync: explicit override, then the
+	// repo's git-origin remote_key, then a linked project (non-repo
+	// contexts only). The local project id is meaningless to the server.
 	projectID := projectOverride
-	if projectID == "" && m.ProjectID != nil {
-		projectID = *m.ProjectID
+	originRouted := false
+	if projectID == "" {
+		cwd, _ := os.Getwd()
+		if proj, rErr := svc.ResolveProjectInfo(cwd); rErr == nil && proj != nil && proj.RemoteKey != "" {
+			projectID = client.ResolveProjectIDByRemoteKey(ctx, proj.RemoteKey)
+			originRouted = true
+		}
+	}
+	if projectID == "" && !originRouted && len(entry.Projects) > 0 {
+		projectID = entry.Projects[0]
+	}
+	if projectID == "" {
+		fmt.Fprintln(os.Stderr, "warning: remote save skipped: no remote project resolved (create the project on the server, or link one with `anchored remote link <id>`)")
+		return
 	}
 
 	mem := sync.RemoteMemory{

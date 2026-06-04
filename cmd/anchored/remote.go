@@ -307,11 +307,16 @@ func runRemoteSync(args []string) {
 	// intentionally (manual override). Otherwise we require a git repo with an
 	// origin so we can confirm the repository identity before pushing.
 	if *projectID == "" {
-		// Linked project takes precedence over git-origin auto-routing.
-		// If the user ran `anchored remote link <id>`, use that project
-		// directly instead of sending a ProjectClaim (which would create a
-		// new project when the server doesn't recognize the git origin).
-		if len(cfg.Remote.Projects) > 0 {
+		// Routing precedence: the repo's git-origin identity wins. A linked
+		// project (`anchored remote link <id>`) is a global, not per-repo,
+		// setting — letting it override origin routing silently funnels every
+		// repo's memories (and KG triples) into one remote project. It is
+		// only used as a fallback when the cwd has no matchable git origin.
+		if proj != nil && proj.RemoteKey != "" {
+			if len(cfg.Remote.Projects) > 0 {
+				fmt.Printf("Repo has a git origin — routing by origin (ignoring linked project %s; use --project-id to force one)\n", cfg.Remote.Projects[0])
+			}
+		} else if len(cfg.Remote.Projects) > 0 {
 			*projectID = cfg.Remote.Projects[0]
 			fmt.Printf("Using linked project %s (use --project-id to override)\n", *projectID)
 		} else {
@@ -320,11 +325,9 @@ func runRemoteSync(args []string) {
 				fmt.Fprintln(os.Stderr, "Run it from a repo, use --all to sync every local project, or --project-id <id> to target one explicitly.")
 				os.Exit(1)
 			}
-			if proj.RemoteKey == "" {
-				fmt.Fprintf(os.Stderr, "Repository %q has no git remote 'origin', so it can't be matched across machines.\n", proj.Name)
-				fmt.Fprintln(os.Stderr, "Add one (git remote add origin <url>) or use --project-id <id> to target a remote project explicitly.")
-				os.Exit(1)
-			}
+			fmt.Fprintf(os.Stderr, "Repository %q has no git remote 'origin', so it can't be matched across machines.\n", proj.Name)
+			fmt.Fprintln(os.Stderr, "Add one (git remote add origin <url>) or use --project-id <id> to target a remote project explicitly.")
+			os.Exit(1)
 		}
 	}
 
@@ -441,7 +444,29 @@ func runRemoteSync(args []string) {
 					Confidence: t.Confidence,
 				}
 			}
-			remoteProjID := *projectID
+			// Resolve the remote project for the triples endpoint, which
+			// needs a concrete ID (no project_claim routing): prefer the
+			// ID the server resolved for this push (servers >= v0.4.4),
+			// then an explicit --project-id/link, then a remote_key match
+			// against the server's project list (older servers).
+			remoteProjID := resp.ProjectID
+			if remoteProjID == "" {
+				remoteProjID = *projectID
+			}
+			if remoteProjID == "" && proj.RemoteKey != "" {
+				if remoteProjects, lpErr := client.ListProjects(ctx); lpErr == nil {
+					for _, rp := range remoteProjects {
+						if rp.RemoteKey == proj.RemoteKey {
+							remoteProjID = rp.ID
+							break
+						}
+					}
+				}
+			}
+			if remoteProjID == "" {
+				fmt.Fprintln(os.Stderr, "KG sync: skipped: could not resolve the remote project ID (server did not return one and no remote_key match)")
+				return
+			}
 			kgResp, kgPushErr := client.PushTriples(ctx, remoteProjID, syncTriples)
 			if kgPushErr != nil {
 				fmt.Fprintf(os.Stderr, "KG sync: warning: push triples failed: %v\n", kgPushErr)
