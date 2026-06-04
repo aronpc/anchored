@@ -309,15 +309,24 @@ func runRemoteSync(args []string) {
 	// intentionally (manual override). Otherwise we require a git repo with an
 	// origin so we can confirm the repository identity before pushing.
 	if *projectID == "" {
-		if proj == nil {
-			fmt.Fprintln(os.Stderr, "Not inside a git repository — `remote sync` is repo-scoped.")
-			fmt.Fprintln(os.Stderr, "Run it from a repo, use --all to sync every local project, or --project-id <id> to target one explicitly.")
-			os.Exit(1)
-		}
-		if proj.RemoteKey == "" {
-			fmt.Fprintf(os.Stderr, "Repository %q has no git remote 'origin', so it can't be matched across machines.\n", proj.Name)
-			fmt.Fprintln(os.Stderr, "Add one (git remote add origin <url>) or use --project-id <id> to target a remote project explicitly.")
-			os.Exit(1)
+		// Linked project takes precedence over git-origin auto-routing.
+		// If the user ran `anchored remote link <id>`, use that project
+		// directly instead of sending a ProjectClaim (which would create a
+		// new project when the server doesn't recognize the git origin).
+		if len(cfg.Remote.Projects) > 0 {
+			*projectID = cfg.Remote.Projects[0]
+			fmt.Printf("Using linked project %s (use --project-id to override)\n", *projectID)
+		} else {
+			if proj == nil {
+				fmt.Fprintln(os.Stderr, "Not inside a git repository — `remote sync` is repo-scoped.")
+				fmt.Fprintln(os.Stderr, "Run it from a repo, use --all to sync every local project, or --project-id <id> to target one explicitly.")
+				os.Exit(1)
+			}
+			if proj.RemoteKey == "" {
+				fmt.Fprintf(os.Stderr, "Repository %q has no git remote 'origin', so it can't be matched across machines.\n", proj.Name)
+				fmt.Fprintln(os.Stderr, "Add one (git remote add origin <url>) or use --project-id <id> to target a remote project explicitly.")
+				os.Exit(1)
+			}
 		}
 	}
 
