@@ -52,13 +52,23 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 		shutdown:  make(chan struct{}),
 	}
 
-	embedder, err := NewONNXEmbedder(cfg.Embedding.ModelDir, logger)
-	if err != nil {
-		logger.Warn("ONNX embedder not available, search will be BM25-only", "error", err)
+	// provider "none" disables embeddings entirely (BM25-only search). It
+	// must short-circuit BEFORE NewONNXEmbedder, which downloads the ONNX
+	// runtime and model when ModelDir is empty — tests and minimal installs
+	// rely on this to stay offline and fast.
+	var embedder *ONNXEmbedder
+	if cfg.Embedding.Provider == "none" {
+		logger.Info("embeddings disabled (provider: none), search will be BM25-only")
 	} else {
-		svc.embedder = embedder
-		svc.cache = NewEmbeddingCache(store.DB(), logger)
-		svc.cache.MigrateFromLegacy(embedder.Model())
+		e, err := NewONNXEmbedder(cfg.Embedding.ModelDir, logger)
+		if err != nil {
+			logger.Warn("ONNX embedder not available, search will be BM25-only", "error", err)
+		} else {
+			embedder = e
+			svc.embedder = embedder
+			svc.cache = NewEmbeddingCache(store.DB(), logger)
+			svc.cache.MigrateFromLegacy(embedder.Model())
+		}
 	}
 
 	searchCfg := DefaultHybridSearchConfig()
