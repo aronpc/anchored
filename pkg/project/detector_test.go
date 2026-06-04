@@ -41,6 +41,73 @@ func TestNormalizeRemoteURL(t *testing.T) {
 	}
 }
 
+// TestRemoteKeyParityVectors locks the canonical (v2) and legacy (v1)
+// normalization against the exact vectors mirrored in the sync server repo.
+// Any divergence here means clients and the server would derive different
+// remote_keys for the same repository.
+func TestRemoteKeyParityVectors(t *testing.T) {
+	canonical := []struct {
+		input    string
+		expected string
+	}{
+		{"https://github.com/user/repo.git", "github.com/user/repo"},
+		{"git@github.com:user/repo.git", "github.com/user/repo"},
+		{"ssh://git@github.com/user/repo", "github.com/user/repo"},
+		{"ssh://git@bitbucket.example.com:7999/proj/repo.git", "bitbucket.example.com/proj/repo"},
+		{"https://bitbucket.example.com/scm/proj/repo.git", "bitbucket.example.com/proj/repo"},
+		{"ssh://git@gitlab.example.com:2222/group/sub/repo.git", "gitlab.example.com/group/sub/repo"},
+		{"http://www.example.com/team/repo/", "example.com/team/repo"},
+		{"https://example.com/x/scm/y.git", "example.com/x/scm/y"},
+	}
+	for _, tt := range canonical {
+		t.Run("canonical/"+tt.input, func(t *testing.T) {
+			if got := normalizeRemoteURL(tt.input); got != tt.expected {
+				t.Errorf("normalizeRemoteURL(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+
+	legacy := []struct {
+		input    string
+		expected string
+	}{
+		{"ssh://git@bitbucket.example.com:7999/proj/repo.git", "bitbucket.example.com:7999/proj/repo"},
+		{"https://bitbucket.example.com/scm/proj/repo.git", "bitbucket.example.com/scm/proj/repo"},
+	}
+	for _, tt := range legacy {
+		t.Run("legacy/"+tt.input, func(t *testing.T) {
+			if got := normalizeRemoteURLLegacy(tt.input); got != tt.expected {
+				t.Errorf("normalizeRemoteURLLegacy(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestDeriveRemoteKeyCanonicalConvergence proves the canonical key collapses an
+// ssh+port URL and an https+scm URL of the same repo onto one key, while the
+// legacy keys differ from it (and from each other).
+func TestDeriveRemoteKeyCanonicalConvergence(t *testing.T) {
+	const sshURL = "ssh://git@bitbucket.example.com:7999/proj/repo.git"
+	const httpURL = "https://bitbucket.example.com/scm/proj/repo.git"
+
+	sshCanonical := DeriveRemoteKeyFromURL(sshURL)
+	httpCanonical := DeriveRemoteKeyFromURL(httpURL)
+	if sshCanonical == "" || sshCanonical != httpCanonical {
+		t.Fatalf("canonical keys should converge: ssh=%q http=%q", sshCanonical, httpCanonical)
+	}
+
+	sshLegacy := DeriveLegacyRemoteKeyFromURL(sshURL)
+	httpLegacy := DeriveLegacyRemoteKeyFromURL(httpURL)
+	if sshLegacy == sshCanonical || httpLegacy == sshCanonical {
+		t.Fatalf("legacy keys must differ from canonical: canonical=%q sshLegacy=%q httpLegacy=%q",
+			sshCanonical, sshLegacy, httpLegacy)
+	}
+
+	if DeriveRemoteKeyFromURL("") != "" || DeriveLegacyRemoteKeyFromURL("") != "" {
+		t.Errorf("empty URL must derive empty key")
+	}
+}
+
 func TestNormalizeRemoteURLSameKey(t *testing.T) {
 	urls := []string{
 		"https://github.com/user/repo.git",
@@ -229,6 +296,52 @@ func TestDetectBackfillsRemoteKey(t *testing.T) {
 	}
 	if rk != p.RemoteKey {
 		t.Errorf("DB remote_key = %q, want %q", rk, p.RemoteKey)
+	}
+}
+
+// TestDetectRekeysLegacyToCanonical proves a stored project carrying the legacy
+// key is updated to the canonical key once its origin now derives a different
+// (v2) key — e.g. a bitbucket-style origin where the port/scm rules apply.
+func TestDetectRekeysLegacyToCanonical(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	tmp := t.TempDir()
+	runGit(t, tmp, "init")
+	runGit(t, tmp, "config", "user.email", "test@test.com")
+	runGit(t, tmp, "config", "user.name", "Test")
+	const origin = "https://bitbucket.example.com/scm/proj/repo.git"
+	runGit(t, tmp, "remote", "add", "origin", origin)
+
+	canonical := DeriveRemoteKeyFromURL(origin)
+	legacy := DeriveLegacyRemoteKeyFromURL(origin)
+	if canonical == legacy {
+		t.Fatalf("test vector must have distinct keys, got %q", canonical)
+	}
+
+	db := openTestDB(t)
+	// Seed a project keyed with the legacy normalization.
+	if _, err := db.Exec("INSERT INTO projects (id, name, path, remote_key) VALUES (?, ?, ?, ?)",
+		"legacy-id", "repo", tmp, legacy); err != nil {
+		t.Fatalf("seed insert: %v", err)
+	}
+
+	detector := NewDetector(db)
+	p, err := detector.Detect(tmp)
+	if err != nil {
+		t.Fatalf("Detect: %v", err)
+	}
+	if p.RemoteKey != canonical {
+		t.Errorf("Detect RemoteKey = %q, want canonical %q", p.RemoteKey, canonical)
+	}
+
+	var rk string
+	if err := db.QueryRow("SELECT remote_key FROM projects WHERE id = ?", "legacy-id").Scan(&rk); err != nil {
+		t.Fatalf("query remote_key: %v", err)
+	}
+	if rk != canonical {
+		t.Errorf("DB remote_key = %q, want canonical %q", rk, canonical)
 	}
 }
 
