@@ -7,12 +7,14 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/memory"
+	projectpkg "github.com/jholhewres/anchored/pkg/project"
 	"github.com/jholhewres/anchored/pkg/sync"
 )
 
@@ -75,6 +77,13 @@ func runRemoteLink(args []string) {
 			fmt.Fprintf(os.Stderr, "remote %q not found in config (available: %s)\n", *remoteName, remoteNames(cfg))
 			os.Exit(1)
 		}
+		entry.Name = *remoteName
+		resolved, err := resolveLinkTarget(projectID, entry, *remoteName)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		projectID = resolved
 		for _, p := range entry.Projects {
 			if p == projectID {
 				fmt.Printf("Already linked to %s on remote %q\n", projectID, *remoteName)
@@ -89,6 +98,17 @@ func runRemoteLink(args []string) {
 		return
 	}
 
+	resolved, err := resolveLinkTarget(projectID, config.RemoteEntry{
+		Name:      "default",
+		ServerURL: cfg.Remote.ServerURL,
+		APIKey:    cfg.Remote.APIKey,
+	}, "default")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	projectID = resolved
+
 	for _, p := range cfg.Remote.Projects {
 		if p == projectID {
 			fmt.Printf("Already linked to %s\n", projectID)
@@ -99,6 +119,45 @@ func runRemoteLink(args []string) {
 	writeConfigFile(configFile, cfg)
 	fmt.Printf("Linked project %s to the default remote (%s)\n", projectID, orEmpty(cfg.Remote.ServerURL, "not configured yet"))
 	fmt.Printf("  Total projects subscribed: %d\n", len(cfg.Remote.Projects))
+}
+
+// uuidRe matches a canonical project UUID. Anything that doesn't match is
+// treated as a project slug to look up on the target remote.
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// resolveLinkTarget returns the project ID to link. When arg already looks
+// like a UUID it is returned unchanged. Otherwise arg is treated as a slug and
+// matched (exactly) against the projects on the target remote; an unknown slug
+// returns an error that lists the available slugs.
+func resolveLinkTarget(arg string, entry config.RemoteEntry, remoteName string) (string, error) {
+	if uuidRe.MatchString(arg) {
+		return arg, nil
+	}
+	if entry.ServerURL == "" {
+		return "", fmt.Errorf("cannot resolve slug %q: remote %q has no server URL configured", arg, remoteName)
+	}
+	client := sync.NewClientFromEntry(entry, "cli")
+	projects, err := client.ListProjects(context.Background())
+	if err != nil {
+		return "", fmt.Errorf("could not list projects on remote %q: %w", remoteName, err)
+	}
+	for _, p := range projects {
+		if p.Slug == arg {
+			return p.ID, nil
+		}
+	}
+	slugs := make([]string, 0, len(projects))
+	for _, p := range projects {
+		if p.Slug != "" {
+			slugs = append(slugs, p.Slug)
+		}
+	}
+	sort.Strings(slugs)
+	available := "(none)"
+	if len(slugs) > 0 {
+		available = strings.Join(slugs, ", ")
+	}
+	return "", fmt.Errorf("no project with slug %q on remote %q\navailable slugs: %s", arg, remoteName, available)
 }
 
 // runRemoteUnlink removes a project_id from a remote's linked-projects list.
@@ -513,12 +572,18 @@ func runRemoteSync(args []string) {
 		return
 	}
 
+	// Compute both the canonical (v2) and legacy (v1) git-origin keys so every
+	// resolution probes canonical first, then legacy — a project still
+	// registered under the old normalization on a not-yet-rekeyed server is
+	// still found. canonicalKey mirrors proj.RemoteKey (the stored canonical).
+	canonicalKey, legacyKey := projectpkg.RemoteKeysFromDir(projectRoot)
+
 	// Cross-remote origin probe: when no remote was forced and the resolved
 	// one doesn't know this repository, ask the other configured remotes —
 	// a freshly-configured second server (no routing paths yet) is found
 	// automatically instead of the push failing with "project not found".
 	if *remoteName == "" && proj != nil && proj.RemoteKey != "" && len(cfg.Remotes) > 1 {
-		if target, _ := sync.ResolveProjectAcrossRemotes(ctx, cfg, projectRoot, proj.RemoteKey, "cli"); target != nil && (entry == nil || target.Name != entry.Name) {
+		if target, _, _ := sync.ResolveProjectAcrossRemotes(ctx, cfg, projectRoot, "cli", canonicalKey, legacyKey); target != nil && (entry == nil || target.Name != entry.Name) {
 			fmt.Printf("Repository is registered on remote %q — using it (force another with --remote)\n", target.Name)
 			entry = target
 		}
@@ -541,18 +606,32 @@ func runRemoteSync(args []string) {
 	}
 	client := sync.NewClientFromEntry(*entry, "cli")
 
+	// Determine which git-origin key the chosen remote actually knows the repo
+	// under: probe canonical first, then legacy. When the server has the
+	// project under the legacy key, the whole outgoing payload (project_claim
+	// AND every memory's remote_project_key) must use that legacy key so the
+	// push lands in the existing project instead of creating a canonical
+	// duplicate. Default to canonical when nothing resolves (new-project case,
+	// which the server accepts/creates).
+	pushKey := canonicalKey
+	if *projectID == "" && proj != nil && proj.RemoteKey != "" {
+		if _, matched := client.ResolveProjectIDByRemoteKeys(ctx, canonicalKey, legacyKey); matched != "" {
+			pushKey = matched
+		}
+	}
+
 	pushMemories := make([]sync.SyncMemory, 0, preview.Syncable)
 	for _, item := range preview.Items {
 		if item.Classification != sync.ClassificationSyncable {
 			continue
 		}
 		// item.Memory.Content is already path-rewritten by the preview.
-		// In repo-scoped mode we stamp every memory with the cwd repo's
+		// In repo-scoped mode we stamp every memory with the matched
 		// git-origin key so the server groups them into one project by origin,
 		// regardless of any stale per-memory key.
 		rpk := derefString(item.Memory.RemoteProjectKey)
 		if proj != nil && proj.RemoteKey != "" {
-			rpk = proj.RemoteKey
+			rpk = pushKey
 		}
 		pushMemories = append(pushMemories, sync.SyncMemory{
 			ID:               item.Memory.ID,
@@ -574,9 +653,9 @@ func runRemoteSync(args []string) {
 	// Send a friendly claim so a project auto-created by origin gets the repo's
 	// name instead of "auto-<hash>". Only when routing by origin (no forced id).
 	if *projectID == "" && proj != nil && proj.RemoteKey != "" {
-		pushReq.ProjectClaim = &sync.ProjectClaim{Name: proj.Name, RemoteKey: proj.RemoteKey}
+		pushReq.ProjectClaim = &sync.ProjectClaim{Name: proj.Name, RemoteKey: pushKey}
 		fmt.Printf("Repo %q · origin %s · key %s → remote project %q\n",
-			proj.Name, orEmpty(gitOriginURL(projectRoot), "(none)"), proj.RemoteKey, proj.Name)
+			proj.Name, orEmpty(gitOriginURL(projectRoot), "(none)"), pushKey, proj.Name)
 	}
 
 	resp, err := client.Push(ctx, pushReq)
@@ -617,14 +696,7 @@ func runRemoteSync(args []string) {
 				remoteProjID = *projectID
 			}
 			if remoteProjID == "" && proj.RemoteKey != "" {
-				if remoteProjects, lpErr := client.ListProjects(ctx); lpErr == nil {
-					for _, rp := range remoteProjects {
-						if rp.RemoteKey == proj.RemoteKey {
-							remoteProjID = rp.ID
-							break
-						}
-					}
-				}
+				remoteProjID, _ = client.ResolveProjectIDByRemoteKeys(ctx, canonicalKey, legacyKey)
 			}
 			if remoteProjID == "" {
 				fmt.Fprintln(os.Stderr, "KG sync: skipped: could not resolve the remote project ID (server did not return one and no remote_key match)")
