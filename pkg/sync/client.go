@@ -299,6 +299,25 @@ type RemoteProject struct {
 	Name      string `json:"name"`
 	Slug      string `json:"slug"`
 	RemoteKey string `json:"remote_key"`
+	// RemoteKeyV1 is the legacy routing key servers >= v0.4.7 expose alongside
+	// the canonical one; empty on older servers.
+	RemoteKeyV1 string `json:"remote_key_v1"`
+}
+
+// GetProjectByID returns the listed project with the given ID, or nil when the
+// listing doesn't contain it (or fails). Used to verify that a forced/linked
+// target project actually belongs to the repository being synced.
+func (c *Client) GetProjectByID(ctx context.Context, id string) *RemoteProject {
+	projects, err := c.ListProjects(ctx)
+	if err != nil {
+		return nil
+	}
+	for i := range projects {
+		if projects[i].ID == id {
+			return &projects[i]
+		}
+	}
+	return nil
 }
 
 // ListProjects returns the projects the configured API key can access on the
