@@ -33,6 +33,11 @@ type SyncPushResponse struct {
 	Accepted int      `json:"accepted"`
 	Rejected int      `json:"rejected"`
 	Errors   []string `json:"errors,omitempty"`
+	// ProjectID is the remote project the batch landed in, resolved by the
+	// server (servers >= v0.4.4). Needed for follow-up per-project calls
+	// (e.g. PushTriples) when routing by project_claim, where the client
+	// doesn't know the remote ID upfront. Empty on older servers.
+	ProjectID string `json:"project_id,omitempty"`
 }
 
 // SyncPullRequest requests new/updated memories from the server.
