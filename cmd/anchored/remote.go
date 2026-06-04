@@ -458,6 +458,8 @@ func runRemoteSync(args []string) {
 	projectID := fs.String("project-id", "", "force a specific remote project ID (overrides git-origin routing)")
 	remoteName := fs.String("remote", "", "use a specific named remote (default: resolve by project path, then the default remote)")
 	all := fs.Bool("all", false, "sync every local project (each routed by its own git origin), not just the current repo")
+	fullStore := fs.Bool("full-store", false, "with --project-id outside a repo: push the ENTIRE local store to that project (dangerous, off by default)")
+	force := fs.Bool("force", false, "push even when the target project is registered to a different repository")
 	fs.Parse(args)
 
 	if *all {
@@ -520,6 +522,17 @@ func runRemoteSync(args []string) {
 				fmt.Printf("Repo has a git origin — routing by origin (ignoring linked project %s; use --project-id to force one)\n", entryProjects[0])
 			}
 		} else if len(entryProjects) > 0 {
+			// A linked project is only a safe fallback when the cwd resolves to
+			// a known local project, which bounds the push to that project's
+			// memories. Without one the fallback below would dump the ENTIRE
+			// local store into the linked project (real incident: a dev ran
+			// sync from a non-repo directory and pushed thousands of unrelated
+			// memories into the team project).
+			if proj == nil {
+				fmt.Fprintf(os.Stderr, "Not inside a known project — refusing to push the entire local store to linked project %s.\n", entryProjects[0])
+				fmt.Fprintln(os.Stderr, "Run `anchored remote sync` inside the repository you want to sync, or pass --project-id <id> --full-store to do this on purpose.")
+				os.Exit(1)
+			}
 			*projectID = entryProjects[0]
 			fmt.Printf("Using linked project %s (use --project-id to override)\n", *projectID)
 		} else {
@@ -534,13 +547,18 @@ func runRemoteSync(args []string) {
 		}
 	}
 
-	// Repo-scoped: pull only this project's memories. Without a project (the
-	// --project-id override outside a repo) fall back to the full store.
+	// Repo-scoped: pull only this project's memories. The full local store is
+	// only ever pushed when the user asked for it in so many words
+	// (--project-id + --full-store outside a repo) — it is never a fallback.
 	var memories []memory.Memory
 	if proj != nil {
 		memories, err = listProjectMemories(ctx, svc, proj.ID)
-	} else {
+	} else if *fullStore {
 		memories, err = listAllMemories(ctx, svc)
+	} else {
+		fmt.Fprintln(os.Stderr, "Refusing to push the entire local store: --project-id outside a repository would send every memory you have to that project.")
+		fmt.Fprintln(os.Stderr, "Run the sync inside the repository instead, or pass --full-store if pushing everything is really the intent.")
+		os.Exit(1)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "list error: %v\n", err)
@@ -605,6 +623,23 @@ func runRemoteSync(args []string) {
 		fmt.Printf("Remote: %s (%s)\n", entry.Name, entry.ServerURL)
 	}
 	client := sync.NewClientFromEntry(*entry, "cli")
+
+	// Targeted pushes (linked project or --project-id) must land in a project
+	// that is registered to THIS repository: when both sides carry routing
+	// keys and none of them line up, the target belongs to a different repo
+	// and the push would pollute it. --force is the documented escape hatch.
+	if *projectID != "" && proj != nil && (canonicalKey != "" || legacyKey != "") {
+		if rp := client.GetProjectByID(ctx, *projectID); rp != nil && (rp.RemoteKey != "" || rp.RemoteKeyV1 != "") {
+			if !remoteKeysMatch(rp, canonicalKey, legacyKey) {
+				if !*force {
+					fmt.Fprintf(os.Stderr, "Target project %q (%s) is registered to a different repository (its routing key doesn't match this repo's origin).\n", rp.Slug, *projectID)
+					fmt.Fprintln(os.Stderr, "Sync from the matching repository, fix the project's Repository URL in the dashboard, or pass --force to push anyway.")
+					os.Exit(1)
+				}
+				fmt.Fprintf(os.Stderr, "warning: pushing to project %q even though its routing key doesn't match this repository (--force)\n", rp.Slug)
+			}
+		}
+	}
 
 	// Determine which git-origin key the chosen remote actually knows the repo
 	// under: probe canonical first, then legacy. When the server has the
@@ -831,4 +866,19 @@ func gitOriginURL(dir string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// remoteKeysMatch reports whether any of the remote project's routing keys
+// (canonical or legacy) equals any of the repo's derived keys. Empty keys
+// never match.
+func remoteKeysMatch(rp *sync.RemoteProject, repoKeys ...string) bool {
+	for _, k := range repoKeys {
+		if k == "" {
+			continue
+		}
+		if k == rp.RemoteKey || k == rp.RemoteKeyV1 {
+			return true
+		}
+	}
+	return false
 }

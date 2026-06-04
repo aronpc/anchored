@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jholhewres/anchored/pkg/config"
+	"github.com/jholhewres/anchored/pkg/sync"
 )
 
 func slugProjectsServer(t *testing.T) *httptest.Server {
@@ -59,5 +60,24 @@ func TestResolveLinkTargetSlugNotFound(t *testing.T) {
 	// Available slugs should be listed to guide the user.
 	if !strings.Contains(msg, "api") || !strings.Contains(msg, "web") {
 		t.Errorf("error message should list available slugs, got %q", msg)
+	}
+}
+
+// TestRemoteKeysMatch locks the push-target guard: a forced/linked project
+// only matches when one of the repo's derived keys equals one of the remote
+// project's routing keys; empty keys never match.
+func TestRemoteKeysMatch(t *testing.T) {
+	rp := &sync.RemoteProject{RemoteKey: "canon123", RemoteKeyV1: "legacy456"}
+	if !remoteKeysMatch(rp, "canon123", "") {
+		t.Fatal("canonical key should match remote_key")
+	}
+	if !remoteKeysMatch(rp, "nope", "legacy456") {
+		t.Fatal("legacy key should match remote_key_v1")
+	}
+	if remoteKeysMatch(rp, "other", "another") {
+		t.Fatal("disjoint keys must not match")
+	}
+	if remoteKeysMatch(rp, "", "") {
+		t.Fatal("empty keys must never match")
 	}
 }
