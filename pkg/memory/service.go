@@ -56,7 +56,11 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 	// must short-circuit BEFORE NewONNXEmbedder, which downloads the ONNX
 	// runtime and model when ModelDir is empty — tests and minimal installs
 	// rely on this to stay offline and fast.
-	var embedder *ONNXEmbedder
+	//
+	// embedder is declared as the INTERFACE type on purpose: assigning a nil
+	// *ONNXEmbedder would produce a non-nil interface, defeating the
+	// `embedder == nil` guards in the searcher and panicking on first query.
+	var embedder EmbeddingProvider
 	if cfg.Embedding.Provider == "none" {
 		logger.Info("embeddings disabled (provider: none), search will be BM25-only")
 	} else {
@@ -65,9 +69,9 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 			logger.Warn("ONNX embedder not available, search will be BM25-only", "error", err)
 		} else {
 			embedder = e
-			svc.embedder = embedder
+			svc.embedder = e
 			svc.cache = NewEmbeddingCache(store.DB(), logger)
-			svc.cache.MigrateFromLegacy(embedder.Model())
+			svc.cache.MigrateFromLegacy(e.Model())
 		}
 	}
 
