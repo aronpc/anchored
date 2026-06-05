@@ -946,7 +946,7 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		// personal / secret memories never leave the machine. The actual
 		// target remote (and its auto_sync gate) is resolved inside the
 		// goroutine via the cross-remote origin probe.
-		if s.cfg.ResolveRemote(p.CWD) != nil {
+		if s.hasAnyRemote() {
 			if redacted, ok := remotesync.ClassifyForAutoSync(*m, p.CWD); ok {
 				// Resolve the destination BEFORE answering so the response can
 				// name the exact server and project the memory goes to — a bare
@@ -1202,7 +1202,7 @@ func (s *Server) toolKGAdd(ctx context.Context, args json.RawMessage) (string, e
 	// auto_sync gate) is resolved inside via the cross-remote origin probe.
 	// Triples are entity strings, not free text, so no safety classification.
 	if s.cfg != nil {
-		if s.cfg.ResolveRemote(p.CWD) != nil {
+		if s.hasAnyRemote() {
 			rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
 			target, pid := s.resolveAutoRemoteTarget(rctx, p.CWD)
 			rcancel()
@@ -1259,6 +1259,14 @@ func (s *Server) resolveAutoRemoteTarget(ctx context.Context, cwd string) (*conf
 		return entry, entry.Projects[0]
 	}
 	return nil, ""
+}
+
+// hasAnyRemote reports whether at least one remote server is configured.
+// Auto-sync gates use it instead of ResolveRemote: a named-only setup with no
+// default flag and no routing paths resolves to nothing, but the origin probe
+// inside resolveAutoRemoteTarget still searches every configured remote.
+func (s *Server) hasAnyRemote() bool {
+	return s.cfg != nil && len(s.cfg.Remotes) > 0
 }
 
 // pushTripleTo pushes a single triple to an already-resolved remote project.
