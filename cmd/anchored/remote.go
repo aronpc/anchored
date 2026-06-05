@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -316,9 +317,14 @@ func runRemoteStatus(args []string) {
 	}
 
 	fmt.Printf("Remote sync: %s\n", boolStr(cfg.Remote.Enabled, "enabled", "disabled"))
-	fmt.Printf("Server URL:  %s\n", orEmpty(cfg.Remote.ServerURL, "(not configured)"))
-	fmt.Printf("API Key:     %s\n", maskKey(cfg.Remote.APIKey))
-	fmt.Printf("Projects:    %d configured\n", len(cfg.Remote.Projects))
+	// Single-server setups keep the familiar detailed header; with named
+	// remotes the map view below already lists the default entry, so the
+	// header would just duplicate it.
+	if len(cfg.Remotes) <= 1 {
+		fmt.Printf("Server URL:  %s\n", orEmpty(cfg.Remote.ServerURL, "(not configured)"))
+		fmt.Printf("API Key:     %s\n", maskKey(cfg.Remote.APIKey))
+		fmt.Printf("Projects:    %d configured\n", len(cfg.Remote.Projects))
+	}
 
 	// Multi-server view: loadConfig migrates the singular block into the
 	// named map, so this lists every server (default included) with its
@@ -354,6 +360,20 @@ func runRemoteStatus(args []string) {
 			fmt.Printf("Current repo: %s\n", proj.Name)
 			fmt.Printf("  Origin:     %s\n", orEmpty(gitOriginURL(cwd), "(no origin — sync will refuse)"))
 			fmt.Printf("  Remote key: %s\n", orEmpty(proj.RemoteKey, "(none)"))
+			// The conclusion users actually need: which server a sync/save
+			// from this repo would talk to (path match, then default).
+			if entry := cfg.ResolveRemote(cwd); entry != nil {
+				how := "default remote"
+				for _, pattern := range entry.Paths {
+					if matched, _ := path.Match(pattern, cwd); matched {
+						how = "path match: " + pattern
+						break
+					}
+				}
+				fmt.Printf("  Routes to:  %s (%s) — %s\n", entry.Name, entry.ServerURL, how)
+			} else {
+				fmt.Println("  Routes to:  (no remote configured)")
+			}
 		}
 	}
 }
@@ -757,12 +777,20 @@ func runRemoteSync(args []string) {
 // remoteNames returns the configured remote names, comma-separated, for
 // error messages.
 func remoteNames(cfg *config.Config) string {
-	if len(cfg.Remotes) == 0 {
-		return "none"
-	}
-	names := make([]string, 0, len(cfg.Remotes))
+	names := make([]string, 0, len(cfg.Remotes)+1)
 	for name := range cfg.Remotes {
 		names = append(names, name)
+	}
+	// Commands that load the config raw (without the legacy-block migration)
+	// won't have "default" in the map even though --remote default is valid
+	// whenever the singular remote: block is configured — list it too.
+	if cfg.Remote.ServerURL != "" {
+		if _, ok := cfg.Remotes["default"]; !ok {
+			names = append(names, "default")
+		}
+	}
+	if len(names) == 0 {
+		return "none"
 	}
 	sort.Strings(names)
 	return strings.Join(names, ", ")
