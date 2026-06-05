@@ -106,7 +106,7 @@ func autoSyncRemote(ctx context.Context, cfg *config.Config, svc *memory.Service
 		fmt.Fprintf(os.Stderr, "warning: auto-sync skipped: %v\n", err)
 		return
 	}
-	fmt.Printf("Auto-synced to remote %s\n", entry.Name)
+	fmt.Printf("Auto-synced to remote %s (%s) · project %s\n", entry.Name, entry.ServerURL, projectID)
 }
 
 func pushRemote(ctx context.Context, cfg *config.Config, svc *memory.Service, m *memory.Memory, remoteName, projectOverride string) {
