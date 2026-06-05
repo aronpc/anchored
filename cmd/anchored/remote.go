@@ -295,6 +295,23 @@ func runRemoteConfigure(args []string) {
 	}
 	entry.ServerURL = newURL
 	entry.APIKey = *key
+	// First server configured under a name (the Connect-tab flow) must become
+	// the default: with no default and no routing paths, ResolveRemote finds
+	// nothing and the MCP auto-sync/search-merge gates silently stay closed —
+	// the config LOOKS right but nothing reaches the server.
+	if cfg.Remote.ServerURL == "" && !entry.Default {
+		hasDefault := false
+		for n, e := range cfg.Remotes {
+			if n != target && e.Default {
+				hasDefault = true
+				break
+			}
+		}
+		if !hasDefault {
+			entry.Default = true
+			fmt.Printf("Marked %q as the default remote (first server configured).\n", target)
+		}
+	}
 	cfg.Remotes[target] = entry
 
 	writeConfigFile(configFile, cfg)
