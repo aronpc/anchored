@@ -391,6 +391,18 @@ func runRemoteStatus(args []string) {
 			} else {
 				fmt.Println("  Routes to:  (no remote configured)")
 			}
+
+			// Identity verification: does any remote actually have a project
+			// registered for this repo, and does a single linked project (if
+			// any) belong to it? Best-effort network probe, bounded.
+			if len(cfg.Remotes) > 0 {
+				canonicalKey, legacyKey := projectpkg.RemoteKeysFromDir(cwd)
+				probeCtx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+				defer cancel()
+				for _, line := range repoIdentityLines(probeCtx, cfg, cwd, gitOriginURL(cwd), canonicalKey, legacyKey) {
+					fmt.Println(line)
+				}
+			}
 		}
 	}
 }
@@ -689,6 +701,14 @@ func runRemoteSync(args []string) {
 	if *projectID == "" && proj != nil && proj.RemoteKey != "" {
 		if _, matched := client.ResolveProjectIDByRemoteKeys(ctx, canonicalKey, legacyKey); matched != "" {
 			pushKey = matched
+		} else {
+			// Pre-flight: a claim-based push for an unknown key fails on the
+			// server with a bare "no project with remote_key" per memory.
+			// Stop here with the actionable version instead. The cross-remote
+			// probe above already widened the search when it could.
+			fmt.Fprint(os.Stderr, buildNoProjectError(
+				gitOriginURL(projectRoot), canonicalKey, legacyKey, sortedRemoteNames(cfg)))
+			os.Exit(1)
 		}
 	}
 
