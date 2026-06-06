@@ -16,18 +16,24 @@ func runDoctor(args []string) {
 	fs := newFlagSet("doctor")
 	configPath := fs.String("config", "", "path to config file")
 	cwd := fs.String("cwd", "", "current working directory (for workspace-scoped probes)")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON ({version, checks:[{name,status,detail,fix_command}]})")
 	fs.Parse(args)
 
 	if *cwd == "" {
 		*cwd = "."
 	}
+	doctorChecks = nil // defensive: collector is package-level state
+	doctorJSONMode = *jsonOut
 
-	fmt.Printf("anchored doctor — diagnostics for v%s\n\n", Version)
+	if !doctorJSONMode {
+		fmt.Printf("anchored doctor — diagnostics for v%s\n\n", Version)
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		printCheck(false, "config loaded", err.Error(), "")
-		os.Exit(1)
+		recordCheck("failed", "config loaded", err.Error(),
+			"fix or remove ~/.anchored/config.yaml (YAML syntax error?)", true)
+		finishDoctor()
 	}
 
 	home, _ := os.UserHomeDir()
@@ -37,8 +43,12 @@ func runDoctor(args []string) {
 	checkDatabase(cfg.Memory.DatabasePath, cfg.Embedding.Dimensions)
 	checkMCPRegistration(home, *cwd)
 	checkConfig(home, cfg)
+	checkPluginDrift(cfg)
+	anyReachable := checkRemoteConnectivity(cfg)
+	checkRemoteConfigSanity(cfg)
+	checkProjectIdentity(cfg, *cwd, anyReachable)
 
-	fmt.Println()
+	finishDoctor()
 }
 
 func checkBinary(home string) {
@@ -124,7 +134,8 @@ func checkDatabase(dbPath string, expectedDims int) {
 
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		printCheck(false, "database open", err.Error(), "")
+		recordCheck("failed", "database open", err.Error(),
+			"the database file may be corrupted — back it up and run 'anchored purge --hard' to rebuild", true)
 		return
 	}
 	defer db.Close()
@@ -290,19 +301,15 @@ func checkConfig(home string, cfg interface{}) {
 	}
 }
 
+// printCheck is the legacy reporting helper; it now feeds the structured
+// collector (recordCheck) so --json sees every finding. Checks reported via
+// this path are never critical (they don't flip the exit code).
 func printCheck(ok bool, label, detail, hint string) {
-	mark := "[ ]"
+	status := "failed"
 	if ok {
-		mark = "[x]"
+		status = "ok"
 	}
-	fmt.Printf("%s %s", mark, label)
-	if detail != "" {
-		fmt.Printf(" — %s", detail)
-	}
-	fmt.Println()
-	if !ok && hint != "" {
-		fmt.Printf("    → %s\n", hint)
-	}
+	recordCheck(status, label, detail, hint, false)
 }
 
 func pathHas(target string) bool {
