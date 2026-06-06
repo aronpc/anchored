@@ -166,7 +166,6 @@ func TestDoctorJSONShape(t *testing.T) {
 	if parsed.Checks[2].Status != "skipped" {
 		t.Fatalf("skipped check shape: %+v", parsed.Checks[2])
 	}
-	doctorChecks = nil
 }
 
 func TestRemoteConfigSanity_DefaultDetection(t *testing.T) {
