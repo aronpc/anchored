@@ -145,39 +145,19 @@ func (h *HybridSearcher) searchVector(ctx context.Context, query string, maxResu
 	var results []SearchResult
 
 	if h.vectorCache != nil && h.vectorCache.Len() > 0 {
-		type idScore struct {
-			id    string
-			score float64
-		}
-		var scored []idScore
-
-		for id, vec := range h.vectorCache.All() {
-			if len(vec) == 0 {
-				continue
-			}
-			qe := QuantizeFloat32(vec)
-			score := qe.CosineSimilarity(queryVec, queryNorm)
-			if score > 0.01 {
-				scored = append(scored, idScore{id: id, score: score})
-			}
-		}
-
-		sort.Slice(scored, func(i, j int) bool {
-			return scored[i].score > scored[j].score
-		})
-		if len(scored) > maxResults {
-			scored = scored[:maxResults]
-		}
+		// Single allocation-light pass over the cache (no map copy, no
+		// re-quantization): the quantized form + norm are memoized per vector.
+		scored := h.vectorCache.Score(queryVec, queryNorm, 0.01, maxResults)
 
 		for _, s := range scored {
-			m, err := h.store.Get(ctx, s.id)
+			m, err := h.store.Get(ctx, s.ID)
 			if err != nil || m == nil {
 				continue
 			}
 			if !matchesSearchOptions(*m, opts) {
 				continue
 			}
-			score := s.score
+			score := s.Score
 			if len(queryEntities) > 0 && containsEntity(m.Content, m.Keywords, queryEntities) {
 				score *= 1.1
 			}
