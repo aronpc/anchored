@@ -110,64 +110,6 @@ func TestSharedCapabilityVectorsPresent(t *testing.T) {
 	}
 }
 
-// TestPush_AdvertisesArtifactSummariesCapability verifies that every push sets
-// ArtifactSummaries: true in client_capabilities and that the field is parsed
-// from the server response.
-func TestPush_AdvertisesArtifactSummariesCapability(t *testing.T) {
-	var gotArtifactCap bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			ClientCapabilities *ClientCapabilities `json:"client_capabilities"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		gotArtifactCap = body.ClientCapabilities != nil && body.ClientCapabilities.ArtifactSummaries
-		w.Write([]byte(`{"accepted":1,"rejected":0,"project_id":"rp-1",
-			"artifact_summaries":[{"artifact_id":"art-abc"}]}`))
-	}))
-	defer srv.Close()
-
-	c := NewClientFromEntry(config.RemoteEntry{Name: "t", ServerURL: srv.URL, APIKey: "k"}, "cli")
-	resp, err := c.Push(context.Background(), SyncPushRequest{
-		ClientID:  "cli",
-		ProjectID: "rp-1",
-		Memories: []SyncMemory{{
-			ID: "m1", Category: "decision",
-			Content:  "use artifact store for ephemeral session content in production",
-			Metadata: map[string]any{"artifact_id": "art-abc"},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("push: %v", err)
-	}
-	if !gotArtifactCap {
-		t.Fatal("push did not advertise artifact_summaries capability")
-	}
-	if len(resp.ArtifactSummaries) != 1 || resp.ArtifactSummaries[0].ArtifactID != "art-abc" {
-		t.Fatalf("ArtifactSummaries not parsed: %+v", resp.ArtifactSummaries)
-	}
-}
-
-// TestPush_NoArtifactSummariesFromOldServer verifies that a server omitting
-// artifact_summaries yields an empty slice and no error.
-func TestPush_NoArtifactSummariesFromOldServer(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"accepted":1,"rejected":0,"project_id":"rp-1"}`))
-	}))
-	defer srv.Close()
-
-	c := NewClientFromEntry(config.RemoteEntry{Name: "t", ServerURL: srv.URL, APIKey: "k"}, "cli")
-	resp, err := c.Push(context.Background(), SyncPushRequest{
-		ClientID: "cli", ProjectID: "rp-1",
-		Memories: []SyncMemory{{ID: "m1", Category: "decision", Content: "a sufficiently substantive architecture decision for the platform"}},
-	})
-	if err != nil {
-		t.Fatalf("push: %v", err)
-	}
-	if len(resp.ArtifactSummaries) != 0 {
-		t.Fatalf("old server must yield empty ArtifactSummaries, got %+v", resp.ArtifactSummaries)
-	}
-}
-
 // policyHintLineForTest re-implements the cmd-layer formatter so pkg/sync can
 // assert the hint shape without importing the command package.
 func policyHintLineForTest(p *PolicyHints) string {

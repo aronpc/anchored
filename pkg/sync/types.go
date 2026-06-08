@@ -63,19 +63,6 @@ type SyncPushResponse struct {
 	// request advertised capabilities and the server supports negotiation
 	// (>= v0.5.1). nil otherwise.
 	Policy *PolicyHints `json:"policy,omitempty"`
-	// ArtifactSummaries lists artifact IDs whose linked memories were accepted
-	// in this push. Only populated when the request advertised
-	// ClientCapabilities.ArtifactSummaries and the server supports it
-	// (>= v0.5.1). nil/empty otherwise.
-	ArtifactSummaries []ArtifactSummary `json:"artifact_summaries,omitempty"`
-}
-
-// ArtifactSummary is the server's acknowledgement for a single artifact whose
-// content was successfully pushed in the same sync batch.
-type ArtifactSummary struct {
-	// ArtifactID is the client-assigned artifact identifier echoed back by the
-	// server, taken from the "artifact_id" key in the accepted memory's Metadata.
-	ArtifactID string `json:"artifact_id"`
 }
 
 // SyncPullRequest requests new/updated memories from the server.
