@@ -61,6 +61,8 @@ func main() {
 		runInspect(os.Args[2:])
 	case "export":
 		runExport(os.Args[2:])
+	case "artifact":
+		runArtifact(os.Args[2:])
 	case "remote":
 		runRemote(os.Args[2:])
 	case "--version", "-v":
@@ -101,6 +103,10 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored purge              Wipe memories (--hard for full DB reset)\n")
 	fmt.Fprintf(os.Stderr, "  anchored inspect <id>      Show full memory details\n")
 	fmt.Fprintf(os.Stderr, "  anchored export             Export memories (JSON/JSONL)\n")
+	fmt.Fprintf(os.Stderr, "  anchored artifact add       Index content as an artifact (--type, --file, --label)\n")
+	fmt.Fprintf(os.Stderr, "  anchored artifact search    FTS search over indexed artifacts\n")
+	fmt.Fprintf(os.Stderr, "  anchored artifact list      List recent artifacts\n")
+	fmt.Fprintf(os.Stderr, "  anchored artifact prune     Remove expired artifacts\n")
 	fmt.Fprintf(os.Stderr, "  anchored remote status      Show remote sync config status\n")
 	fmt.Fprintf(os.Stderr, "  anchored remote preview     Preview which memories would sync (offline)\n")
 	fmt.Fprintf(os.Stderr, "  anchored --version          Print version\n")
