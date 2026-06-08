@@ -38,14 +38,14 @@ func (s *Store) PrepareStatements() error {
 	var err error
 
 	s.stmtInsertChunk, err = s.db.Prepare(`
-		INSERT INTO content_chunks (id, session_id, project_id, source, label, content, metadata, content_type, indexed_at, ttl_hours)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		INSERT INTO content_chunks (id, session_id, project_id, source, label, content, metadata, content_type, indexed_at, ttl_hours, artifact_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare insert chunk: %w", err)
 	}
 
 	s.stmtGetChunk, err = s.db.Prepare(`
-		SELECT id, session_id, project_id, source, label, content, metadata, content_type, indexed_at, ttl_hours
+		SELECT id, session_id, project_id, source, label, content, metadata, content_type, indexed_at, ttl_hours, artifact_id
 		FROM content_chunks WHERE id = ?`)
 	if err != nil {
 		return fmt.Errorf("prepare get chunk: %w", err)
@@ -65,7 +65,7 @@ func (s *Store) PrepareStatements() error {
 	}
 
 	s.stmtChunksBySrc, err = s.db.Prepare(`
-		SELECT id, session_id, project_id, source, label, content, metadata, content_type, indexed_at, ttl_hours
+		SELECT id, session_id, project_id, source, label, content, metadata, content_type, indexed_at, ttl_hours, artifact_id
 		FROM content_chunks WHERE source = ?`)
 	if err != nil {
 		return fmt.Errorf("prepare chunks by source: %w", err)
@@ -110,7 +110,7 @@ func (s *Store) InsertChunk(ctx context.Context, chunk *Chunk) error {
 	_, err := s.stmtInsertChunk.ExecContext(ctx,
 		chunk.ID, chunk.SessionID, chunk.ProjectID, chunk.Source, chunk.Label,
 		chunk.Content, chunk.Metadata, chunk.ContentType,
-		chunk.IndexedAt, chunk.TTLHours,
+		chunk.IndexedAt, chunk.TTLHours, chunk.ArtifactID,
 	)
 	if err != nil {
 		return fmt.Errorf("insert chunk: %w", err)
@@ -125,7 +125,7 @@ func (s *Store) GetChunk(ctx context.Context, id string) (*Chunk, error) {
 	err := row.Scan(
 		&c.ID, &c.SessionID, &c.ProjectID, &c.Source, &c.Label,
 		&c.Content, &c.Metadata, &c.ContentType,
-		&c.IndexedAt, &c.TTLHours,
+		&c.IndexedAt, &c.TTLHours, &c.ArtifactID,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -204,7 +204,7 @@ func (s *Store) GetChunksBySource(ctx context.Context, source string) ([]Chunk, 
 		if err := rows.Scan(
 			&c.ID, &c.SessionID, &c.ProjectID, &c.Source, &c.Label,
 			&c.Content, &c.Metadata, &c.ContentType,
-			&c.IndexedAt, &c.TTLHours,
+			&c.IndexedAt, &c.TTLHours, &c.ArtifactID,
 		); err != nil {
 			return nil, fmt.Errorf("scan chunk: %w", err)
 		}

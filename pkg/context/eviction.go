@@ -53,6 +53,15 @@ func NewEvictor(store *Store, db *sql.DB, cfg EvictorConfig, logger *slog.Logger
 func (e *Evictor) RunEviction(ctx context.Context) (int, error) {
 	var totalDeleted int
 
+	// Prune expired artifacts (and their chunks) first.
+	pruned, err := e.store.PruneExpired(ctx)
+	if err != nil {
+		e.logger.Warn("prune expired artifacts failed", "error", err)
+	} else if pruned > 0 {
+		totalDeleted += pruned
+		e.logger.Info("evicted expired artifacts", "count", pruned)
+	}
+
 	expiredIDs, err := e.store.GetExpiredChunkIDs(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("get expired chunks: %w", err)

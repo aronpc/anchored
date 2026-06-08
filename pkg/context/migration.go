@@ -1,5 +1,30 @@
 package ctx
 
+// MigrationSQL014 adds the artifact store table and wires artifact_id into content_chunks.
+const MigrationSQL014 = `
+CREATE TABLE IF NOT EXISTS artifacts (
+    id              TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL DEFAULT '',
+    session_id      TEXT NOT NULL DEFAULT '',
+    type            TEXT NOT NULL,
+    source_tool     TEXT NOT NULL DEFAULT '',
+    source_label    TEXT NOT NULL DEFAULT '',
+    content_hash    TEXT NOT NULL DEFAULT '',
+    size_bytes      INTEGER NOT NULL DEFAULT 0,
+    ttl_expires_at  DATETIME,
+    created_at      DATETIME NOT NULL,
+    metadata        TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id, type, created_at);
+CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_artifacts_hash ON artifacts(content_hash) WHERE content_hash != '';
+
+ALTER TABLE content_chunks ADD COLUMN artifact_id TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_chunks_artifact ON content_chunks(artifact_id);
+`
+
 // Migration 009: project_id column for per-project isolation on existing databases.
 const MigrationSQL009 = `
 ALTER TABLE content_chunks ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
