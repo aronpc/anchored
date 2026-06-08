@@ -81,6 +81,35 @@ type PluginConfig struct {
 	// CacheDir overrides where Claude Code keeps the installed-plugin cache.
 	// Defaults to ~/.claude/plugins/cache/anchored/anchored.
 	CacheDir string `yaml:"cache_dir"`
+	// AutoRecall controls the UserPromptSubmit auto-recall injection:
+	//   "off"  — inject only the routing reminder (no retrieval)
+	//   "hits" — inject the routing reminder + top relevant memories (default)
+	//   "full" — "hits" plus recent artifacts (test reports, stack traces)
+	// Empty resolves to "hits".
+	AutoRecall string `yaml:"auto_recall"`
+	// HookBudgetBytes caps the size of the auto-recall context block. Lowest-
+	// relevance hits are dropped to fit rather than truncating mid-content.
+	// Empty/0 resolves to 4800 (~1200 tokens).
+	HookBudgetBytes int `yaml:"hook_budget_bytes"`
+}
+
+// AutoRecallMode resolves the configured mode to one of off|hits|full,
+// defaulting to "hits" for any empty/unknown value.
+func (p PluginConfig) AutoRecallMode() string {
+	switch p.AutoRecall {
+	case "off", "hits", "full":
+		return p.AutoRecall
+	default:
+		return "hits"
+	}
+}
+
+// HookBudget resolves the configured byte budget, defaulting to 4800.
+func (p PluginConfig) HookBudget() int {
+	if p.HookBudgetBytes > 0 {
+		return p.HookBudgetBytes
+	}
+	return 4800
 }
 
 // DebugConfig controls anchored's optional NDJSON event log.

@@ -32,6 +32,18 @@ type HookContext struct {
 // openHookContext opens the SQLite DB with WAL+busy_timeout and wires a
 // project detector against it. Caller must Close() when done.
 func openHookContext(configPath string) (*HookContext, error) {
+	return openHookContextMode(configPath, false)
+}
+
+// openHookContextReadOnly opens the DB read-only with a short busy timeout, so
+// a read-path hook (e.g. UserPromptSubmit auto-recall) never contends with the
+// MCP server's writer or blocks the user's prompt. The DB must already exist;
+// callers treat any open failure as "no context" and fall back gracefully.
+func openHookContextReadOnly(configPath string) (*HookContext, error) {
+	return openHookContextMode(configPath, true)
+}
+
+func openHookContextMode(configPath string, readOnly bool) (*HookContext, error) {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -41,6 +53,11 @@ func openHookContext(configPath string) (*HookContext, error) {
 	}
 
 	dsn := cfg.Memory.DatabasePath + "?_journal_mode=WAL&_busy_timeout=5000"
+	if readOnly {
+		// mode=ro opens an existing DB for reads only; a short busy timeout
+		// keeps the hook from stalling behind the writer.
+		dsn = cfg.Memory.DatabasePath + "?mode=ro&_busy_timeout=200"
+	}
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
