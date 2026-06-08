@@ -82,15 +82,23 @@ func runHookPostToolUse(args []string) {
 	}
 	defer hc.Close()
 
-	// Wire artifact capture to the content-optimizer store. Best-effort: any
-	// error is returned to the core, which falls back to the event-only path.
+	// Wire artifact capture to the content-optimizer store. AddArtifact ->
+	// InsertChunk uses prepared statements, so PrepareStatements MUST run
+	// first; on failure we leave capture nil and fall back to the event-only
+	// path rather than risk a nil-statement panic in the fail-safe hook.
+	var capture func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error)
 	artStore := ctxpkg.NewStore(hc.db, nil)
-	chunker := ctxpkg.NewChunker(4096)
-	capture := func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error) {
-		return artStore.AddArtifact(context.Background(), chunker, ctxpkg.ArtifactInput{
-			ProjectID: projectID, SessionID: sessionID, Type: artifactType,
-			SourceTool: sourceTool, SourceLabel: sourceLabel, Content: content,
-		}, 72) // 72h TTL: long enough to debug from, short enough to self-clean
+	if perr := artStore.PrepareStatements(); perr != nil {
+		slog.Warn("posttooluse: prepare statements failed; artifact capture disabled", "error", perr)
+		dlog.Event("hook.posttooluse", map[string]any{"stage": "artifact_prepare_failed", "error": perr.Error()})
+	} else {
+		chunker := ctxpkg.NewChunker(4096)
+		capture = func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error) {
+			return artStore.AddArtifact(context.Background(), chunker, ctxpkg.ArtifactInput{
+				ProjectID: projectID, SessionID: sessionID, Type: artifactType,
+				SourceTool: sourceTool, SourceLabel: sourceLabel, Content: content,
+			}, 72) // 72h TTL: long enough to debug from, short enough to self-clean
+		}
 	}
 
 	recordPostToolUseEvent(PostToolUseDeps{
