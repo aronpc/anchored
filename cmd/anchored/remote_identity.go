@@ -9,6 +9,27 @@ import (
 	"github.com/jholhewres/anchored/pkg/sync"
 )
 
+// policyHintLine renders a one-line advisory from the server's sync policy, or
+// "" when the server returned none (older server, or capability-less request).
+// Surfacing it after a push lets the user see why memories may be rejected
+// (blocked categories) and the batch cap, without a separate call.
+func policyHintLine(p *sync.PolicyHints) string {
+	if p == nil {
+		return ""
+	}
+	parts := make([]string, 0, 2)
+	if len(p.BlockedCategories) > 0 {
+		parts = append(parts, "blocked categories ["+strings.Join(p.BlockedCategories, " ")+"]")
+	}
+	if p.MaxMemoriesPerSync > 0 {
+		parts = append(parts, fmt.Sprintf("max %d per sync", p.MaxMemoriesPerSync))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "server policy: " + strings.Join(parts, "; ")
+}
+
 // buildNoProjectError formats the actionable failure for a claim-based sync
 // when no configured remote has a project matching the repository's keys. It
 // names exactly what was tried so the user can fix the right side (panel
