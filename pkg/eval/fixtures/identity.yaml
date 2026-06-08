@@ -1,0 +1,36 @@
+description: >
+  Project-identity invariants. Equivalent URL forms of the same repo must
+  resolve to one canonical remote key; distinct repos must never collide.
+  Hosts are generic (github.example.com / bitbucket.example.com) on purpose.
+cases:
+  - name: https_form
+    origin: "https://github.example.com/org/repo.git"
+
+  - name: scp_form
+    origin: "git@github.example.com:org/repo.git"
+    same_as: https_form
+
+  - name: ssh_form
+    origin: "ssh://git@github.example.com/org/repo.git"
+    same_as: https_form
+
+  - name: trailing_slash_and_no_git
+    origin: "https://github.example.com/org/repo/"
+    same_as: https_form
+
+  - name: different_repo
+    origin: "https://github.example.com/org/other.git"
+    must_differ: https_form
+
+  - name: bitbucket_https
+    origin: "https://bitbucket.example.com/proj/repo.git"
+
+  # v2 normalization strips a numeric port and a leading scm/ segment, so the
+  # Bitbucket Server SSH form collapses onto the plain https key.
+  - name: bitbucket_port_scm
+    origin: "ssh://git@bitbucket.example.com:7999/scm/proj/repo.git"
+    same_as: bitbucket_https
+
+  - name: bitbucket_other_host_differs
+    origin: "https://github.example.com/proj/repo.git"
+    must_differ: bitbucket_https
