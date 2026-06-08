@@ -31,6 +31,25 @@ type Memory struct {
 type SearchResult struct {
 	Memory Memory
 	Score  float64
+	// Signals explains why a result ranked where it did (e.g. "project",
+	// "working_set", "pinned", "fresh", "low_signal"). Populated only when
+	// SearchOptions.ExplainSignals is set; nil otherwise.
+	Signals []string `json:"signals,omitempty"`
+}
+
+// WorkingSetSignals is the retrieval-relevant projection of a session working
+// set: the files/symbols/entities currently in focus. Memories whose content or
+// keywords overlap these get a working-set boost. Kept dependency-free here so
+// pkg/memory never imports pkg/session.
+type WorkingSetSignals struct {
+	Files    []string
+	Symbols  []string
+	Entities []string
+}
+
+// Empty reports whether there are no focus tokens to boost on.
+func (w *WorkingSetSignals) Empty() bool {
+	return w == nil || len(w.Files)+len(w.Symbols)+len(w.Entities) == 0
 }
 
 type SearchOptions struct {
@@ -39,6 +58,11 @@ type SearchOptions struct {
 	ProjectID      string
 	BoostProjectID string // Project to boost in results (separate from filter)
 	Since          *time.Time
+	// WorkingSet, when set, boosts results overlapping the session's current
+	// focus (files/symbols/entities). Nil disables the boost.
+	WorkingSet *WorkingSetSignals
+	// ExplainSignals populates SearchResult.Signals with ranking rationale.
+	ExplainSignals bool
 }
 
 type ListOptions struct {

@@ -51,6 +51,14 @@ func ToolDefinitions() []Tool {
 						"type":        "string",
 						"description": "Usually OMIT this: when the project has a remote configured, remote results are merged into every search automatically. Set it only to search the remote EXCLUSIVELY (empty string or \"default\" for the default remote, or a named remote). Falls back to local on error.",
 					},
+					"session_id": map[string]any{
+						"type":        "string",
+						"description": "Optional. When provided, results are boosted toward the session's working set (files/symbols currently in focus).",
+					},
+					"debug": map[string]any{
+						"type":        "boolean",
+						"description": "Optional. When true, each hit includes its ranking signals (e.g. project, working_set, pinned, fresh) and score.",
+					},
 				},
 				"required": []string{"query"},
 			},

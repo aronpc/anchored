@@ -25,6 +25,30 @@ ALTER TABLE content_chunks ADD COLUMN artifact_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_chunks_artifact ON content_chunks(artifact_id);
 `
 
+// MigrationSQL015 adds the per-session working set: the files, symbols,
+// entities, commands, tests, errors and referenced memory/artifact ids that
+// describe what the current session is actively working on. Stored as JSON
+// arrays keyed by session_id so retrieval can boost memories that overlap the
+// live focus. Additive and idempotent.
+const MigrationSQL015 = `
+CREATE TABLE IF NOT EXISTS working_sets (
+    session_id   TEXT PRIMARY KEY,
+    project_id   TEXT NOT NULL DEFAULT '',
+    files        TEXT NOT NULL DEFAULT '[]',
+    symbols      TEXT NOT NULL DEFAULT '[]',
+    entities     TEXT NOT NULL DEFAULT '[]',
+    commands     TEXT NOT NULL DEFAULT '[]',
+    tests        TEXT NOT NULL DEFAULT '[]',
+    errors       TEXT NOT NULL DEFAULT '[]',
+    memory_ids   TEXT NOT NULL DEFAULT '[]',
+    artifact_ids TEXT NOT NULL DEFAULT '[]',
+    topic_key    TEXT NOT NULL DEFAULT '',
+    updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_working_sets_project ON working_sets(project_id);
+`
+
 // Migration 009: project_id column for per-project isolation on existing databases.
 const MigrationSQL009 = `
 ALTER TABLE content_chunks ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
