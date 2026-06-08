@@ -121,18 +121,13 @@ func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushRespon
 
 	req.Memories = filtered
 
-	// Advertise capabilities so the server returns its policy hints and
-	// artifact summaries. The presence of the object is the opt-in signal for
-	// policy; individual feature flags enable per-feature opt-ins. Set
-	// centrally here so every push path negotiates without each caller
-	// remembering to.
+	// Advertise capabilities so the server returns its policy hints. The
+	// presence of the object is the opt-in signal; the per-feature flags stay
+	// false until a later wave implements them. Set centrally here so every
+	// push path negotiates without each caller remembering to.
 	if req.ClientCapabilities == nil {
 		req.ClientCapabilities = &ClientCapabilities{}
 	}
-	// Always opt into artifact summaries: the server will only populate the
-	// field when accepted memories carry an artifact_id in their metadata, so
-	// enabling this flag on every push has no cost for memory-only pushes.
-	req.ClientCapabilities.ArtifactSummaries = true
 
 	body, err := json.Marshal(req)
 	if err != nil {
