@@ -223,7 +223,18 @@ func (s *Service) Search(ctx context.Context, query string, opts SearchOptions) 
 		return s.searcher.Search(ctx, query, opts)
 	}
 
-	return s.store.Search(ctx, query, opts)
+	// BM25-only fallback (no hybrid searcher): expand the raw query into a safe
+	// FTS expression so punctuation can't crash the match and multi-word queries
+	// OR their tokens — mirroring HybridSearcher.searchBM25 so this path has the
+	// same recall instead of FTS5's implicit-AND.
+	fts := ExpandQueryAdvanced(query)
+	if fts == "" {
+		fts = ExpandQueryForFTS(ExtractKeywords(query))
+	}
+	if fts == "" {
+		return nil, nil
+	}
+	return s.store.Search(ctx, fts, opts)
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*Memory, error) {

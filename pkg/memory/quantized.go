@@ -102,6 +102,32 @@ func (q QuantizedEmbedding) CosineSimilarity(query []float32, queryNorm float64)
 	return dot / (math.Sqrt(normSq) * queryNorm)
 }
 
+// NormSq returns the squared L2 norm of the stored vector in dequantized
+// space. It is invariant per stored vector, so callers that score the same
+// vector against many queries precompute sqrt(NormSq) once instead of
+// recomputing the sumD2/sumD loop on every CosineSimilarity call.
+func (q QuantizedEmbedding) NormSq() float64 {
+	var sumD2, sumD float64
+	for i := 0; i < q.Dims; i++ {
+		d := float64(q.Data[i])
+		sumD2 += d * d
+		sumD += d
+	}
+	s := float64(q.Scale)
+	m := float64(q.MinVal)
+	return s*s*sumD2 + 2*s*m*sumD + float64(q.Dims)*m*m
+}
+
+// CosineWithNorm is CosineSimilarity with the stored vector's norm
+// (sqrt(NormSq)) supplied by the caller, avoiding the per-call norm
+// recomputation. Returns bit-identical results to CosineSimilarity.
+func (q QuantizedEmbedding) CosineWithNorm(query []float32, queryNorm, storedNorm float64) float64 {
+	if len(query) != q.Dims || queryNorm == 0 || storedNorm == 0 {
+		return 0
+	}
+	return q.DotProduct(query) / (storedNorm * queryNorm)
+}
+
 const binaryHeaderSize = 12
 
 func (q QuantizedEmbedding) MarshalBinary() ([]byte, error) {
