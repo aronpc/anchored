@@ -33,9 +33,13 @@ func runHookPreToolUse(args []string) {
 
 	content, err := io.ReadAll(os.Stdin)
 	if err != nil {
+		// A stdin read failure is infrastructure, not a security threat —
+		// honor the fail-safe contract and allow rather than os.Exit(1), which
+		// would abort the user's tool call.
 		slog.Error("failed to read stdin", "error", err)
 		dlog.Event("hook.pretooluse", map[string]any{"stage": "stdin_error", "error": err.Error()})
-		os.Exit(1)
+		outputJSON(map[string]string{"decision": "allow"})
+		return
 	}
 
 	// Claude Code's canonical PreToolUse payload is {tool_name, tool_input,

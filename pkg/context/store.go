@@ -224,7 +224,10 @@ func (s *Store) SearchChunks(ctx context.Context, query string, maxResults int, 
 	terms := strings.Fields(query)
 	quoted := make([]string, len(terms))
 	for i, t := range terms {
-		quoted[i] = `"` + t + `"`
+		// Wrap each term as an FTS5 string literal, doubling embedded quotes so
+		// a term containing `"` cannot break out of the literal and inject FTS5
+		// operators (e.g. a crafted query running an arbitrary MATCH).
+		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
 	}
 	matchExpr := strings.Join(quoted, " ")
 

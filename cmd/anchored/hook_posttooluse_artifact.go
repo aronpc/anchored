@@ -3,6 +3,7 @@ package main
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Artifact-capture thresholds for posttooluse. Small outputs become a session
@@ -78,8 +79,9 @@ func artifactSourceLabel(toolName, input string) string {
 		return toolName
 	}
 	in = strings.ReplaceAll(in, "\n", " ")
-	if len(in) > 80 {
-		in = in[:80]
+	// Rune-aware cap so a multibyte (PT-BR/CJK) command isn't split mid-rune.
+	if utf8.RuneCountInString(in) > 80 {
+		in = string([]rune(in)[:80])
 	}
 	return in
 }

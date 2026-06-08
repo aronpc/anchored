@@ -52,12 +52,15 @@ func openHookContextMode(configPath string, readOnly bool) (*HookContext, error)
 		return nil, fmt.Errorf("ensure dirs: %w", err)
 	}
 
-	dsn := cfg.Memory.DatabasePath + "?_journal_mode=WAL&_busy_timeout=5000"
+	// busy_timeout is short on the read path so the hook never stalls the
+	// user's prompt; WAL lets readers run concurrently with the MCP writer
+	// without blocking it, so we keep WAL (not mode=ro, which can't reliably
+	// read another process's un-checkpointed WAL frames).
+	busy := "5000"
 	if readOnly {
-		// mode=ro opens an existing DB for reads only; a short busy timeout
-		// keeps the hook from stalling behind the writer.
-		dsn = cfg.Memory.DatabasePath + "?mode=ro&_busy_timeout=200"
+		busy = "200"
 	}
+	dsn := cfg.Memory.DatabasePath + "?_journal_mode=WAL&_busy_timeout=" + busy
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -66,6 +69,16 @@ func openHookContextMode(configPath string, readOnly bool) (*HookContext, error)
 	// are in flight from another `anchored` invocation. Hooks are short-lived
 	// so the cap is harmless.
 	db.SetMaxOpenConns(1)
+
+	if readOnly {
+		// Enforce read-only at the SQLite level on this (single) connection:
+		// query_only rejects any write, giving the genuine no-write guarantee
+		// the auto-recall hook wants while still reading WAL data reliably.
+		if _, err := db.Exec("PRAGMA query_only=ON"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set query_only: %w", err)
+		}
+	}
 
 	return &HookContext{
 		cfg:      cfg,

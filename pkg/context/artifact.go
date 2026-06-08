@@ -64,9 +64,14 @@ func (s *Store) AddArtifact(ctx context.Context, chunker *Chunker, in ArtifactIn
 		ttlExpiresAt = &t
 	}
 
-	metaBytes, err := json.Marshal(in.Metadata)
-	if err != nil || in.Metadata == nil {
-		metaBytes = []byte("{}")
+	// nil metadata is the valid default ({}); a marshal failure on non-nil
+	// metadata is a real error and must not be silently swallowed as {}.
+	metaBytes := []byte("{}")
+	if in.Metadata != nil {
+		metaBytes, err = json.Marshal(in.Metadata)
+		if err != nil {
+			return "", fmt.Errorf("marshal artifact metadata: %w", err)
+		}
 	}
 
 	_, err = s.db.ExecContext(ctx, `

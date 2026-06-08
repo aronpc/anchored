@@ -182,6 +182,15 @@ type preSearchHit struct {
 // returns up to `limit` hits. When categories are given, results are filtered
 // to those memory categories (the intent-aware boost); empty means no filter.
 func bm25TopHits(ctx context.Context, db *sql.DB, q string, projectID string, limit int, categories ...string) ([]preSearchHit, error) {
+	// FTS5's default operator between bare terms is AND, which makes a
+	// free-form prompt match only memories containing every word — almost
+	// never what we want for recall. OR the tokens so any overlapping term
+	// contributes, and let bm25() rank by how many/how strongly they match.
+	match := strings.Join(strings.Fields(q), " OR ")
+	if match == "" {
+		return nil, nil
+	}
+
 	sqlStmt := `
 		SELECT m.category, m.content
 		FROM memories_fts fts
@@ -189,7 +198,7 @@ func bm25TopHits(ctx context.Context, db *sql.DB, q string, projectID string, li
 		WHERE memories_fts MATCH ?
 		  AND m.deleted_at IS NULL
 		  AND (? = '' OR m.project_id = ?)`
-	args := []any{q, projectID, projectID}
+	args := []any{match, projectID, projectID}
 	if len(categories) > 0 {
 		placeholders := make([]string, len(categories))
 		for i, c := range categories {

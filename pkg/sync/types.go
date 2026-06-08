@@ -27,6 +27,9 @@ type SyncPushRequest struct {
 type ClientCapabilities struct {
 	PromotionQueue    bool `json:"promotion_queue,omitempty"`
 	TeamCache         bool `json:"team_cache,omitempty"`
+	// ArtifactSummaries is reserved for a later wave (artifact-summary sync);
+	// it stays false here so the server never emits the response plumbing,
+	// while the field reserves the wire name for forward compatibility.
 	ArtifactSummaries bool `json:"artifact_summaries,omitempty"`
 }
 
