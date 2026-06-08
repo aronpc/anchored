@@ -65,6 +65,8 @@ func main() {
 		runArtifact(os.Args[2:])
 	case "remote":
 		runRemote(os.Args[2:])
+	case "eval":
+		runEval(os.Args[2:])
 	case "--version", "-v":
 		fmt.Printf("anchored %s\n", Version)
 	case "--help", "-h":
