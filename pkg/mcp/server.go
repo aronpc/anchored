@@ -341,11 +341,51 @@ func (s *Server) toolContext(ctx context.Context, args json.RawMessage) (string,
 	// decision isn't buried under fresh low-signal noise; then keep the top 5.
 	recentMems = rankBundleMemories(recentMems, 5)
 
-	if identity == "" && projectID == "" && len(recentMems) == 0 && len(events) == 0 && len(rels) == 0 {
+	var wsSummary string
+	if s.sessions != nil && p.SessionID != "" {
+		if ws, wErr := s.sessions.GetWorkingSet(ctx, p.SessionID); wErr == nil && !ws.Empty() {
+			wsSummary = renderWorkingSet(ws)
+		}
+	}
+
+	if identity == "" && projectID == "" && len(recentMems) == 0 && len(events) == 0 && len(rels) == 0 && wsSummary == "" {
 		return "No memory context available yet. Save memories with anchored_save.", nil
 	}
 
-	return renderContextBundle(identity, projectName, projectPath, projectID, memCount, byCategory, recentMems, events, rels, anchoredContextBudget), nil
+	bundle := renderContextBundle(identity, projectName, projectPath, projectID, memCount, byCategory, recentMems, events, rels, anchoredContextBudget)
+	if wsSummary != "" {
+		bundle = bundle + "\n" + wsSummary
+	}
+	return bundle, nil
+}
+
+// renderWorkingSet emits a compact summary of the session's current focus so
+// the agent sees what's in flight (files being edited, tests run, current
+// error) at the top of a conversation. Lists are capped to keep the bundle
+// inside its budget.
+func renderWorkingSet(ws *session.WorkingSet) string {
+	take := func(items []string, n int) []string {
+		if len(items) > n {
+			return items[:n]
+		}
+		return items
+	}
+	var sb strings.Builder
+	sb.WriteString("<working_set>\n")
+	if f := take(ws.Files, 8); len(f) > 0 {
+		fmt.Fprintf(&sb, "  <files>%s</files>\n", escapeText(strings.Join(f, " ")))
+	}
+	if t := take(ws.Tests, 5); len(t) > 0 {
+		fmt.Fprintf(&sb, "  <tests>%s</tests>\n", escapeText(strings.Join(t, " ")))
+	}
+	if c := take(ws.Commands, 5); len(c) > 0 {
+		fmt.Fprintf(&sb, "  <commands>%s</commands>\n", escapeText(strings.Join(c, " ")))
+	}
+	if e := take(ws.Errors, 3); len(e) > 0 {
+		fmt.Fprintf(&sb, "  <errors>%s</errors>\n", escapeText(strings.Join(e, " ")))
+	}
+	sb.WriteString("</working_set>")
+	return sb.String()
 }
 
 // rankBundleMemories orders memories for the bootstrap bundle by a blend of
@@ -694,6 +734,11 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		// string field made `remote: ""` silently mean "local", which
 		// contradicted the tool schema.
 		Remote *string `json:"remote"`
+		// SessionID, when provided, lets the search boost memories that overlap
+		// the session's working set (files/symbols/entities in focus).
+		SessionID string `json:"session_id"`
+		// Debug surfaces per-result ranking signals and scores.
+		Debug bool `json:"debug"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
@@ -747,12 +792,24 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		boostProjectID = projectID
 	}
 
-	results, err := s.mem.Search(ctx, p.Query, memory.SearchOptions{
+	searchOpts := memory.SearchOptions{
 		MaxResults:     p.MaxResults,
 		Category:       p.Category,
 		ProjectID:      projectID,
 		BoostProjectID: boostProjectID,
-	})
+		ExplainSignals: p.Debug,
+	}
+	if p.SessionID != "" && s.sessions != nil {
+		if ws, wErr := s.sessions.GetWorkingSet(ctx, p.SessionID); wErr == nil && !ws.Empty() {
+			searchOpts.WorkingSet = &memory.WorkingSetSignals{
+				Files:    ws.Files,
+				Symbols:  ws.Symbols,
+				Entities: ws.Entities,
+			}
+		}
+	}
+
+	results, err := s.mem.Search(ctx, p.Query, searchOpts)
 	if err != nil {
 		return "", err
 	}
@@ -794,7 +851,7 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	}
 
 	if len(remoteHits) == 0 {
-		return renderSearchResults(p.Query, p.CWD == "", results), nil
+		return renderSearchResults(p.Query, p.CWD == "", results, p.Debug), nil
 	}
 
 	// Merged rendering: one envelope, local hits first, then remote hits
@@ -814,6 +871,9 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		}
 		if globalMode && r.Memory.ProjectID != nil && *r.Memory.ProjectID != "" {
 			attrs = append(attrs, fmt.Sprintf("project=%q", escapeAttr(*r.Memory.ProjectID)))
+		}
+		if p.Debug && len(r.Signals) > 0 {
+			attrs = append(attrs, fmt.Sprintf("signals=%q", escapeAttr(strings.Join(r.Signals, ","))))
 		}
 		fmt.Fprintf(&sb, "  <hit %s>%s</hit>\n", strings.Join(attrs, " "), escapeText(content))
 	}
@@ -847,7 +907,7 @@ func (s *Server) resolveRemoteEntry(selector, cwd string) *config.RemoteEntry {
 // attribute-level metadata + one entry per result. Score is rendered with
 // three decimals to keep the snippet stable across runs (BM25/RRF jitter at
 // the fourth decimal would create noisy diffs in tests).
-func renderSearchResults(query string, globalMode bool, results []memory.SearchResult) string {
+func renderSearchResults(query string, globalMode bool, results []memory.SearchResult, debug bool) string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "<anchored_search query=%q count=%q>\n",
 		truncateRunes(query, 200), fmt.Sprintf("%d", len(results)),
@@ -863,6 +923,9 @@ func renderSearchResults(query string, globalMode bool, results []memory.SearchR
 		)
 		if globalMode && r.Memory.ProjectID != nil && *r.Memory.ProjectID != "" {
 			attrs = append(attrs, fmt.Sprintf("project=%q", escapeAttr(*r.Memory.ProjectID)))
+		}
+		if debug && len(r.Signals) > 0 {
+			attrs = append(attrs, fmt.Sprintf("signals=%q", escapeAttr(strings.Join(r.Signals, ","))))
 		}
 		fmt.Fprintf(&sb, "  <hit %s>%s</hit>\n", strings.Join(attrs, " "), escapeText(content))
 	}

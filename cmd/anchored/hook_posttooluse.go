@@ -16,6 +16,7 @@ import (
 
 	ctxpkg "github.com/jholhewres/anchored/pkg/context"
 	"github.com/jholhewres/anchored/pkg/debuglog"
+	"github.com/jholhewres/anchored/pkg/session"
 )
 
 // postToolUseInsertSQL is exposed as a package-level constant so tests can
@@ -46,6 +47,10 @@ type PostToolUseDeps struct {
 	// returns its id. nil disables artifact capture (the event-only path).
 	// Production wires it to the artifact store; tests may stub or omit it.
 	CaptureArtifact func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error)
+	// UpdateWorkingSet records the files/commands/tests this tool call touched
+	// into the session working set so retrieval can boost in-focus memories.
+	// nil disables the update. Best-effort; errors never block the tool call.
+	UpdateWorkingSet func(sessionID, projectID string, files, commands, tests []string) error
 }
 
 // ExecContexter is the small slice of *sql.DB the hook actually needs;
@@ -101,17 +106,31 @@ func runHookPostToolUse(args []string) {
 		}
 	}
 
+	// Working-set feed: best-effort, shares the hook's DB. A failure to build
+	// the manager simply leaves the updater nil (event recording proceeds).
+	wsMgr := session.NewManager(hc.db, nil)
+	updateWorkingSet := func(sessionID, projectID string, files, commands, tests []string) error {
+		_, err := wsMgr.UpdateWorkingSet(context.Background(), sessionID, session.WorkingSetDelta{
+			ProjectID: projectID,
+			Files:     files,
+			Commands:  commands,
+			Tests:     tests,
+		})
+		return err
+	}
+
 	recordPostToolUseEvent(PostToolUseDeps{
-		Stdin:           os.Stdin,
-		Stdout:          os.Stdout,
-		DB:              hc.db,
-		ResolveProject:  hc.ResolveProject,
-		SessionIDFlag:   *sessionIDFlag,
-		CwdFlag:         *cwdFlag,
-		Now:             time.Now,
-		NewID:           newHookID,
-		Logger:          dlog,
-		CaptureArtifact: capture,
+		Stdin:            os.Stdin,
+		Stdout:           os.Stdout,
+		DB:               hc.db,
+		ResolveProject:   hc.ResolveProject,
+		SessionIDFlag:    *sessionIDFlag,
+		CwdFlag:          *cwdFlag,
+		Now:              time.Now,
+		NewID:            newHookID,
+		Logger:           dlog,
+		CaptureArtifact:  capture,
+		UpdateWorkingSet: updateWorkingSet,
 	})
 }
 
@@ -165,12 +184,25 @@ func recordPostToolUseEvent(deps PostToolUseDeps) {
 		projectID = deps.ResolveProject(cwdVal)
 	}
 
+	inputText := rawText(input.ToolInput)
+
+	// Feed the working set from this tool call (files edited, commands/tests
+	// run) so retrieval can boost in-focus memories. Best-effort: a failure is
+	// logged but never blocks the tool call.
+	if deps.UpdateWorkingSet != nil {
+		files, commands, tests := workingSetDelta(input.ToolName, inputText)
+		if len(files)+len(commands)+len(tests) > 0 {
+			if wErr := deps.UpdateWorkingSet(sessionID, projectID, files, commands, tests); wErr != nil {
+				dlog.Event("hook.posttooluse", map[string]any{"stage": "working_set_update_failed", "error": wErr.Error()})
+			}
+		}
+	}
+
 	// Large tool outputs become searchable artifacts instead of bloating the
 	// session-event summary. The event still records that an artifact was
 	// captured so the timeline stays complete. Best-effort: a capture failure
 	// falls through to the normal event path.
 	response := rawText(input.ToolResponse)
-	inputText := rawText(input.ToolInput)
 	if deps.CaptureArtifact != nil && len(response) > artifactMinBytes {
 		atype := classifyArtifact(input.ToolName, inputText, response)
 		label := artifactSourceLabel(input.ToolName, inputText)

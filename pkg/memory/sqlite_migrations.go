@@ -118,6 +118,7 @@ func Migrate(db *sql.DB) error {
 			INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
 		`},
 		{Name: "014_artifact_store", Up: ctxpkg.MigrationSQL014},
+		{Name: "015_working_sets", Up: ctxpkg.MigrationSQL015},
 	}
 
 	for _, m := range migrations {

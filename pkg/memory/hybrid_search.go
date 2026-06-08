@@ -89,6 +89,18 @@ func (h *HybridSearcher) Search(ctx context.Context, query string, opts ...Searc
 		fused = h.applyProjectBoost(fused, searchOpts.ProjectID)
 	}
 
+	if !searchOpts.WorkingSet.Empty() {
+		fused = applyWorkingSetBoost(fused, searchOpts.WorkingSet, searchOpts.ExplainSignals)
+	}
+
+	if searchOpts.ExplainSignals {
+		boostPID := searchOpts.BoostProjectID
+		if boostPID == "" {
+			boostPID = searchOpts.ProjectID
+		}
+		annotateBaseSignals(fused, boostPID, time.Now())
+	}
+
 	if cfg.MMREnabled {
 		mmrLambda := cfg.MMRLambda
 		if h.topicChangeDetector != nil {
@@ -323,6 +335,113 @@ func (h *HybridSearcher) applyProjectBoost(results []SearchResult, projectID str
 		}
 	}
 	return results
+}
+
+// workingSetBoost is the multiplier applied to a result whose content or
+// keywords overlap the session's current focus. Matches applyProjectBoost's
+// active-project boost so a focused, on-topic memory ranks comparably to one in
+// the active project.
+const workingSetBoost = 1.3
+
+// applyWorkingSetBoost multiplies the score of results that mention any token
+// from the working set (file basenames, symbols, entities) in their content or
+// keywords. Token matching is case-insensitive and substring-based; tokens
+// shorter than 3 runes are ignored to avoid spurious matches. When explain is
+// set, a "working_set" signal is appended to each boosted result.
+func applyWorkingSetBoost(results []SearchResult, ws *WorkingSetSignals, explain bool) []SearchResult {
+	tokens := workingSetTokens(ws)
+	if len(tokens) == 0 {
+		return results
+	}
+	for i := range results {
+		hay := strings.ToLower(results[i].Memory.Content + " " + strings.Join(results[i].Memory.Keywords, " "))
+		for _, tok := range tokens {
+			if strings.Contains(hay, tok) {
+				results[i].Score *= workingSetBoost
+				if explain {
+					results[i].Signals = appendSignal(results[i].Signals, "working_set")
+				}
+				break
+			}
+		}
+		if results[i].Score > 10.0 {
+			results[i].Score = 10.0
+		}
+	}
+	return results
+}
+
+// workingSetTokens flattens the working set into a lower-cased, deduped token
+// list. File paths contribute their basename (and basename without extension)
+// so a memory mentioning "client.go" matches a working-set entry of
+// "pkg/sync/client.go".
+func workingSetTokens(ws *WorkingSetSignals) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if len([]rune(s)) < 3 || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, f := range ws.Files {
+		base := f
+		if idx := strings.LastIndexAny(base, "/\\"); idx >= 0 {
+			base = base[idx+1:]
+		}
+		add(base) // full basename incl. extension, e.g. "client.go"
+		// The extension-stripped stem is only added when it's 4+ runes: short
+		// stems like "run" (from run.go) would substring-match unrelated words
+		// ("running", "runtime"); "client.go" itself is specific enough.
+		if dot := strings.LastIndex(base, "."); dot > 0 {
+			if stem := base[:dot]; len([]rune(stem)) >= 4 {
+				add(stem)
+			}
+		}
+	}
+	for _, s := range ws.Symbols {
+		add(s)
+	}
+	for _, e := range ws.Entities {
+		add(e)
+	}
+	return out
+}
+
+// annotateBaseSignals appends ranking-rationale signals derived from each
+// result's project membership and lifecycle metadata. Called only in explain
+// mode; it does not alter scores.
+func annotateBaseSignals(results []SearchResult, boostProjectID string, now time.Time) {
+	for i := range results {
+		pid := results[i].Memory.ProjectID
+		switch {
+		case boostProjectID != "" && pid != nil && *pid == boostProjectID:
+			results[i].Signals = appendSignal(results[i].Signals, "project")
+		case pid == nil || *pid == "":
+			results[i].Signals = appendSignal(results[i].Signals, "global")
+		}
+		meta := ParseMetadata(results[i].Memory.Metadata)
+		if meta.Pinned {
+			results[i].Signals = appendSignal(results[i].Signals, "pinned")
+		}
+		if meta.CurationStatus == CurationStatusLowSignal {
+			results[i].Signals = appendSignal(results[i].Signals, "low_signal")
+		}
+		if now.Sub(results[i].Memory.CreatedAt) <= 7*24*time.Hour {
+			results[i].Signals = appendSignal(results[i].Signals, "fresh")
+		}
+	}
+}
+
+func appendSignal(sigs []string, s string) []string {
+	for _, existing := range sigs {
+		if existing == s {
+			return sigs
+		}
+	}
+	return append(sigs, s)
 }
 
 func applyLifecycleBoost(results []SearchResult, now time.Time) []SearchResult {
