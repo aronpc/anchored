@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	ctxpkg "github.com/jholhewres/anchored/pkg/context"
 	"github.com/jholhewres/anchored/pkg/debuglog"
 )
 
@@ -32,15 +33,19 @@ const postToolUseInsertSQL = `INSERT INTO session_events
 // os.Stdin, stdout to os.Stdout, and DB+ResolveProject through HookContext;
 // tests pass an in-memory DB and a stub resolver.
 type PostToolUseDeps struct {
-	Stdin           io.Reader
-	Stdout          io.Writer
-	DB              ExecContexter
-	ResolveProject  func(cwd string) string
-	SessionIDFlag   string
-	CwdFlag         string
-	Now             func() time.Time
-	NewID           func() string
-	Logger          *debuglog.Logger
+	Stdin          io.Reader
+	Stdout         io.Writer
+	DB             ExecContexter
+	ResolveProject func(cwd string) string
+	SessionIDFlag  string
+	CwdFlag        string
+	Now            func() time.Time
+	NewID          func() string
+	Logger         *debuglog.Logger
+	// CaptureArtifact indexes a large tool output as a searchable artifact and
+	// returns its id. nil disables artifact capture (the event-only path).
+	// Production wires it to the artifact store; tests may stub or omit it.
+	CaptureArtifact func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error)
 }
 
 // ExecContexter is the small slice of *sql.DB the hook actually needs;
@@ -77,16 +82,28 @@ func runHookPostToolUse(args []string) {
 	}
 	defer hc.Close()
 
+	// Wire artifact capture to the content-optimizer store. Best-effort: any
+	// error is returned to the core, which falls back to the event-only path.
+	artStore := ctxpkg.NewStore(hc.db, nil)
+	chunker := ctxpkg.NewChunker(4096)
+	capture := func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error) {
+		return artStore.AddArtifact(context.Background(), chunker, ctxpkg.ArtifactInput{
+			ProjectID: projectID, SessionID: sessionID, Type: artifactType,
+			SourceTool: sourceTool, SourceLabel: sourceLabel, Content: content,
+		}, 72) // 72h TTL: long enough to debug from, short enough to self-clean
+	}
+
 	recordPostToolUseEvent(PostToolUseDeps{
-		Stdin:          os.Stdin,
-		Stdout:         os.Stdout,
-		DB:             hc.db,
-		ResolveProject: hc.ResolveProject,
-		SessionIDFlag:  *sessionIDFlag,
-		CwdFlag:        *cwdFlag,
-		Now:            time.Now,
-		NewID:          newHookID,
-		Logger:         dlog,
+		Stdin:           os.Stdin,
+		Stdout:          os.Stdout,
+		DB:              hc.db,
+		ResolveProject:  hc.ResolveProject,
+		SessionIDFlag:   *sessionIDFlag,
+		CwdFlag:         *cwdFlag,
+		Now:             time.Now,
+		NewID:           newHookID,
+		Logger:          dlog,
+		CaptureArtifact: capture,
 	})
 }
 
@@ -139,6 +156,36 @@ func recordPostToolUseEvent(deps PostToolUseDeps) {
 	if deps.ResolveProject != nil {
 		projectID = deps.ResolveProject(cwdVal)
 	}
+
+	// Large tool outputs become searchable artifacts instead of bloating the
+	// session-event summary. The event still records that an artifact was
+	// captured so the timeline stays complete. Best-effort: a capture failure
+	// falls through to the normal event path.
+	response := rawText(input.ToolResponse)
+	inputText := rawText(input.ToolInput)
+	if deps.CaptureArtifact != nil && len(response) > artifactMinBytes {
+		atype := classifyArtifact(input.ToolName, inputText, response)
+		label := artifactSourceLabel(input.ToolName, inputText)
+		if artID, aerr := deps.CaptureArtifact(projectID, sessionID, atype, input.ToolName, label, response); aerr == nil {
+			eventID := deps.NewID()
+			summary := fmt.Sprintf("captured %s artifact %s (%d bytes) — search with: anchored artifact search", atype, artID, len(response))
+			metadata := buildPostToolUseMetadata(cwdVal, input.HookEventName, len(body))
+			if _, derr := deps.DB.ExecContext(context.Background(), postToolUseInsertSQL,
+				eventID, sessionID, projectID, input.ToolName, summary, metadata); derr != nil {
+				dlog.Event("hook.posttooluse", map[string]any{"stage": "artifact_event_insert_failed", "error": derr.Error()})
+			}
+			dlog.Event("hook.posttooluse", map[string]any{
+				"stage": "artifact_captured", "session_id": sessionID, "project_id": projectID,
+				"artifact_id": artID, "artifact_type": atype, "bytes": len(response),
+			})
+			writePostToolUseResp(deps.Stdout, map[string]any{"recorded": true, "artifact_id": artID, "artifact_type": atype})
+			return
+		} else {
+			dlog.Event("hook.posttooluse", map[string]any{"stage": "artifact_capture_failed", "error": aerr.Error()})
+			// fall through to event-only path
+		}
+	}
+
 	summary := summarizeToolEvent(input.ToolResponse, input.ToolInput, 500)
 	metadata := buildPostToolUseMetadata(cwdVal, input.HookEventName, len(body))
 	eventID := deps.NewID()
@@ -226,6 +273,25 @@ func buildPostToolUseMetadata(cwd, hookEvent string, rawLen int) string {
 		meta = meta[:1024]
 	}
 	return string(meta)
+}
+
+// rawText returns the decoded string of a JSON value: a JSON string is
+// unquoted to its content (so a Bash tool_response that is a JSON string of
+// stdout is measured/classified by its real text), anything else is returned
+// as its compact JSON form.
+func rawText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return string(raw)
+	}
+	return buf.String()
 }
 
 func newHookID() string {
