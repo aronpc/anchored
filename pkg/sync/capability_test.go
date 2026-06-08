@@ -110,6 +110,43 @@ func TestSharedCapabilityVectorsPresent(t *testing.T) {
 	}
 }
 
+// TestPush_PartitionsLargeBatch verifies a push larger than maxPushBatch is
+// split into multiple requests (so the server's per-sync cap doesn't reject a
+// legitimate large store wholesale) and the results aggregate.
+func TestPush_PartitionsLargeBatch(t *testing.T) {
+	var requests, totalMemories int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Memories []SyncMemory `json:"memories"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		requests++
+		totalMemories += len(body.Memories)
+		// Echo accepted = batch size.
+		w.Write([]byte(`{"accepted":` + itoa(len(body.Memories)) + `,"rejected":0,"project_id":"rp-1"}`))
+	}))
+	defer srv.Close()
+
+	c := NewClientFromEntry(config.RemoteEntry{Name: "t", ServerURL: srv.URL, APIKey: "k"}, "cli")
+	mems := make([]SyncMemory, maxPushBatch*2+10) // forces 3 batches
+	for i := range mems {
+		mems[i] = SyncMemory{ID: "m" + itoa(i), Category: "decision", Content: "a substantive decision about the storage architecture number " + itoa(i)}
+	}
+	resp, err := c.Push(context.Background(), SyncPushRequest{ClientID: "cli", ProjectID: "rp-1", Memories: mems})
+	if err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if requests != 3 {
+		t.Fatalf("want 3 batched requests, got %d", requests)
+	}
+	if totalMemories != len(mems) {
+		t.Fatalf("server received %d memories, want %d", totalMemories, len(mems))
+	}
+	if resp.Accepted != len(mems) {
+		t.Fatalf("aggregated accepted = %d, want %d", resp.Accepted, len(mems))
+	}
+}
+
 // policyHintLineForTest re-implements the cmd-layer formatter so pkg/sync can
 // assert the hint shape without importing the command package.
 func policyHintLineForTest(p *PolicyHints) string {
