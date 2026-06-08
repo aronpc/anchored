@@ -762,6 +762,9 @@ func runRemoteSync(args []string) {
 			fmt.Fprintf(os.Stderr, "  error: %s\n", e)
 		}
 	}
+	if line := policyHintLine(resp.Policy); line != "" {
+		fmt.Println(line)
+	}
 
 	if proj != nil {
 		kgInst := kg.New(svc.StoreDB(), logger)

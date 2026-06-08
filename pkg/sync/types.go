@@ -15,6 +15,27 @@ type SyncPushRequest struct {
 	ProjectClaim *ProjectClaim `json:"project_claim,omitempty"`
 	Memories     []SyncMemory  `json:"memories"`
 	ProjectRoot  string        `json:"-"`
+	// ClientCapabilities advertises optional protocol features and, by its
+	// presence, opts into the server's Policy hints. Omitted -> the server
+	// responds exactly as it did before negotiation existed.
+	ClientCapabilities *ClientCapabilities `json:"client_capabilities,omitempty"`
+}
+
+// ClientCapabilities mirrors the server's negotiation struct. This wave only
+// the (empty) presence matters — it opts into policy hints; the feature flags
+// stay false until later waves implement them.
+type ClientCapabilities struct {
+	PromotionQueue    bool `json:"promotion_queue,omitempty"`
+	TeamCache         bool `json:"team_cache,omitempty"`
+	ArtifactSummaries bool `json:"artifact_summaries,omitempty"`
+}
+
+// PolicyHints is the server's advisory sync policy, returned only when the
+// request advertised ClientCapabilities. nil from older servers.
+type PolicyHints struct {
+	QualityThreshold   float64  `json:"quality_threshold"`
+	BlockedCategories  []string `json:"blocked_categories"`
+	MaxMemoriesPerSync int      `json:"max_memories_per_sync"`
 }
 
 // SyncMemory is a memory ready for remote sync (no embeddings, no local paths).
@@ -38,6 +59,23 @@ type SyncPushResponse struct {
 	// (e.g. PushTriples) when routing by project_claim, where the client
 	// doesn't know the remote ID upfront. Empty on older servers.
 	ProjectID string `json:"project_id,omitempty"`
+	// Policy is the server's advisory sync policy, present only when the
+	// request advertised capabilities and the server supports negotiation
+	// (>= v0.5.1). nil otherwise.
+	Policy *PolicyHints `json:"policy,omitempty"`
+	// ArtifactSummaries lists artifact IDs whose linked memories were accepted
+	// in this push. Only populated when the request advertised
+	// ClientCapabilities.ArtifactSummaries and the server supports it
+	// (>= v0.5.1). nil/empty otherwise.
+	ArtifactSummaries []ArtifactSummary `json:"artifact_summaries,omitempty"`
+}
+
+// ArtifactSummary is the server's acknowledgement for a single artifact whose
+// content was successfully pushed in the same sync batch.
+type ArtifactSummary struct {
+	// ArtifactID is the client-assigned artifact identifier echoed back by the
+	// server, taken from the "artifact_id" key in the accepted memory's Metadata.
+	ArtifactID string `json:"artifact_id"`
 }
 
 // SyncPullRequest requests new/updated memories from the server.
