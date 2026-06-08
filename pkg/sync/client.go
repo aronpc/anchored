@@ -119,8 +119,6 @@ func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushRespon
 		}, nil
 	}
 
-	req.Memories = filtered
-
 	// Advertise capabilities so the server returns its policy hints. The
 	// presence of the object is the opt-in signal; the per-feature flags stay
 	// false until a later wave implements them. Set centrally here so every
@@ -129,6 +127,48 @@ func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushRespon
 		req.ClientCapabilities = &ClientCapabilities{}
 	}
 
+	// Partition into batches under the server's per-sync cap (default 500) so
+	// a large store still syncs — an oversized single request is rejected
+	// wholesale by the server. Batches are sent sequentially and their results
+	// aggregated; the policy hint and resolved project come from the last one.
+	agg := &SyncPushResponse{}
+	for start := 0; start < len(filtered); start += maxPushBatch {
+		end := start + maxPushBatch
+		if end > len(filtered) {
+			end = len(filtered)
+		}
+		batch := req
+		batch.Memories = filtered[start:end]
+		resp, err := c.pushBatch(ctx, batch)
+		if err != nil {
+			return nil, err
+		}
+		agg.Accepted += resp.Accepted
+		agg.Rejected += resp.Rejected
+		agg.Errors = append(agg.Errors, resp.Errors...)
+		if resp.ProjectID != "" {
+			agg.ProjectID = resp.ProjectID
+		}
+		if resp.Policy != nil {
+			agg.Policy = resp.Policy
+		}
+	}
+
+	if len(rejections) > 0 {
+		agg.Rejected += len(rejections)
+		agg.Errors = append(agg.Errors, rejections...)
+	}
+
+	return agg, nil
+}
+
+// maxPushBatch caps how many memories the client sends per request. It sits
+// under the server's default per-sync cap (500) so a routine large-store push
+// is partitioned client-side instead of being rejected wholesale.
+const maxPushBatch = 400
+
+// pushBatch sends one already-filtered batch to the compat push endpoint.
+func (c *Client) pushBatch(ctx context.Context, req SyncPushRequest) (*SyncPushResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal push request: %w", err)
@@ -149,12 +189,6 @@ func (c *Client) Push(ctx context.Context, req SyncPushRequest) (*SyncPushRespon
 	if err := json.NewDecoder(resp.Body).Decode(&pushResp); err != nil {
 		return nil, fmt.Errorf("decode push response: %w", err)
 	}
-
-	if len(rejections) > 0 {
-		pushResp.Rejected += len(rejections)
-		pushResp.Errors = append(pushResp.Errors, rejections...)
-	}
-
 	return &pushResp, nil
 }
 
