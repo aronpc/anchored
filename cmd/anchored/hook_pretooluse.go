@@ -6,10 +6,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 
+	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
+	"github.com/jholhewres/anchored/pkg/memory"
 )
 
 // runHookPreToolUse inspects an anchored sandbox tool call before execution
@@ -55,6 +58,18 @@ func runHookPreToolUse(args []string) {
 	args2 := input.ToolInput
 	if args2 == nil {
 		args2 = input.Arguments
+	}
+
+	// Security: block writing a secret into a memory/instruction file. These
+	// files (CLAUDE.md, AGENTS.md, .cursor/rules) get committed and shared, so
+	// a leaked credential there is high-impact. Memory belongs in anchored
+	// (sanitized, never synced raw), so we point the user there instead.
+	// Fast path: only Write/Edit reach the body below; the file/secret checks
+	// short-circuit on non-memory paths before any real work.
+	if blocked, reason := memoryFileSecretBlock(tool, args2); blocked {
+		dlog.Event("hook.pretooluse", map[string]any{"stage": "blocked_memory_file_secret", "tool": tool})
+		outputJSON(map[string]string{"decision": "block", "reason": reason})
+		return
 	}
 
 	// Security checks for command execution tools
@@ -103,6 +118,44 @@ func runHookPreToolUse(args []string) {
 		"tool":  tool,
 	})
 	outputJSON(map[string]string{"decision": "allow"})
+}
+
+// memoryFileSecretRe matches the instruction/memory files whose content gets
+// committed and shared, so a secret written there leaks widely.
+var memoryFileRe = regexp.MustCompile(`(?i)(^|/)(claude\.md|agents\.md)$|\.cursor/rules`)
+
+// hookSecretSanitizer is an always-on secret detector for the pretooluse hook.
+// It is independent of the user's sanitizer.enabled config: blocking a secret
+// from landing in a shared file is a security floor, not an opt-in.
+var hookSecretSanitizer = memory.NewSanitizer(config.SanitizerConfig{Enabled: true})
+
+// memoryFileSecretBlock returns true when a Write/Edit targets a memory or
+// instruction file AND the new content contains something the sanitizer would
+// redact (a secret/credential). The message points at anchored_save, the safe
+// destination. Non-memory paths and clean content fall through fast.
+func memoryFileSecretBlock(tool string, args map[string]any) (bool, string) {
+	switch tool {
+	case "Write", "Edit", "MultiEdit":
+	default:
+		return false, ""
+	}
+	path, _ := args["file_path"].(string)
+	if path == "" || !memoryFileRe.MatchString(path) {
+		return false, ""
+	}
+	// Content to inspect: Write uses "content"; Edit uses "new_string".
+	content, _ := args["content"].(string)
+	if content == "" {
+		content, _ = args["new_string"].(string)
+	}
+	if content == "" {
+		return false, ""
+	}
+	if hookSecretSanitizer.Sanitize(content) == content {
+		return false, "" // nothing redactable -> no secret
+	}
+	return true, "writing a credential into " + filepath.Base(path) +
+		" would commit it to a shared file. Store it as memory instead — call anchored_save (sanitized, never synced raw), or remove the secret from this edit."
 }
 
 func checkDangerousPattern(code string) (blocked bool, pattern string) {
