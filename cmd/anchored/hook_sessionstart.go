@@ -138,7 +138,7 @@ func runHookSessionStart(args []string) {
 	}
 
 	// Rich path: assemble tiers via contextbudget.
-	tiers := buildSessionStartTiers(ctx, hc, resolvedSessionID, projectID)
+	tiers := buildSessionStartTiers(ctx, hc, resolvedSessionID, projectID, cwdVal)
 	richBlock, dropped := contextbudget.Assemble(tiers, budget)
 
 	if richBlock != "" {
@@ -157,7 +157,7 @@ func runHookSessionStart(args []string) {
 
 // buildSessionStartTiers assembles the five tiers for the rich context block.
 // Each tier is best-effort: any DB error causes that tier to be empty (fail-safe).
-func buildSessionStartTiers(ctx context.Context, hc *HookContext, sessionID, projectID string) []contextbudget.Tier {
+func buildSessionStartTiers(ctx context.Context, hc *HookContext, sessionID, projectID, cwd string) []contextbudget.Tier {
 	queryCtx, cancel := context.WithTimeout(ctx, sessionStartQueryTimeout)
 	defer cancel()
 
@@ -175,13 +175,22 @@ func buildSessionStartTiers(ctx context.Context, hc *HookContext, sessionID, pro
 	// ── Tier 2: decisions (pinned + decision/learning, top 5) ───────────────
 	decisionItems := queryDecisions(queryCtx, hc, projectID)
 
-	// ── Tier 3: task (working set) ───────────────────────────────────────────
+	// ── Tier 3: task (active task thread + working set) ─────────────────────
+	// The thread comes first: when the branch carries a ticket key, the
+	// session is registered on the thread and a compact cross-repo block is
+	// injected (what the same task touched in OTHER projects — references
+	// only, never the other repos' full data).
+	// queryCtx bounds the whole tier (upsert + cross-repo queries included):
+	// a contended DB must degrade to an empty tier, never hang the hook.
 	var taskItems []contextbudget.Item
+	mgr := session.NewManager(hc.db, nil)
+	if item, ok := taskThreadItem(queryCtx, hc, mgr, sessionID, projectID, cwd); ok {
+		taskItems = append(taskItems, item)
+	}
 	if sessionID != "" {
-		wsMgr := session.NewManager(hc.db, nil)
-		ws, err := wsMgr.GetWorkingSet(ctx, sessionID)
+		ws, err := mgr.GetWorkingSet(queryCtx, sessionID)
 		if err == nil && ws != nil && !ws.Empty() {
-			taskItems = []contextbudget.Item{{Text: renderWorkingSetCompact(ws), Priority: 0}}
+			taskItems = append(taskItems, contextbudget.Item{Text: renderWorkingSetCompact(ws), Priority: 1})
 		}
 	}
 
@@ -195,6 +204,114 @@ func buildSessionStartTiers(ctx context.Context, hc *HookContext, sessionID, pro
 		{Name: "task", Items: taskItems, MinItems: 0},
 		{Name: "events", Items: eventItems, MinItems: 0},
 	}
+}
+
+// taskThreadItem registers the session on the branch-inferred task thread and
+// renders the cross-repo block: the thread's key/status/journal plus what the
+// SAME task touched in OTHER projects (project names + their sessions' files,
+// capped) — references only, advisory by design. Returns ok=false when the
+// branch carries no ticket key or the thread is terminal.
+func taskThreadItem(ctx context.Context, hc *HookContext, mgr *session.Manager, sessionID, projectID, cwd string) (contextbudget.Item, bool) {
+	key := session.InferTaskKey(currentGitBranch(cwd))
+	if key == "" {
+		return contextbudget.Item{}, false
+	}
+	t, err := mgr.UpsertTaskThread(ctx, key, session.TaskThreadDelta{
+		ProjectID: projectID,
+		SessionID: sessionID,
+	})
+	if err != nil || t == nil || (t.Status != session.TaskStatusActive && t.Status != session.TaskStatusPaused) {
+		return contextbudget.Item{}, false
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "<task_thread key=%q status=%q projects=\"%d\"", t.TaskKey, t.Status, len(t.ProjectIDs))
+	if t.ExternalRef != "" {
+		fmt.Fprintf(&b, " ref=%q", sessionEscapeAttr(t.ExternalRef))
+	}
+	b.WriteString(">")
+	if len(t.Journal) > 0 {
+		n := len(t.Journal)
+		if n > 2 {
+			n = 2
+		}
+		for i := 0; i < n; i++ {
+			fmt.Fprintf(&b, "<note>%s</note>", escapeText(sessionTruncateRunes(t.Journal[i], 160)))
+		}
+	}
+	for _, line := range crossRepoLines(ctx, hc, t, projectID) {
+		b.WriteString(line)
+	}
+	b.WriteString("</task_thread>")
+	return contextbudget.Item{Text: b.String(), Priority: 0}, true
+}
+
+// crossRepoLines renders, for each OTHER project the thread touched, its name
+// and the most recent files its sessions worked on (cap 6 files, 3 projects).
+func crossRepoLines(ctx context.Context, hc *HookContext, t *session.TaskThread, currentProjectID string) []string {
+	if len(t.SessionIDs) == 0 {
+		return nil
+	}
+	var lines []string
+	count := 0
+	for _, pid := range t.ProjectIDs {
+		if pid == currentProjectID || pid == "" {
+			continue
+		}
+		if count >= 3 {
+			break
+		}
+		var name string
+		if err := hc.db.QueryRowContext(ctx,
+			`SELECT name FROM projects WHERE id = ?`, pid).Scan(&name); err != nil {
+			name = pid
+		}
+		var files string
+		_ = hc.db.QueryRowContext(ctx, `
+			SELECT files FROM working_sets
+			WHERE project_id = ? AND session_id IN (`+jsonListPlaceholders(len(t.SessionIDs))+`)
+			ORDER BY updated_at DESC LIMIT 1`,
+			append([]any{pid}, toAnySlice(t.SessionIDs)...)...).Scan(&files)
+		fileList := decodeFilesPreview(files, 6)
+		line := fmt.Sprintf("<also_touched project=%q", sessionEscapeAttr(name))
+		if fileList != "" {
+			line += fmt.Sprintf(" files=%q", sessionEscapeAttr(fileList))
+		}
+		line += "/>"
+		lines = append(lines, line)
+		count++
+	}
+	return lines
+}
+
+func jsonListPlaceholders(n int) string {
+	if n == 0 {
+		return "''"
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+func toAnySlice(in []string) []any {
+	out := make([]any, len(in))
+	for i, s := range in {
+		out[i] = s
+	}
+	return out
+}
+
+// decodeFilesPreview turns a JSON string list into "a, b, c" capped at max.
+func decodeFilesPreview(raw string, max int) string {
+	if raw == "" {
+		return ""
+	}
+	var items []string
+	if err := json.Unmarshal([]byte(raw), &items); err != nil || len(items) == 0 {
+		return ""
+	}
+	if len(items) > max {
+		items = items[:max]
+	}
+	return strings.Join(items, ", ")
 }
 
 // queryDirectives returns the user's standing rules: global directives plus
