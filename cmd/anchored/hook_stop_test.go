@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jholhewres/anchored/pkg/debuglog"
+	"github.com/jholhewres/anchored/pkg/memory"
+
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -556,5 +559,102 @@ func TestSaveLightweight_LockedDB_FailsFastWithinCap(t *testing.T) {
 	}
 	if elapsed > stopHardCap {
 		t.Errorf("locked save took %v, exceeds hard cap %v", elapsed, stopHardCap)
+	}
+}
+
+// ── Feature D: markUsedMemories ───────────────────────────────────────────────
+
+// newUsedTestDB builds a migrated DB with a working set pointing at seeded
+// memories, mirroring what recordInjection leaves behind.
+func newUsedTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if err := memory.Migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	for id, content := range map[string]string{
+		"mem-budgeter": "the contextbudget assembler keeps sessionstart injection bounded and deterministic",
+		"mem-postgres": "we settled on postgres for durable team storage on the server side",
+	} {
+		if _, err := db.Exec(
+			`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata)
+			 VALUES (?, 'proj1', 'decision', ?, '', datetime('now'), datetime('now'), '{}')`,
+			id, content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(
+		`INSERT INTO working_sets (session_id, project_id, memory_ids, updated_at)
+		 VALUES ('sess-u', 'proj1', '["mem-budgeter","mem-postgres"]', datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func usedCount(t *testing.T, db *sql.DB, id string) int {
+	t.Helper()
+	var n sql.NullInt64
+	if err := db.QueryRow(
+		`SELECT json_extract(metadata,'$.used_count') FROM memories WHERE id = ?`, id).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return int(n.Int64)
+}
+
+// TestMarkUsedMemories_OverlapBumpsOnlyUsed: turn text drawing on one memory
+// bumps only that memory's used_count.
+func TestMarkUsedMemories_OverlapBumpsOnlyUsed(t *testing.T) {
+	db := newUsedTestDB(t)
+	hc := &HookContext{db: db}
+	dlog := &debuglog.Logger{}
+
+	turn := "ajustei o contextbudget assembler para a sessionstart injection ficar deterministic com o budget novo"
+	n := markUsedMemories(context.Background(), hc, "sess-u", turn, dlog)
+	if n != 1 {
+		t.Fatalf("want 1 used memory, got %d", n)
+	}
+	if got := usedCount(t, db, "mem-budgeter"); got != 1 {
+		t.Errorf("mem-budgeter used_count = %d, want 1", got)
+	}
+	if got := usedCount(t, db, "mem-postgres"); got != 0 {
+		t.Errorf("mem-postgres used_count = %d, want 0 (unrelated)", got)
+	}
+}
+
+// TestMarkUsedMemories_UnrelatedTurnMarksNothing: generic text without the
+// memories' significant tokens marks nothing.
+func TestMarkUsedMemories_UnrelatedTurnMarksNothing(t *testing.T) {
+	db := newUsedTestDB(t)
+	hc := &HookContext{db: db}
+	if n := markUsedMemories(context.Background(), hc, "sess-u", "obrigado, pode seguir com a tarefa", &debuglog.Logger{}); n != 0 {
+		t.Fatalf("unrelated turn must mark 0, got %d", n)
+	}
+}
+
+// TestMarkUsedMemories_NoSessionNoWorkingSet: fail-safe paths return 0.
+func TestMarkUsedMemories_NoSessionNoWorkingSet(t *testing.T) {
+	db := newUsedTestDB(t)
+	hc := &HookContext{db: db}
+	if n := markUsedMemories(context.Background(), hc, "", "texto qualquer", &debuglog.Logger{}); n != 0 {
+		t.Errorf("empty session must return 0, got %d", n)
+	}
+	if n := markUsedMemories(context.Background(), hc, "sess-missing", "texto qualquer", &debuglog.Logger{}); n != 0 {
+		t.Errorf("missing working set must return 0, got %d", n)
+	}
+}
+
+func TestSignificantTokenSet_SplitsOnPunctuation(t *testing.T) {
+	set := significantTokenSet("call `contextbudget.Assemble(tiers, 7000)` before emit")
+	for _, want := range []string{"contextbudget", "assemble", "tiers", "before"} {
+		if !set[want] {
+			t.Errorf("missing token %q in %v", want, set)
+		}
+	}
+	if set["7000"] || set["call"] {
+		t.Errorf("short tokens must be dropped: %v", set)
 	}
 }
