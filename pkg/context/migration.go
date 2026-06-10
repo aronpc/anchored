@@ -49,6 +49,26 @@ CREATE TABLE IF NOT EXISTS working_sets (
 CREATE INDEX IF NOT EXISTS idx_working_sets_project ON working_sets(project_id);
 `
 
+// MigrationSQL016 adds cross-project task threads (Feature B): a task — a
+// Jira ticket, a Trello card, a branch-named unit of work — becomes a
+// first-class grouping that spans project boundaries. Threads are inferred
+// from branch names (feature/PROJ-123-...) or managed explicitly via
+// `anchored task`. Additive and idempotent; local-only (no sync in v1).
+const MigrationSQL016 = `
+CREATE TABLE IF NOT EXISTS task_threads (
+    task_key     TEXT PRIMARY KEY,
+    external_ref TEXT NOT NULL DEFAULT '',
+    project_ids  TEXT NOT NULL DEFAULT '[]',
+    journal      TEXT NOT NULL DEFAULT '[]',
+    session_ids  TEXT NOT NULL DEFAULT '[]',
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_threads_status ON task_threads(status);
+`
+
 // Migration 009: project_id column for per-project isolation on existing databases.
 const MigrationSQL009 = `
 ALTER TABLE content_chunks ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
