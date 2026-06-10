@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 
 	"github.com/jholhewres/anchored/pkg/contextbudget"
 	"github.com/jholhewres/anchored/pkg/memory"
+	"github.com/jholhewres/anchored/pkg/session"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -94,7 +96,7 @@ func TestBuildSessionStartTiers_FailSafeOnEmptyDB(t *testing.T) {
 	db := newSessionStartTestDB(t)
 	hc := &HookContext{db: db}
 
-	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj-none")
+	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj-none", "")
 	if len(tiers) != 5 {
 		t.Fatalf("want 5 tiers (standing_rules first), got %d", len(tiers))
 	}
@@ -159,7 +161,7 @@ func TestBuildSessionStartTiers_StandingRulesFirst(t *testing.T) {
 		insertSessionStartMem(t, db, fmt.Sprintf("m%d", i), "proj1", "decision", big, `{}`, false)
 	}
 
-	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj1")
+	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj1", "")
 	if tiers[0].Name != "standing_rules" {
 		t.Fatalf("tier 0 = %s, want standing_rules", tiers[0].Name)
 	}
@@ -189,5 +191,69 @@ func TestQueryDecisions_ExcludesDirectives(t *testing.T) {
 	}
 	if len(items) != 1 {
 		t.Errorf("want 1 decision, got %d", len(items))
+	}
+}
+
+// TestTaskThreadItem_CrossRepoInjection locks Feature B's core promise: when
+// the branch carries a ticket key, the sessionstart tier shows the thread AND
+// what the same task touched in OTHER projects (name + files), as references.
+func TestTaskThreadItem_CrossRepoInjection(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	db := newSessionStartTestDB(t)
+	hc := &HookContext{db: db}
+	mgr := session.NewManager(db, nil)
+	ctx := context.Background()
+
+	// Repo on a ticket branch.
+	repo := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q", repo},
+		{"-C", repo, "checkout", "-q", "-b", "feature/PROJ-77-cross-repo"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v (%s)", args, err, out)
+		}
+	}
+
+	// The same task already touched repoB (another project) in session sB.
+	if _, err := db.Exec(`INSERT INTO projects (id, name, path) VALUES ('projB', 'repo-b', '/tmp/repo-b')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO working_sets (session_id, project_id, files, updated_at)
+		VALUES ('sB', 'projB', '["api/handler.go","api/router.go"]', datetime('now'))`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.UpsertTaskThread(ctx, "PROJ-77", session.TaskThreadDelta{ProjectID: "projB", SessionID: "sB", JournalNote: "decided the wire format"}); err != nil {
+		t.Fatal(err)
+	}
+
+	item, ok := taskThreadItem(ctx, hc, mgr, "sA", "projA", repo)
+	if !ok {
+		t.Fatal("taskThreadItem should fire on a ticket branch")
+	}
+	for _, want := range []string{
+		`key="PROJ-77"`,
+		`project="repo-b"`,
+		"api/handler.go",
+		"decided the wire format",
+	} {
+		if !strings.Contains(item.Text, want) {
+			t.Errorf("cross-repo block missing %q\n--- block ---\n%s", want, item.Text)
+		}
+	}
+
+	// The session/project were registered on the thread.
+	th, _ := mgr.GetTaskThread(ctx, "PROJ-77")
+	if len(th.ProjectIDs) != 2 || len(th.SessionIDs) != 2 {
+		t.Fatalf("session not registered on thread: %+v", th)
+	}
+
+	// Non-ticket branch: no item.
+	repo2 := t.TempDir()
+	exec.Command("git", "init", "-q", repo2).Run()
+	if _, ok := taskThreadItem(ctx, hc, mgr, "sC", "projA", repo2); ok {
+		t.Error("non-ticket branch must not produce a task item")
 	}
 }
