@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/jholhewres/anchored/pkg/contextbudget"
 	"github.com/jholhewres/anchored/pkg/memory"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -93,16 +95,99 @@ func TestBuildSessionStartTiers_FailSafeOnEmptyDB(t *testing.T) {
 	hc := &HookContext{db: db}
 
 	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj-none")
-	if len(tiers) != 4 {
-		t.Fatalf("want 4 tiers, got %d", len(tiers))
+	if len(tiers) != 5 {
+		t.Fatalf("want 5 tiers (standing_rules first), got %d", len(tiers))
 	}
-	// decisions/task/events must be empty on a fresh DB (identity may pick up
-	// the developer's real ~/.anchored/identity.md, which is fine).
-	for _, tier := range tiers[1:] {
-		if tier.Name == "task" || tier.Name == "events" || tier.Name == "decisions" {
+	// standing_rules/decisions/task/events must be empty on a fresh DB
+	// (identity may pick up the developer's real ~/.anchored/identity.md,
+	// which is fine).
+	for _, tier := range tiers {
+		switch tier.Name {
+		case "standing_rules", "task", "events", "decisions":
 			if len(tier.Items) != 0 {
 				t.Errorf("tier %s should be empty on fresh DB, got %d items", tier.Name, len(tier.Items))
 			}
 		}
+	}
+}
+
+// TestQueryDirectives_ScopingAndOrder guards Feature A: global directives load
+// in every project, project-scoped ones only in theirs, soft-deleted and
+// non-directive rows are excluded, and order is stable (oldest first).
+func TestQueryDirectives_ScopingAndOrder(t *testing.T) {
+	db := newSessionStartTestDB(t)
+	hc := &HookContext{db: db}
+
+	insertSessionStartMem(t, db, "d1", "", "preference",
+		"never commit without an explicit request", `{"directive": true, "pinned": true}`, false)
+	insertSessionStartMem(t, db, "d2", "proj1", "preference",
+		"in this repo always run make lint before pushing", `{"directive": true}`, false)
+	insertSessionStartMem(t, db, "d3", "proj2", "preference",
+		"other project rule must not leak", `{"directive": true}`, false)
+	insertSessionStartMem(t, db, "d4", "", "preference",
+		"deleted rule must not appear", `{"directive": true}`, true)
+	insertSessionStartMem(t, db, "d5", "", "preference",
+		"a plain preference is not a directive", `{}`, false)
+
+	items := queryDirectives(context.Background(), hc, "proj1")
+	if len(items) != 2 {
+		t.Fatalf("want 2 directives (global + proj1), got %d: %+v", len(items), items)
+	}
+	if !strings.Contains(items[0].Text, "never commit") || !strings.Contains(items[0].Text, `scope="user"`) {
+		t.Errorf("first directive should be the global one with scope=user, got: %s", items[0].Text)
+	}
+	if !strings.Contains(items[1].Text, "make lint") || !strings.Contains(items[1].Text, `scope="project"`) {
+		t.Errorf("second directive should be project-scoped, got: %s", items[1].Text)
+	}
+	for _, it := range items {
+		if strings.Contains(it.Text, "must not leak") || strings.Contains(it.Text, "deleted rule") || strings.Contains(it.Text, "plain preference") {
+			t.Errorf("leaked excluded row: %s", it.Text)
+		}
+	}
+}
+
+// TestBuildSessionStartTiers_StandingRulesFirst ensures the directives tier is
+// tier 0 and survives the budget even with large lower tiers (MinItems).
+func TestBuildSessionStartTiers_StandingRulesFirst(t *testing.T) {
+	db := newSessionStartTestDB(t)
+	hc := &HookContext{db: db}
+
+	insertSessionStartMem(t, db, "d1", "", "preference",
+		"never push directly to main", `{"directive": true}`, false)
+	big := strings.Repeat("a long decision body ", 200)
+	for i := 0; i < 5; i++ {
+		insertSessionStartMem(t, db, fmt.Sprintf("m%d", i), "proj1", "decision", big, `{}`, false)
+	}
+
+	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj1")
+	if tiers[0].Name != "standing_rules" {
+		t.Fatalf("tier 0 = %s, want standing_rules", tiers[0].Name)
+	}
+	out, _ := contextbudget.Assemble(tiers, 2000)
+	if !strings.Contains(out, "never push directly to main") {
+		t.Error("standing rule must survive the budget ahead of large decisions")
+	}
+}
+
+// TestQueryDecisions_ExcludesDirectives guards the double-injection bug: a
+// pinned directive must appear only in the standing_rules tier, never also in
+// the decisions tier.
+func TestQueryDecisions_ExcludesDirectives(t *testing.T) {
+	db := newSessionStartTestDB(t)
+	hc := &HookContext{db: db}
+
+	insertSessionStartMem(t, db, "d1", "proj1", "preference",
+		"never push directly to main", `{"directive": true, "pinned": true}`, false)
+	insertSessionStartMem(t, db, "m1", "proj1", "decision",
+		"we settled on postgres", `{}`, false)
+
+	items := queryDecisions(context.Background(), hc, "proj1")
+	for _, it := range items {
+		if strings.Contains(it.Text, "never push directly") {
+			t.Fatalf("directive leaked into decisions tier: %s", it.Text)
+		}
+	}
+	if len(items) != 1 {
+		t.Errorf("want 1 decision, got %d", len(items))
 	}
 }
