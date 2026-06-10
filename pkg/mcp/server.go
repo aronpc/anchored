@@ -749,39 +749,77 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		limit = 10
 	}
 
-	// Explicit remote: query ONLY the remote server.
+	// Explicit remote: query ONLY the remote server. A failure here must be
+	// VISIBLE in the output — falling back to local silently makes the agent
+	// present local results as "the remote" and conclude things like "they
+	// are in sync" when the remote was never reached. remoteFallback* mark
+	// the local output when that happens.
+	var remoteFallbackName, remoteFallbackErr string
 	if p.Remote != nil && s.cfg != nil {
-		entry := s.resolveRemoteEntry(*p.Remote, p.CWD)
-		if entry != nil {
+		selector := *p.Remote
+		var entry *config.RemoteEntry
+		projectID := ""
+		if selector == "" || selector == "_" || selector == "default" {
+			// "the repo's remote": resolve exactly like sync routing does
+			// (git-origin probe across every configured remote), so a repo
+			// that syncs to a named server is searched THERE — not on the
+			// default config entry, which may have never heard of it.
+			rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
+			entry, projectID = s.resolveAutoRemoteTarget(rctx, p.CWD)
+			rcancel()
+			if entry == nil {
+				entry = s.resolveRemoteEntry(selector, p.CWD)
+			}
+		} else {
+			entry = s.resolveRemoteEntry(selector, p.CWD)
+		}
+
+		switch {
+		case entry == nil:
+			remoteFallbackName = selector
+			remoteFallbackErr = "remote not configured"
+		default:
 			client := remotesync.NewClientFromEntry(*entry, "mcp")
-			// Resolve the REMOTE project — the server only knows its own IDs.
-			// Same precedence as sync: git-origin remote_key first, linked
-			// project for non-repo contexts.
-			projectID, _ := s.resolveRemoteProjectID(ctx, client, *entry, p.CWD)
+			if projectID == "" {
+				// Resolve the REMOTE project — the server only knows its own
+				// IDs. Same precedence as sync: git-origin remote_key first,
+				// linked project for non-repo contexts.
+				projectID, _ = s.resolveRemoteProjectID(ctx, client, *entry, p.CWD)
+			}
+			if projectID == "" {
+				remoteFallbackName = entry.Name
+				remoteFallbackErr = "project not resolved on this remote (not linked or never synced)"
+				break
+			}
 			results, err := client.SearchRemote(ctx, projectID, p.Query, limit)
 			if err != nil {
-				if remotesync.IsRemoteForbidden(err) || remotesync.IsRemoteUnavailable(err) {
-					s.logger.Warn("remote search unavailable, falling back to local", "remote", entry.Name, "error", err)
-				} else {
-					s.logger.Warn("remote search failed, falling back to local", "remote", entry.Name, "error", err)
+				remoteFallbackName = entry.Name
+				switch {
+				case remotesync.IsRemoteForbidden(err):
+					remoteFallbackErr = "forbidden (check API key and scope)"
+				case remotesync.IsRemoteUnavailable(err):
+					remoteFallbackErr = "unreachable"
+				default:
+					remoteFallbackErr = "search failed"
 				}
-				// Fall through to local search below
-			} else {
-				if len(results) == 0 {
-					return "<anchored_search count=\"0\" remote=\"" + escapeAttr(entry.Name) + "\"/>", nil
-				}
-				var sb strings.Builder
-				fmt.Fprintf(&sb, "<anchored_search query=%q count=%q remote=%q>\n",
-					truncateRunes(p.Query, 200), fmt.Sprintf("%d", len(results)), escapeAttr(entry.Name))
-				for _, r := range results {
-					content := strings.ReplaceAll(r.Content, "\n", " ")
-					content = strings.ReplaceAll(content, "\r", " ")
-					fmt.Fprintf(&sb, "  <hit id=%q category=%q project=%q>%s</hit>\n",
-						r.ID, r.Category, r.ProjectID, escapeText(content))
-				}
-				sb.WriteString("</anchored_search>")
-				return sb.String(), nil
+				s.logger.Warn("remote search failed, returning local results marked as fallback",
+					"remote", entry.Name, "error", err)
+				break
 			}
+			if len(results) == 0 {
+				return "<anchored_search count=\"0\" remote=\"" + escapeAttr(entry.Name) + "\"/>", nil
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "<anchored_search query=%q count=%q remote=%q>\n",
+				truncateRunes(p.Query, 200), fmt.Sprintf("%d", len(results)), escapeAttr(entry.Name))
+			for _, r := range results {
+				content := strings.ReplaceAll(r.Content, "\n", " ")
+				content = strings.ReplaceAll(content, "\r", " ")
+				fmt.Fprintf(&sb, "  <hit id=%q category=%q project=%q>%s</hit>\n",
+					r.ID, r.Category, r.ProjectID, escapeText(content))
+			}
+			sb.WriteString("</anchored_search>")
+			return sb.String(), nil
 		}
 	}
 
@@ -846,12 +884,26 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		cancel()
 	}
 
+	// Explicit-remote failure: every local-rendered shape carries the
+	// remote_error + fallback attributes so the agent reports "the remote
+	// search failed (reason); showing local results" instead of presenting
+	// local data as remote.
+	fallbackAttrs := ""
+	if remoteFallbackErr != "" {
+		fallbackAttrs = fmt.Sprintf(" remote=%q remote_error=%q fallback=\"local\"",
+			escapeAttr(remoteFallbackName), escapeAttr(remoteFallbackErr))
+	}
+
 	if len(results) == 0 && len(remoteHits) == 0 {
-		return "<anchored_search count=\"0\"/>", nil
+		return "<anchored_search count=\"0\"" + fallbackAttrs + "/>", nil
 	}
 
 	if len(remoteHits) == 0 {
-		return renderSearchResults(p.Query, p.CWD == "", results, p.Debug), nil
+		out := renderSearchResults(p.Query, p.CWD == "", results, p.Debug)
+		if fallbackAttrs != "" {
+			out = strings.Replace(out, "<anchored_search ", "<anchored_search"+fallbackAttrs+" ", 1)
+		}
+		return out, nil
 	}
 
 	// Merged rendering: one envelope, local hits first, then remote hits

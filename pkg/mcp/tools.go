@@ -49,7 +49,7 @@ func ToolDefinitions() []Tool {
 					},
 					"remote": map[string]any{
 						"type":        "string",
-						"description": "Usually OMIT this: when the project has a remote configured, remote results are merged into every search automatically. Set it only to search the remote EXCLUSIVELY (empty string or \"default\" for the default remote, or a named remote). Falls back to local on error.",
+						"description": "Usually OMIT this: when the project has a remote configured, remote results are merged into every search automatically. Set it only to search a remote EXCLUSIVELY. Empty string or \"default\" means THIS REPO'S remote (resolved by git origin, the same routing sync uses — not necessarily a server named default); any other value is a server name from the config. If the remote search fails, local results come back marked with remote_error and fallback=\"local\" — report that to the user instead of presenting them as remote data.",
 					},
 					"session_id": map[string]any{
 						"type":        "string",
