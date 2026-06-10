@@ -91,6 +91,16 @@ type PluginConfig struct {
 	// relevance hits are dropped to fit rather than truncating mid-content.
 	// Empty/0 resolves to 4800 (~1200 tokens).
 	HookBudgetBytes int `yaml:"hook_budget_bytes"`
+	// SessionStartBudgetBytes caps the rich context block injected by the
+	// SessionStart hook. nil resolves to 7000 (~1750 tokens); an explicit 0
+	// disables the rich block entirely (restores the old plain format).
+	SessionStartBudgetBytes *int `yaml:"sessionstart_budget_bytes"`
+	// AutoSaveStop controls whether the Stop hook extracts and saves durable
+	// candidates at the end of each turn. nil resolves to true.
+	AutoSaveStop *bool `yaml:"auto_save_stop"`
+	// AdaptiveReminder controls whether the UserPromptSubmit hook adjusts
+	// the recall reminder based on the quality of the hits. nil resolves to true.
+	AdaptiveReminder *bool `yaml:"adaptive_reminder"`
 }
 
 // AutoRecallMode resolves the configured mode to one of off|hits|full,
@@ -110,6 +120,33 @@ func (p PluginConfig) HookBudget() int {
 		return p.HookBudgetBytes
 	}
 	return 4800
+}
+
+// SessionStartBudget resolves the SessionStart rich-block byte budget.
+// nil → 7000; explicit value (including 0) → that value.
+func (p PluginConfig) SessionStartBudget() int {
+	if p.SessionStartBudgetBytes != nil {
+		return *p.SessionStartBudgetBytes
+	}
+	return 7000
+}
+
+// AutoSaveStopEnabled reports whether the Stop hook should extract and save
+// durable candidates. nil → true.
+func (p PluginConfig) AutoSaveStopEnabled() bool {
+	if p.AutoSaveStop != nil {
+		return *p.AutoSaveStop
+	}
+	return true
+}
+
+// AdaptiveReminderEnabled reports whether the UserPromptSubmit hook should
+// adapt the recall reminder based on hit quality. nil → true.
+func (p PluginConfig) AdaptiveReminderEnabled() bool {
+	if p.AdaptiveReminder != nil {
+		return *p.AdaptiveReminder
+	}
+	return true
 }
 
 // DebugConfig controls anchored's optional NDJSON event log.
