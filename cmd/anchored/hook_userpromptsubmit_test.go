@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -674,5 +676,65 @@ func TestAutoRecallPreview_FailSafe(t *testing.T) {
 			}()
 			_ = autoRecallPreview(tc.config, tc.cwd, tc.prompt, tc.sessionID, nopLog)
 		})
+	}
+}
+
+// TestRecordInjection_TracksWorkingSetAndCount guards D-lite: injected memory
+// IDs land in the session working set and injected_count increments per
+// injection. Uses a real config file + migrated DB so the write path matches
+// production.
+func TestRecordInjection_TracksWorkingSetAndCount(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("memory:\n  database_path: "+dbPath+"\nembedding:\n  provider: none\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.Migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	for _, id := range []string{"mem-a", "mem-b"} {
+		if _, err := db.Exec(
+			`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata)
+			 VALUES (?, 'proj1', 'decision', 'content of '||?, '', datetime('now'), datetime('now'), '{}')`,
+			id, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	dlog := &debuglog.Logger{}
+	hits := []preSearchHit{{ID: "mem-a"}, {ID: "mem-b"}}
+	recordInjection(cfgPath, "sess-1", "proj1", hits, dlog)
+	recordInjection(cfgPath, "sess-1", "proj1", hits[:1], dlog)
+
+	check, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer check.Close()
+
+	var countA, countB int
+	if err := check.QueryRow(`SELECT json_extract(metadata,'$.injected_count') FROM memories WHERE id='mem-a'`).Scan(&countA); err != nil {
+		t.Fatalf("mem-a count: %v", err)
+	}
+	if err := check.QueryRow(`SELECT json_extract(metadata,'$.injected_count') FROM memories WHERE id='mem-b'`).Scan(&countB); err != nil {
+		t.Fatalf("mem-b count: %v", err)
+	}
+	if countA != 2 || countB != 1 {
+		t.Errorf("injected_count: mem-a=%d (want 2), mem-b=%d (want 1)", countA, countB)
+	}
+
+	var memIDs string
+	if err := check.QueryRow(`SELECT memory_ids FROM working_sets WHERE session_id='sess-1'`).Scan(&memIDs); err != nil {
+		t.Fatalf("working set: %v", err)
+	}
+	if !strings.Contains(memIDs, "mem-a") || !strings.Contains(memIDs, "mem-b") {
+		t.Errorf("working_sets.memory_ids should contain both IDs, got: %s", memIDs)
 	}
 }
