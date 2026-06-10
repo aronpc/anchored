@@ -105,6 +105,16 @@ func RecurateMetadata(m MemoryMetadata, content, category string, hasProject boo
 	score := ScoreQuality(content, category, hasProject)
 	changed := false
 
+	// One-time migration to scorer v3: injected_count accumulated before the
+	// used-signal existed (v0.8.x) would instantly demote memories that never
+	// had a chance to be marked used. Zero it once so every memory gets a
+	// fresh NeverUsedInjectionFloor window under the new regime.
+	if m.ScorerVersion < 3 && m.UsedCount == 0 && m.InjectedCount > 0 {
+		m.InjectedCount = 0
+		m.LastInjectedAt = ""
+		changed = true
+	}
+
 	if m.QualityScore != score {
 		m.QualityScore = score
 		changed = true
@@ -122,13 +132,25 @@ func RecurateMetadata(m MemoryMetadata, content, category string, hasProject boo
 
 	switch {
 	case score < threshold && !m.Pinned:
-		if m.CurationStatus != CurationStatusLowSignal {
+		if m.CurationStatus != CurationStatusLowSignal || m.CurationRule != CurationRuleQuality {
 			m.CurationStatus = CurationStatusLowSignal
+			m.CurationRule = CurationRuleQuality
+			changed = true
+		}
+	case m.InjectedCount >= NeverUsedInjectionFloor && m.UsedCount == 0 && !m.Pinned:
+		// Usage-feedback demotion (Feature D): the memory was put in front of
+		// the model many times and the turn text never drew on it. Advisory
+		// and reversible — a single use lifts it on the next recurate pass.
+		if m.CurationStatus != CurationStatusLowSignal || m.CurationRule != CurationRuleNeverUsed {
+			m.CurationStatus = CurationStatusLowSignal
+			m.CurationRule = CurationRuleNeverUsed
 			changed = true
 		}
 	case m.CurationStatus == CurationStatusLowSignal:
-		// Score recovered (or memory pinned): lift the demotion flag.
+		// Neither demotion condition holds anymore (score recovered, memory
+		// got used, or it was pinned): lift the flag.
 		m.CurationStatus = ""
+		m.CurationRule = ""
 		changed = true
 	}
 

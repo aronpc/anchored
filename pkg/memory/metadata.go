@@ -37,6 +37,15 @@ const (
 
 	CurationStatusLowSignal = "low_signal"
 
+	// CurationRule values explaining a low_signal demotion.
+	CurationRuleQuality   = "quality"    // mechanical quality score below threshold
+	CurationRuleNeverUsed = "never_used" // injected many times, never drawn on
+
+	// NeverUsedInjectionFloor is how many injections a memory gets before a
+	// zero used_count demotes it (Feature D). Generous on purpose: ten chances
+	// to prove useful before the feedback loop pulls it out of rotation.
+	NeverUsedInjectionFloor = 10
+
 	// RemoteQualityThreshold: minimum quality_score for remote sync eligibility.
 	// Referenced by preview, IsRemoteSyncCandidate, and hybrid search demotion.
 	RemoteQualityThreshold = 0.55
@@ -46,7 +55,8 @@ const (
 	// worker and `curation reconcile` treat any memory whose scorer_version is
 	// missing or lower than this as a candidate, so formula changes re-flow
 	// through the whole corpus instead of only touching brand-new memories.
-	QualityScorerVersion = 2
+	// v3: usage-feedback demotion (never_used) joined the recurate pass.
+	QualityScorerVersion = 3
 )
 
 // MemoryMetadata provides structured metadata for memories.
@@ -75,11 +85,28 @@ type MemoryMetadata struct {
 	ContextTier    string   `json:"context_tier,omitempty"` // "L0", "L1", "L2" context stack hint
 	Confidence     float64  `json:"confidence,omitempty"`   // 0.0..1.0 for bootstrap/import/inferred items
 	CurationStatus string   `json:"curation_status,omitempty"`
+	// CurationRule records WHY curation_status was set ("quality" or
+	// "never_used"), so the lift conditions don't conflict: a quality demotion
+	// lifts when the score recovers; a never_used demotion lifts when the
+	// memory is finally used. INVARIANT: must be cleared together with
+	// CurationStatus — never one without the other (RecurateMetadata is the
+	// canonical writer for both).
+	CurationRule string `json:"curation_rule,omitempty"`
 	// ScorerVersion records which ScoreQuality formula last curated this memory.
 	// Drives re-curation: a value below QualityScorerVersion means stale. Also
 	// acts as the "has been scored" marker so a legitimate quality_score of 0
 	// (omitempty would otherwise drop it) does not look like an unscored memory.
 	ScorerVersion int `json:"scorer_version,omitempty"`
+
+	// Usage-feedback fields (Feature D). InjectedCount/LastInjectedAt are
+	// written by the UserPromptSubmit hook when a memory is put in front of
+	// the model; UsedCount/LastUsedAt by the Stop hook when the turn's text
+	// actually drew on it. RecurateMetadata consumes the pair to demote
+	// always-injected-never-used memories.
+	InjectedCount  int    `json:"injected_count,omitempty"`
+	UsedCount      int    `json:"used_count,omitempty"`
+	LastInjectedAt string `json:"last_injected_at,omitempty"`
+	LastUsedAt     string `json:"last_used_at,omitempty"`
 
 	// Extra preserves unknown metadata keys from raw maps that are not
 	// represented in this struct. Not serialized directly; merged during
@@ -108,7 +135,12 @@ func (m MemoryMetadata) isZero() bool {
 		m.ContextTier == "" &&
 		m.Confidence == 0 &&
 		m.CurationStatus == "" &&
+		m.CurationRule == "" &&
 		m.ScorerVersion == 0 &&
+		m.InjectedCount == 0 &&
+		m.UsedCount == 0 &&
+		m.LastInjectedAt == "" &&
+		m.LastUsedAt == "" &&
 		len(m.Extra) == 0
 }
 
@@ -187,7 +219,9 @@ func ParseMetadata(v any) MemoryMetadata {
 			"memory_type":      true, "kind": true, "scope": true, "origin": true,
 			"importance": true, "pinned": true, "expires_at": true,
 			"supersedes": true, "context_tier": true, "confidence": true,
-			"curation_status": true, "scorer_version": true,
+			"curation_status": true, "curation_rule": true, "scorer_version": true,
+			"injected_count": true, "used_count": true,
+			"last_injected_at": true, "last_used_at": true,
 		}
 		for k, val := range raw {
 			if !knownKeys[k] {
