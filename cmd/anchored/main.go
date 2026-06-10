@@ -37,6 +37,8 @@ func main() {
 		runIdentity(os.Args[2:])
 	case "directives":
 		runDirectives(os.Args[2:])
+	case "task":
+		runTask(os.Args[2:])
 	case "config":
 		runConfig(os.Args[2:])
 	case "init":
