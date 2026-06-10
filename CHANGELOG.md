@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.1] - 2026-06-09
+
+### Added
+
+- **User directives (standing rules)** — `anchored directives add|list|rm`
+  manages short do/don't rules ("never commit without an explicit request").
+  They are first-party instructions, stored as pinned preference memories
+  marked `directive=true`, and the SessionStart hook injects them as the
+  **top tier** of the rich context block — always present, unranked, ahead of
+  identity/decisions — rendered as `<standing_rule scope="user|project">`
+  lines. Global rules load in every project; `--project` binds a rule to the
+  current repo. `rm` accepts a unique ID prefix and only matches
+  directive-marked rows.
+- **Injection tracking (usage-feedback capture)** — when auto-recall injects
+  memories, their IDs are merged into the session working set
+  (`working_sets.memory_ids`) and each memory's metadata gets
+  `injected_count`/`last_injected_at` bumped, on a best-effort 50ms write that
+  can never delay or fail the prompt. This is the data-collection half of the
+  usage feedback loop: a future curation pass can demote
+  always-injected-never-used memories, and "injected × used" becomes
+  measurable.
+
+### Fixed
+
+- `anchored directives rm` accepts flags after the positional ID
+  (`reorderArgsForFlag`), matching the other subcommands.
+
 ## [0.8.0] - 2026-06-09
 
 Push-based context injection: the hooks now put relevant memory in front of the
