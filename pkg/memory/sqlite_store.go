@@ -525,16 +525,21 @@ func scanMemoryRow(rows *sql.Rows) (*Memory, error) {
 	var lastAccessed sql.NullTime
 	var embeddingBlob []byte
 	var contentHash sql.NullString
+	// source is nullable in the schema; rows inserted outside Save (raw
+	// tooling, older imports) can carry NULL and must not break a full-corpus
+	// scan like `curation reconcile`.
+	var source sql.NullString
 	var syncOrigin, author, remoteProjectKey sql.NullString
 
 	err := rows.Scan(
-		&m.ID, &projectID, &m.Category, &m.Content, &contentHash, &keywordsStr, &embeddingBlob, &m.Source, &sourceID,
+		&m.ID, &projectID, &m.Category, &m.Content, &contentHash, &keywordsStr, &embeddingBlob, &source, &sourceID,
 		&m.CreatedAt, &m.UpdatedAt, &m.AccessCount, &lastAccessed, &metadataStr,
 		&m.SyncDirty, &syncOrigin, &author, &remoteProjectKey,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("scan memory row: %w", err)
 	}
+	m.Source = source.String
 
 	m.ProjectID = nilIfNull(projectID)
 	m.SourceID = nilIfNull(sourceID)
