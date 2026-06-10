@@ -155,22 +155,27 @@ func runHookSessionStart(args []string) {
 	emitSessionStart(additional)
 }
 
-// buildSessionStartTiers assembles the four tiers for the rich context block.
+// buildSessionStartTiers assembles the five tiers for the rich context block.
 // Each tier is best-effort: any DB error causes that tier to be empty (fail-safe).
 func buildSessionStartTiers(ctx context.Context, hc *HookContext, sessionID, projectID string) []contextbudget.Tier {
 	queryCtx, cancel := context.WithTimeout(ctx, sessionStartQueryTimeout)
 	defer cancel()
 
-	// ── Tier 0: identity ────────────────────────────────────────────────────
+	// ── Tier 0: standing rules (user directives) ─────────────────────────────
+	// First-party do/don't rules the user explicitly registered; injected
+	// unranked at the top so they never compete with recalled data.
+	ruleItems := queryDirectives(queryCtx, hc, projectID)
+
+	// ── Tier 1: identity ────────────────────────────────────────────────────
 	var identityItems []contextbudget.Item
 	if id := readSessionIdentity(); id != "" {
 		identityItems = []contextbudget.Item{{Text: id, Priority: 0}}
 	}
 
-	// ── Tier 1: decisions (pinned + decision/learning, top 5) ───────────────
+	// ── Tier 2: decisions (pinned + decision/learning, top 5) ───────────────
 	decisionItems := queryDecisions(queryCtx, hc, projectID)
 
-	// ── Tier 2: task (working set) ───────────────────────────────────────────
+	// ── Tier 3: task (working set) ───────────────────────────────────────────
 	var taskItems []contextbudget.Item
 	if sessionID != "" {
 		wsMgr := session.NewManager(hc.db, nil)
@@ -180,15 +185,59 @@ func buildSessionStartTiers(ctx context.Context, hc *HookContext, sessionID, pro
 		}
 	}
 
-	// ── Tier 3: recent events ────────────────────────────────────────────────
+	// ── Tier 4: recent events ────────────────────────────────────────────────
 	eventItems := queryRecentEvents(queryCtx, hc, projectID)
 
 	return []contextbudget.Tier{
+		{Name: "standing_rules", Items: ruleItems, MinItems: 4},
 		{Name: "identity", Items: identityItems, MinItems: 1},
 		{Name: "decisions", Items: decisionItems, MinItems: 1},
 		{Name: "task", Items: taskItems, MinItems: 0},
 		{Name: "events", Items: eventItems, MinItems: 0},
 	}
+}
+
+// queryDirectives returns the user's standing rules: global directives plus
+// the ones scoped to the current project, oldest first (stable order). Capped
+// at 8; terse one-line rules are expected. Fail-safe: errors return nil.
+func queryDirectives(ctx context.Context, hc *HookContext, projectID string) []contextbudget.Item {
+	rows, err := hc.db.QueryContext(ctx, `
+		SELECT content, COALESCE(project_id, '')
+		FROM memories
+		WHERE json_extract(metadata, '$.directive') = 1
+		  AND deleted_at IS NULL
+		  AND (project_id = '' OR project_id IS NULL OR project_id = ?)
+		ORDER BY created_at ASC
+		LIMIT 8`,
+		projectID,
+	)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var items []contextbudget.Item
+	for rows.Next() {
+		var content, pid string
+		if err := rows.Scan(&content, &pid); err != nil {
+			continue
+		}
+		content = strings.TrimSpace(content)
+		if content == "" {
+			continue
+		}
+		scope := "user"
+		if pid != "" {
+			scope = "project"
+		}
+		text := fmt.Sprintf("<standing_rule scope=%q>%s</standing_rule>",
+			scope, escapeText(content))
+		items = append(items, contextbudget.Item{Text: text, Priority: len(items)})
+	}
+	if err := rows.Err(); err != nil {
+		return nil
+	}
+	return items
 }
 
 // readSessionIdentity reads ~/.anchored/identity.md, capped at 600 runes.
@@ -216,6 +265,7 @@ func queryDecisions(ctx context.Context, hc *HookContext, projectID string) []co
 		  AND deleted_at IS NULL
 		  AND (COALESCE(json_extract(metadata, '$.pinned'), 0) = 1
 		       OR category IN ('decision', 'learning'))
+		  AND COALESCE(json_extract(metadata, '$.directive'), 0) != 1
 		  AND COALESCE(json_extract(metadata, '$.curation_status'), 'ok')
 		      NOT IN ('low_signal', 'near_duplicate', 'rejected')
 		ORDER BY COALESCE(json_extract(metadata, '$.pinned'), 0) DESC, created_at DESC

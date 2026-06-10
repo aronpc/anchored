@@ -35,6 +35,8 @@ func main() {
 		runStats(os.Args[2:])
 	case "identity":
 		runIdentity(os.Args[2:])
+	case "directives":
+		runDirectives(os.Args[2:])
 	case "config":
 		runConfig(os.Args[2:])
 	case "init":
