@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -14,7 +15,10 @@ import (
 
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/intent"
+	"github.com/jholhewres/anchored/pkg/kg"
+	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/mcp"
+	"github.com/jholhewres/anchored/pkg/session"
 )
 
 // preSearchTimeout caps how long we wait on the BM25 query so a slow DB
@@ -22,15 +26,21 @@ import (
 // always best-effort: missing hits fall back to the routing block alone.
 const preSearchTimeout = 150 * time.Millisecond
 
-// preSearchLimit is the max rows we return; small enough to fit in context
-// without bloat, big enough that two recent decisions + one fact still come
-// through.
-const preSearchLimit = 3
+// kgQueryTimeout caps the KG lookup added in G2.
+const kgQueryTimeout = 50 * time.Millisecond
+
+// preSearchLimit is the max candidate rows from BM25; the budget decides
+// how many survive into the rendered block. Raised from 3 → 5 in G2.
+const preSearchLimit = 5
 
 // recallMinTokens is the floor of meaningful tokens an unknown-intent prompt
 // must have before we run retrieval. Trivial prompts ("oi", "hi", "thanks")
 // sanitize below this and inject nothing but the reminder.
 const recallMinTokens = 3
+
+// anchorQueryCap is the total token cap for the expanded BM25 query.
+// Anchors take precedence over free-text tokens when the cap is exceeded.
+const anchorQueryCap = 24
 
 // runHookUserPromptSubmit injects the anchored routing block on every user
 // prompt and, when the prompt mentions memory/preferences/past work,
@@ -61,7 +71,7 @@ func runHookUserPromptSubmit(args []string) {
 	// puts relevant memories (and, for debugging, recent artifacts) in front of
 	// the model rather than hoping it calls anchored_search, and self-gates:
 	// trivial/unknown prompts inject nothing. Gated by plugin.auto_recall.
-	if preview := autoRecallPreview(*configPath, parsed.Cwd, parsed.Prompt, dlog); preview != "" {
+	if preview := autoRecallPreview(*configPath, parsed.Cwd, parsed.Prompt, parsed.SessionID, dlog); preview != "" {
 		additional += "\n\n" + preview
 	}
 
@@ -106,7 +116,7 @@ func categoriesForIntent(k intent.Kind) []string {
 // (test reports, stack traces). Returns "" on any failure, empty result, or
 // when auto_recall is off — it must NEVER prevent the prompt from going through
 // and must never exit non-zero.
-func autoRecallPreview(configPath, cwd, prompt string, dlog *debuglog.Logger) string {
+func autoRecallPreview(configPath, cwd, prompt, sessionID string, dlog *debuglog.Logger) string {
 	q := sanitizeFTSQuery(prompt)
 	if q == "" {
 		return ""
@@ -140,14 +150,40 @@ func autoRecallPreview(configPath, cwd, prompt string, dlog *debuglog.Logger) st
 	}
 	projectID := hc.ResolveProject(cwdVal)
 
+	// ── G2: extract file/symbol anchors from prompt ──────────────────────────
+	fileAnchors, symAnchors := extractAnchors(prompt)
+
+	// ── G2: working set for the session ──────────────────────────────────────
+	var wsSignals *memory.WorkingSetSignals
+	if sessionID != "" {
+		wsMgr := session.NewManager(hc.db, nil)
+		wsCtx, wsCancel := context.WithTimeout(context.Background(), preSearchTimeout)
+		ws, wsErr := wsMgr.GetWorkingSet(wsCtx, sessionID)
+		wsCancel()
+		if wsErr == nil && ws != nil && !ws.Empty() {
+			wsSignals = &memory.WorkingSetSignals{
+				Files:    ws.Files,
+				Symbols:  ws.Symbols,
+				Entities: ws.Entities,
+			}
+		}
+	}
+
+	// ── G2: build expanded query (anchors have precedence, cap 24) ──────────
+	expandedQ := buildExpandedQuery(q, fileAnchors, symAnchors, wsSignals)
+
 	ctx, cancel := context.WithTimeout(context.Background(), preSearchTimeout)
 	defer cancel()
 
-	hits, err := bm25TopHits(ctx, hc.db, q, projectID, preSearchLimit, categoriesForIntent(in.Kind)...)
+	hits, err := bm25TopHits(ctx, hc.db, expandedQ, projectID, preSearchLimit, categoriesForIntent(in.Kind)...)
 	if err != nil {
 		dlog.Event("hook.userpromptsubmit.recall", map[string]any{"stage": "query_failed", "error": err.Error()})
 		return ""
 	}
+
+	// ── G2: local re-rank — boost hits that mention anchor/working-set tokens ─
+	allAnchorTokens := anchorTokens(fileAnchors, symAnchors, wsSignals)
+	hits = reRankHits(hits, allAnchorTokens, fileAnchors, wsSignals)
 
 	// For debugging/test intents in "full" mode, surface the most recent
 	// captured artifacts so the model can pull the failing test output or
@@ -158,24 +194,381 @@ func autoRecallPreview(configPath, cwd, prompt string, dlog *debuglog.Logger) st
 	}
 
 	if len(hits) == 0 && len(arts) == 0 {
-		dlog.Event("hook.userpromptsubmit.recall", map[string]any{"stage": "no_hits", "intent": string(in.Kind), "query": debuglog.Snippet(q, 80)})
+		dlog.Event("hook.userpromptsubmit.recall", map[string]any{"stage": "no_hits", "intent": string(in.Kind), "query": debuglog.Snippet(expandedQ, 80)})
 		return ""
 	}
 
+	// ── G2: KG lookup for anchors ─────────────────────────────────────────────
+	var kgLine string
+	if len(fileAnchors)+len(symAnchors) > 0 {
+		kgLine = queryKGForAnchors(hc.db, fileAnchors, symAnchors, projectID)
+	}
+
 	dlog.Event("hook.userpromptsubmit.recall", map[string]any{
-		"stage":     "hits",
-		"intent":    string(in.Kind),
-		"hits":      len(hits),
-		"artifacts": len(arts),
-		"query":     debuglog.Snippet(q, 80),
-		"project":   projectID,
+		"stage":        "hits",
+		"intent":       string(in.Kind),
+		"hits":         len(hits),
+		"artifacts":    len(arts),
+		"query":        debuglog.Snippet(expandedQ, 80),
+		"project":      projectID,
+		"anchor_files": len(fileAnchors),
+		"anchor_syms":  len(symAnchors),
 	})
-	return renderRecallPreview(q, in.Kind, hits, arts, hc.cfg.Plugin.HookBudget())
+
+	// ── G2: adaptive reminder ────────────────────────────────────────────────
+	var adaptiveMode adaptiveReminderMode
+	if hc.cfg.Plugin.AdaptiveReminderEnabled() {
+		adaptiveMode = classifyAdaptiveReminder(hits)
+	}
+
+	return renderRecallPreview(expandedQ, in.Kind, hits, arts, kgLine, adaptiveMode, hc.cfg.Plugin.HookBudget())
 }
 
+// adaptiveReminderMode controls which reminder variant to emit.
+type adaptiveReminderMode int
+
+const (
+	adaptiveReminderDefault adaptiveReminderMode = iota // standard reminder (unchanged)
+	adaptiveReminderStrong                              // >= 1 boosted hit: "memories injected — consult before exploring"
+	adaptiveReminderShort                               // 0 hits: short 1-line reminder
+)
+
+// classifyAdaptiveReminder decides the reminder mode based on hit signals.
+func classifyAdaptiveReminder(hits []preSearchHit) adaptiveReminderMode {
+	if len(hits) == 0 {
+		return adaptiveReminderShort
+	}
+	for _, h := range hits {
+		for _, sig := range h.Signals {
+			if sig == "file_anchor" || sig == "working_set" {
+				return adaptiveReminderStrong
+			}
+		}
+	}
+	return adaptiveReminderDefault
+}
+
+// preSearchHit is a BM25 hit with optional explainability signals.
 type preSearchHit struct {
 	Category string
 	Content  string
+	Signals  []string // e.g. "file_anchor", "working_set"
+}
+
+// extractAnchors extracts file-path tokens and symbol tokens from a prompt.
+//
+// File anchor: token contains '/' and ends in .<ext> (1-5 alphanum chars),
+// OR token has no '/' but ends in .<ext> (e.g. "foo.go").
+// Symbol: identifier that is CamelCase or snake_case with >= 4 runes and
+// does not look like a plain word (has uppercase after start OR contains '_').
+func extractAnchors(prompt string) (fileAnchors []string, symAnchors []string) {
+	seen := make(map[string]bool)
+	for _, tok := range strings.Fields(prompt) {
+		// Strip surrounding punctuation but keep internal . / _
+		tok = strings.Trim(tok, "\"'`()[]{},:;!?")
+		if tok == "" {
+			continue
+		}
+		if isFileAnchor(tok) {
+			base := fileBasename(tok)
+			if !seen[base] {
+				seen[base] = true
+				fileAnchors = append(fileAnchors, tok)
+			}
+			continue
+		}
+		if isSymbolAnchor(tok) {
+			low := strings.ToLower(tok)
+			if !seen["sym:"+low] {
+				seen["sym:"+low] = true
+				symAnchors = append(symAnchors, tok)
+			}
+		}
+	}
+	return
+}
+
+// isFileAnchor returns true if tok looks like a file path reference.
+func isFileAnchor(tok string) bool {
+	hasSlash := strings.ContainsAny(tok, "/\\")
+	dotIdx := strings.LastIndex(tok, ".")
+	if dotIdx < 0 {
+		return false
+	}
+	ext := tok[dotIdx+1:]
+	if len(ext) < 1 || len(ext) > 5 {
+		return false
+	}
+	for _, r := range ext {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	if hasSlash {
+		return true
+	}
+	// No slash: only a file if there's at least one non-dot char before the ext
+	return dotIdx > 0
+}
+
+// isSymbolAnchor returns true if tok looks like a CamelCase or snake_case identifier.
+func isSymbolAnchor(tok string) bool {
+	runes := []rune(tok)
+	if len(runes) < 4 {
+		return false
+	}
+	// Must be purely letters/digits/underscore
+	for _, r := range runes {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			return false
+		}
+	}
+	// CamelCase: has uppercase after the first rune
+	for _, r := range runes[1:] {
+		if unicode.IsUpper(r) {
+			return true
+		}
+	}
+	// snake_case: contains underscore
+	return strings.Contains(tok, "_")
+}
+
+// fileBasename returns the basename of a file path token.
+func fileBasename(tok string) string {
+	base := filepath.Base(tok)
+	return strings.ToLower(base)
+}
+
+// anchorTokens flattens fileAnchors, symAnchors, and wsSignals into the
+// deduped lower-cased set of tokens used for re-ranking.
+func anchorTokens(fileAnchors, symAnchors []string, ws *memory.WorkingSetSignals) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if len([]rune(s)) < 3 || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, f := range fileAnchors {
+		base := fileBasename(f)
+		add(base)
+		if dot := strings.LastIndex(base, "."); dot > 0 {
+			if stem := base[:dot]; len([]rune(stem)) >= 4 {
+				add(stem)
+			}
+		}
+	}
+	for _, s := range symAnchors {
+		add(s)
+	}
+	if ws != nil {
+		for _, f := range ws.Files {
+			base := fileBasename(f)
+			add(base)
+			if dot := strings.LastIndex(base, "."); dot > 0 {
+				if stem := base[:dot]; len([]rune(stem)) >= 4 {
+					add(stem)
+				}
+			}
+		}
+		for _, s := range ws.Symbols {
+			add(s)
+		}
+		for _, e := range ws.Entities {
+			add(e)
+		}
+	}
+	return out
+}
+
+// buildExpandedQuery builds a BM25 query string from free-text tokens plus
+// anchor tokens. Anchor tokens have precedence; total capped at anchorQueryCap.
+func buildExpandedQuery(freeText string, fileAnchors, symAnchors []string, ws *memory.WorkingSetSignals) string {
+	// Anchor tokens first (deduplicated, sanitized for FTS).
+	anchorToks := anchorTokens(fileAnchors, symAnchors, ws)
+	var sanitizedAnchors []string
+	for _, tok := range anchorToks {
+		san := sanitizeFTSQuery(tok)
+		if san != "" {
+			sanitizedAnchors = append(sanitizedAnchors, strings.Fields(san)...)
+		}
+	}
+
+	// Free-text tokens (already sanitized).
+	freeToks := strings.Fields(freeText)
+
+	// Merge: anchors first, then fill with free-text up to cap. The cap also
+	// bounds the anchor loop itself — a 50-file working set would otherwise
+	// produce an uncapped OR query that degrades BM25 (everything matches
+	// weakly) and risks the FTS5 parser limits.
+	seen := make(map[string]bool)
+	var combined []string
+	for _, t := range sanitizedAnchors {
+		if len(combined) >= anchorQueryCap {
+			break
+		}
+		if !seen[t] {
+			seen[t] = true
+			combined = append(combined, t)
+		}
+	}
+	for _, t := range freeToks {
+		if len(combined) >= anchorQueryCap {
+			break
+		}
+		if !seen[t] {
+			seen[t] = true
+			combined = append(combined, t)
+		}
+	}
+	if len(combined) == 0 {
+		return freeText
+	}
+	return strings.Join(combined, " ")
+}
+
+// reRankHits applies a local 1.3x boost to hits that mention anchor/ws tokens
+// and annotates signals. The input slice is modified in-place and returned
+// sorted by descending pseudo-score (boosted hits first).
+func reRankHits(hits []preSearchHit, allTokens []string, fileAnchors []string, ws *memory.WorkingSetSignals) []preSearchHit {
+	if len(allTokens) == 0 {
+		return hits
+	}
+
+	// Build separate sets for file-anchor tokens and ws tokens for signal labelling.
+	fileSet := make(map[string]bool)
+	for _, f := range fileAnchors {
+		base := strings.ToLower(fileBasename(f))
+		fileSet[base] = true
+		if dot := strings.LastIndex(base, "."); dot > 0 {
+			if stem := base[:dot]; len([]rune(stem)) >= 4 {
+				fileSet[stem] = true
+			}
+		}
+	}
+
+	wsTokenSet := make(map[string]bool)
+	if ws != nil {
+		for _, tok := range anchorTokens(nil, nil, ws) {
+			wsTokenSet[tok] = true
+		}
+	}
+
+	scoredHits := make([]scoredHit, len(hits))
+	for i, h := range hits {
+		hay := strings.ToLower(h.Content)
+		s := scoredHit{hit: h, score: float64(len(hits) - i), order: i} // base score: BM25 rank
+		boosted := false
+		for _, tok := range allTokens {
+			if strings.Contains(hay, tok) {
+				if !boosted {
+					s.score *= 1.3
+					boosted = true
+				}
+				if fileSet[tok] {
+					s.hit.Signals = appendUnique(s.hit.Signals, "file_anchor")
+				} else if wsTokenSet[tok] {
+					s.hit.Signals = appendUnique(s.hit.Signals, "working_set")
+				}
+			}
+		}
+		scoredHits[i] = s
+	}
+
+	// Stable sort: higher score first; ties preserve BM25 order.
+	stableSort(scoredHits)
+
+	out := make([]preSearchHit, len(scoredHits))
+	for i, s := range scoredHits {
+		out[i] = s.hit
+	}
+	return out
+}
+
+// scoredHit wraps a preSearchHit with a floating-point score and original
+// position for stable sort during re-ranking.
+type scoredHit struct {
+	hit   preSearchHit
+	score float64
+	order int
+}
+
+// stableSort sorts a slice of scored hits by score descending, preserving
+// original order for ties (insertion sort is fine for N<=5).
+func stableSort(items []scoredHit) {
+	n := len(items)
+	for i := 1; i < n; i++ {
+		key := items[i]
+		j := i - 1
+		for j >= 0 && (items[j].score < key.score || (items[j].score == key.score && items[j].order > key.order)) {
+			items[j+1] = items[j]
+			j--
+		}
+		items[j+1] = key
+	}
+}
+
+func appendUnique(sigs []string, s string) []string {
+	for _, existing := range sigs {
+		if existing == s {
+			return sigs
+		}
+	}
+	return append(sigs, s)
+}
+
+// queryKGForAnchors queries the KG for up to 2 triples matching anchor tokens.
+// Returns a compact `<anchored_kg>` line or "" when nothing found or on error.
+func queryKGForAnchors(db *sql.DB, fileAnchors, symAnchors []string, projectID string) string {
+	kgInst := kg.New(db, nil)
+
+	candidates := make([]string, 0, len(fileAnchors)+len(symAnchors))
+	for _, f := range fileAnchors {
+		base := fileBasename(f)
+		if dot := strings.LastIndex(base, "."); dot > 0 {
+			candidates = append(candidates, base[:dot])
+		}
+		candidates = append(candidates, base)
+	}
+	for _, s := range symAnchors {
+		candidates = append(candidates, s)
+	}
+
+	var allTriples []string
+	seen := make(map[string]bool)
+	for _, name := range candidates {
+		if len(allTriples) >= 2 {
+			break
+		}
+		kgCtx, kgCancel := context.WithTimeout(context.Background(), kgQueryTimeout)
+		var pid *string
+		if projectID != "" {
+			p := projectID
+			pid = &p
+		}
+		triples, err := kgInst.Query(kgCtx, name, pid)
+		kgCancel()
+		if err != nil || len(triples) == 0 {
+			continue
+		}
+		for _, tr := range triples {
+			if len(allTriples) >= 2 {
+				break
+			}
+			line := tr.Subject + " " + tr.Predicate + " " + tr.Object
+			if !seen[line] {
+				seen[line] = true
+				allTriples = append(allTriples, escapeText(line))
+			}
+		}
+	}
+	if len(allTriples) == 0 {
+		return ""
+	}
+	return "<anchored_kg>" + strings.Join(allTriples, "; ") + "</anchored_kg>"
 }
 
 // bm25TopHits runs a project-scoped (with global fallback) BM25 query and
@@ -307,25 +700,48 @@ func sanitizeFTSQuery(s string) string {
 }
 
 // renderRecallPreview renders the recall block under a byte budget. Hits are
-// already relevance-ordered (best BM25 first); when the block would exceed the
-// budget we drop the lowest-relevance trailing hits rather than truncating a
-// hit mid-content, so what survives is always coherent and the most relevant.
-func renderRecallPreview(query string, kind intent.Kind, hits []preSearchHit, arts []recentArtifact, budget int) string {
+// already relevance-ordered (best/boosted first after re-rank); when the block
+// would exceed the budget we drop the lowest-relevance trailing hits rather
+// than truncating a hit mid-content, so what survives is always coherent and
+// the most relevant.
+func renderRecallPreview(query string, kind intent.Kind, hits []preSearchHit, arts []recentArtifact, kgLine string, adaptive adaptiveReminderMode, budget int) string {
 	render := func(hh []preSearchHit) string {
 		var sb strings.Builder
-		fmt.Fprintf(&sb, "<anchored_recall intent=%q query=%q count=%q>\n",
-			escapeText(string(kind)), truncateRunes(query, 80), fmt.Sprintf("%d", len(hh)))
+		sigStr := signalsAttr(hh)
+		if sigStr != "" {
+			fmt.Fprintf(&sb, "<anchored_recall intent=%q query=%q count=%q signals=%q>\n",
+				escapeText(string(kind)), truncateRunes(query, 80), fmt.Sprintf("%d", len(hh)), sigStr)
+		} else {
+			fmt.Fprintf(&sb, "<anchored_recall intent=%q query=%q count=%q>\n",
+				escapeText(string(kind)), truncateRunes(query, 80), fmt.Sprintf("%d", len(hh)))
+		}
 		for _, h := range hh {
 			content := strings.ReplaceAll(h.Content, "\n", " ")
 			content = strings.ReplaceAll(content, "\r", " ")
 			content = truncateRunes(content, 240)
-			fmt.Fprintf(&sb, "  [%s] %s\n", escapeText(h.Category), escapeText(content))
+			if len(h.Signals) > 0 {
+				fmt.Fprintf(&sb, "  [%s|%s] %s\n", escapeText(h.Category), strings.Join(h.Signals, ","), escapeText(content))
+			} else {
+				fmt.Fprintf(&sb, "  [%s] %s\n", escapeText(h.Category), escapeText(content))
+			}
 		}
 		for _, a := range arts {
 			fmt.Fprintf(&sb, "  <artifact type=%q label=%q/> (search with: anchored artifact search)\n",
 				escapeText(a.Type), escapeText(truncateRunes(a.SourceLabel, 80)))
 		}
+		if kgLine != "" {
+			fmt.Fprintf(&sb, "  %s\n", kgLine)
+		}
 		sb.WriteString("</anchored_recall>")
+
+		// Append adaptive reminder after the closing tag.
+		switch adaptive {
+		case adaptiveReminderStrong:
+			sb.WriteString("\n<!-- anchored: memórias relevantes injetadas acima — consulte antes de explorar arquivos -->")
+		case adaptiveReminderShort:
+			sb.WriteString("\n<!-- anchored: use anchored_search para memórias adicionais -->")
+		}
+
 		return sb.String()
 	}
 
@@ -341,6 +757,22 @@ func renderRecallPreview(query string, kind intent.Kind, hits []preSearchHit, ar
 		}
 	}
 	return ""
+}
+
+// signalsAttr returns a comma-joined summary of all unique signals in a hit
+// list, for the outer anchored_recall attribute. Empty when no signals.
+func signalsAttr(hits []preSearchHit) string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, h := range hits {
+		for _, s := range h.Signals {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // truncateRunes caps `s` at `max` runes (NOT bytes) so we never split a
