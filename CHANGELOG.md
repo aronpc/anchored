@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.3] - 2026-06-10
+
+Cross-project task threads: a ticket becomes a first-class unit of work that
+follows you across repositories.
+
+### Added
+
+- **Task threads (`anchored task`)** — `start/pause/resume/done/cancel/note/
+  status` manage a ticket-keyed thread (PROJ-123) that records every project
+  and session the task touches plus a short journal. `done` consolidates the
+  thread into a durable summary memory (project names, ref, journal recap);
+  `cancel` closes without consolidating. No interactive prompts — every
+  transition is a command. Local-only (no sync in v1); migration
+  `016_task_threads` is additive and idempotent.
+- **Branch inference** — the SessionStart hook extracts the ticket key from
+  the checked-out branch (`feature/PROJ-123-...`, case-insensitive,
+  `git symbolic-ref` so branches with no commits still resolve) and registers
+  the session on the thread automatically. Done/cancelled threads are never
+  silently reopened by automation; paused threads reactivate on touch.
+- **Cross-repo context injection** — when the same task already touched OTHER
+  projects, the rich SessionStart block gains a compact `<task_thread>` tier:
+  thread status, latest journal notes, and per-project `<also_touched>` lines
+  with the files those sessions worked on. References only — memories keep
+  their own project; the thread just ties the strands together.
+
 ## [0.8.2] - 2026-06-10
 
 The usage feedback loop closes: memories that keep getting injected but never
