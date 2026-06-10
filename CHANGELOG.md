@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.2] - 2026-06-10
+
+The usage feedback loop closes: memories that keep getting injected but never
+help are pulled out of rotation automatically, and a single real use brings
+them back.
+
+### Added
+
+- **Used-signal capture** — the Stop hook now checks which injected memories
+  the turn's text actually drew on (deterministic significant-token overlap,
+  no model in the loop) and bumps `used_count`/`last_used_at`. Runs even when
+  the turn produced nothing to auto-save.
+- **Never-used demotion** — the canonical recuration pass demotes memories
+  with `injected_count >= 10` and `used_count == 0` to
+  `low_signal/never_used`. Advisory and reversible: one real use lifts the
+  flag on the next pass. Pinned memories are exempt, and the mechanical
+  quality rule takes priority. `curation_rule` metadata explains which rule
+  set the flag.
+- **Push-path demotion** — the auto-recall hook now excludes `low_signal`
+  memories, so a demotion actually stops the injection (previously only
+  `Service.Search` honored it).
+
+- **Trustworthy explicit-remote search** — when `anchored_search` is asked
+  for a remote exclusively and that search fails, the local results now come
+  back marked with `remote_error="..."` and `fallback="local"` instead of
+  silently impersonating the remote (which led agents to conclude "local and
+  remote are in sync" when the remote was never reached). And the
+  `""`/`"default"` selector now means THIS REPO'S remote — resolved by the
+  same git-origin routing sync uses — not whichever config entry happens to
+  be named "default".
+
+### Changed
+
+- Quality scorer version bumped to 3 — the serve-time worker and
+  `curation reconcile` re-flow the whole corpus once. As part of that pass,
+  `injected_count` accumulated on v0.8.x (before the used-signal existed) is
+  reset, so no memory is demoted for injections it never had a chance to be
+  marked "used" against.
+
+### Fixed
+
+- `curation reconcile` no longer aborts on memories with a NULL `source`
+  column (rows created by raw tooling or older imports).
+
 ## [0.8.1] - 2026-06-09
 
 ### Added
