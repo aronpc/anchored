@@ -64,6 +64,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook stop"
+          }
+        ]
+      }
     ]
   }
 }
