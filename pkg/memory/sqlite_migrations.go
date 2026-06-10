@@ -119,6 +119,7 @@ func Migrate(db *sql.DB) error {
 		`},
 		{Name: "014_artifact_store", Up: ctxpkg.MigrationSQL014},
 		{Name: "015_working_sets", Up: ctxpkg.MigrationSQL015},
+		{Name: "016_task_threads", Up: ctxpkg.MigrationSQL016},
 	}
 
 	for _, m := range migrations {
