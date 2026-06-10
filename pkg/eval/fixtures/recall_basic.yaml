@@ -29,6 +29,10 @@ memories:
     category: decision
     content: "sync capability negotiation keeps old clients byte-identical via opt-in client_capabilities"
     keywords: [sync, capability, compatibility]
+  - key: m_hybrid_file
+    category: learning
+    content: "hybrid_search.go applies the working set boost after the project boost in the client ranking pipeline"
+    keywords: [hybrid, search, ranking, boost, working, set]
 queries:
   - query: "anchored management system overview"
     expect: [m_pm_overview]
@@ -40,3 +44,5 @@ queries:
     expect: [m_deploy]
   - query: "client hooks exit code safety"
     expect: [m_hooks_ptbr]
+  - query: "analisa pkg/memory/hybrid_search.go ranking boost"
+    expect: [m_hybrid_file]
