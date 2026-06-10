@@ -112,6 +112,7 @@ func TestBM25TopHits_EndToEnd(t *testing.T) {
 			category TEXT,
 			content TEXT,
 			keywords TEXT,
+			metadata TEXT,
 			deleted_at DATETIME
 		);
 		CREATE VIRTUAL TABLE memories_fts USING fts5(
@@ -195,7 +196,7 @@ func newFTSTestDB(t *testing.T) *sql.DB {
 	schema := `
 		CREATE TABLE memories (
 			id TEXT PRIMARY KEY, project_id TEXT, category TEXT,
-			content TEXT, keywords TEXT, deleted_at DATETIME
+			content TEXT, keywords TEXT, metadata TEXT, deleted_at DATETIME
 		);
 		CREATE VIRTUAL TABLE memories_fts USING fts5(
 			content, keywords, content=memories, content_rowid=rowid
@@ -228,7 +229,7 @@ func BenchmarkBM25TopHits(b *testing.B) {
 	}
 	defer db.Close()
 	schema := `
-		CREATE TABLE memories (id TEXT PRIMARY KEY, project_id TEXT, category TEXT, content TEXT, keywords TEXT, deleted_at DATETIME);
+		CREATE TABLE memories (id TEXT PRIMARY KEY, project_id TEXT, category TEXT, content TEXT, keywords TEXT, metadata TEXT, deleted_at DATETIME);
 		CREATE VIRTUAL TABLE memories_fts USING fts5(content, keywords, content=memories, content_rowid=rowid);
 		CREATE TRIGGER t AFTER INSERT ON memories BEGIN INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.rowid, new.content, new.keywords); END;`
 	if _, err := db.Exec(schema); err != nil {
@@ -736,5 +737,32 @@ func TestRecordInjection_TracksWorkingSetAndCount(t *testing.T) {
 	}
 	if !strings.Contains(memIDs, "mem-a") || !strings.Contains(memIDs, "mem-b") {
 		t.Errorf("working_sets.memory_ids should contain both IDs, got: %s", memIDs)
+	}
+}
+
+// TestBM25TopHits_ExcludesLowSignal guards the push-path side of the usage
+// feedback loop: a memory demoted to low_signal (quality or never_used) must
+// stop being injected by the recall hook.
+func TestBM25TopHits_ExcludesLowSignal(t *testing.T) {
+	db := newFTSTestDB(t)
+	insertMem(t, db, "ok-1", "proj-A", "decision", "postgres storage decision for the team server")
+	if _, err := db.Exec(
+		`INSERT INTO memories (id, project_id, category, content, keywords, metadata)
+		 VALUES ('demoted-1', 'proj-A', 'decision', 'postgres storage noise that was demoted', '',
+		         '{"curation_status":"low_signal","curation_rule":"never_used"}')`); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := bm25TopHits(context.Background(), db, "postgres storage", "proj-A", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hits {
+		if h.ID == "demoted-1" {
+			t.Fatal("low_signal memory must not be injected by the recall hook")
+		}
+	}
+	if len(hits) != 1 || hits[0].ID != "ok-1" {
+		t.Fatalf("want only ok-1, got %+v", hits)
 	}
 }

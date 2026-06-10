@@ -672,12 +672,16 @@ func bm25TopHits(ctx context.Context, db *sql.DB, q string, projectID string, li
 		return nil, nil
 	}
 
+	// low_signal exclusion closes the usage-feedback loop on the push path:
+	// without it, a memory demoted by curation (quality or never_used) would
+	// keep being injected by this hook even though Service.Search demotes it.
 	sqlStmt := `
 		SELECT m.id, m.category, m.content
 		FROM memories_fts fts
 		JOIN memories m ON m.rowid = fts.rowid
 		WHERE memories_fts MATCH ?
 		  AND m.deleted_at IS NULL
+		  AND COALESCE(json_extract(m.metadata, '$.curation_status'), '') != 'low_signal'
 		  AND (? = '' OR m.project_id = ?)`
 	args := []any{match, projectID, projectID}
 	if len(categories) > 0 {

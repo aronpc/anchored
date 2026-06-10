@@ -12,12 +12,14 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/project"
+	"github.com/jholhewres/anchored/pkg/session"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -130,13 +132,10 @@ func runHookStop(args []string) {
 		return
 	}
 
-	// Extract durable candidates.
+	// Extract durable candidates. The used-signal pass below needs the write
+	// context even when there is nothing to save, so candidates==0 no longer
+	// short-circuits before the DB is open.
 	candidates := extractDurableCandidates(transcriptText)
-	if len(candidates) == 0 {
-		dlog.Event("hook.stop", map[string]any{"stage": "no_candidates"})
-		outputJSON(map[string]any{"saved": 0})
-		return
-	}
 
 	// Open write context (no embedder, busy_timeout ≤ 300ms).
 	hc, err := openHookContextWrite(*configPath)
@@ -155,6 +154,17 @@ func runHookStop(args []string) {
 
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
+
+	// Usage-feedback (Feature D): mark which injected memories the turn's text
+	// actually drew on, closing the loop that recordInjection opens. Runs
+	// before the save pass so it still happens when there are no candidates.
+	used := markUsedMemories(ctx, hc, input.SessionID, transcriptText, dlog)
+
+	if len(candidates) == 0 {
+		dlog.Event("hook.stop", map[string]any{"stage": "no_candidates", "used": used})
+		outputJSON(map[string]any{"saved": 0, "used": used})
+		return
+	}
 
 	// Load recent memories for dedup. If the set can't be loaded completely,
 	// skip saving this turn — saving without dedup risks duplicates, and the
@@ -194,8 +204,128 @@ func runHookStop(args []string) {
 		saved++
 	}
 
-	dlog.Event("hook.stop", map[string]any{"stage": "done", "saved": saved, "candidates": len(candidates)})
-	outputJSON(map[string]any{"saved": saved})
+	dlog.Event("hook.stop", map[string]any{"stage": "done", "saved": saved, "candidates": len(candidates), "used": used})
+	outputJSON(map[string]any{"saved": saved, "used": used})
+}
+
+// usedMinOverlap / usedMinRatio define when a memory counts as "used" by the
+// turn: at least 3 of its significant tokens appear in the turn text, or at
+// least 2 covering 30% of a short memory's significant tokens. Deterministic
+// on purpose — no model in the loop.
+const (
+	usedMinOverlap    = 3
+	usedMinRatio      = 0.30
+	usedMinTokenRunes = 5
+)
+
+// markUsedMemories closes the usage-feedback loop: for every memory the
+// session injected (working_sets.memory_ids, fed by the UserPromptSubmit
+// hook), check whether the turn's transcript text draws on its content and
+// bump used_count/last_used_at. Best-effort and bounded by the caller's
+// deadline; returns how many memories were marked.
+func markUsedMemories(ctx context.Context, hc *HookContext, sessionID, turnText string, dlog *debuglog.Logger) int {
+	if sessionID == "" || turnText == "" {
+		return 0
+	}
+	mgr := session.NewManager(hc.db, nil)
+	ws, err := mgr.GetWorkingSet(ctx, sessionID)
+	if err != nil || ws == nil || len(ws.MemoryIDs) == 0 {
+		return 0
+	}
+
+	placeholders := make([]string, len(ws.MemoryIDs))
+	args := make([]any, len(ws.MemoryIDs))
+	for i, id := range ws.MemoryIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	rows, err := hc.db.QueryContext(ctx, `
+		SELECT id, content FROM memories
+		WHERE deleted_at IS NULL AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+
+	turnTokens := significantTokenSet(turnText)
+	var usedIDs []string
+	for rows.Next() {
+		var id, content string
+		if err := rows.Scan(&id, &content); err != nil {
+			continue
+		}
+		memTokens := significantTokenSet(content)
+		if len(memTokens) == 0 {
+			continue
+		}
+		overlap := 0
+		for tok := range memTokens {
+			if turnTokens[tok] {
+				overlap++
+			}
+		}
+		// The absolute floor scales with the memory's vocabulary: 3 shared
+		// tokens means a lot against a 8-token memory and nothing against a
+		// 40-token one (generic dev terms would false-positive). Long
+		// memories effectively require usedMinRatio coverage.
+		minNeeded := usedMinOverlap
+		if len(memTokens) > 15 {
+			if scaled := int(float64(len(memTokens)) * usedMinRatio); scaled > minNeeded {
+				minNeeded = scaled
+			}
+		}
+		ratio := float64(overlap) / float64(len(memTokens))
+		if overlap >= minNeeded || (overlap >= 2 && ratio >= usedMinRatio) {
+			usedIDs = append(usedIDs, id)
+		}
+	}
+	if err := rows.Err(); err != nil || len(usedIDs) == 0 {
+		return 0
+	}
+
+	upPlaceholders := make([]string, len(usedIDs))
+	upArgs := make([]any, 0, len(usedIDs)+1)
+	upArgs = append(upArgs, time.Now().UTC().Format(time.RFC3339))
+	for i, id := range usedIDs {
+		upPlaceholders[i] = "?"
+		upArgs = append(upArgs, id)
+	}
+	// Metadata-only UPDATE: does not fire the FTS triggers (AFTER UPDATE OF
+	// content, keywords). The NULLIF chain normalises legacy ''/'null' rows.
+	if _, err := hc.db.ExecContext(ctx, `
+		UPDATE memories SET metadata = json_set(
+			COALESCE(NULLIF(NULLIF(metadata, ''), 'null'), '{}'),
+			'$.used_count', COALESCE(json_extract(metadata, '$.used_count'), 0) + 1,
+			'$.last_used_at', ?
+		) WHERE id IN (`+strings.Join(upPlaceholders, ",")+`)`, upArgs...); err != nil {
+		dlog.Event("hook.stop.used", map[string]any{"stage": "update_failed", "error": err.Error()})
+		return 0
+	}
+	dlog.Event("hook.stop.used", map[string]any{"stage": "marked", "count": len(usedIDs)})
+	return len(usedIDs)
+}
+
+// significantTokenSet lower-cases and splits text on non-alphanumeric runes,
+// keeping tokens of usedMinTokenRunes+ runes. Splitting on punctuation (not
+// just whitespace) lets code identifiers inside backticks/parens match.
+func significantTokenSet(text string) map[string]bool {
+	out := make(map[string]bool)
+	var cur []rune
+	flush := func() {
+		if len(cur) >= usedMinTokenRunes {
+			out[string(cur)] = true
+		}
+		cur = cur[:0]
+	}
+	for _, r := range strings.ToLower(text) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
+			cur = append(cur, r)
+			continue
+		}
+		flush()
+	}
+	flush()
+	return out
 }
 
 // openHookContextWrite opens the SQLite DB in write mode with busy_timeout ≤ 300ms.
