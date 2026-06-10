@@ -221,7 +221,94 @@ func autoRecallPreview(configPath, cwd, prompt, sessionID string, dlog *debuglog
 		adaptiveMode = classifyAdaptiveReminder(hits)
 	}
 
+	// ── D-lite: record which memories were injected (usage-feedback capture).
+	// Best-effort with a HARD wall-clock cap on the whole call — config load,
+	// EnsureDirs and sql.Open included, not just the DB writes. A plain
+	// goroutine would not work here: the hook process exits right after
+	// emitting its JSON, killing any in-flight async work — so we run the
+	// write concurrently but wait up to the cap, letting the common case
+	// complete and a slow filesystem skip tracking instead of delaying the
+	// prompt.
+	if len(hits) > 0 {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			recordInjection(configPath, sessionID, projectID, hits, dlog)
+		}()
+		select {
+		case <-done:
+		case <-time.After(injectionTotalBudget):
+			dlog.Event("hook.userpromptsubmit.inject_track", map[string]any{"stage": "total_budget_exceeded"})
+		}
+	}
+
 	return renderRecallPreview(expandedQ, in.Kind, hits, arts, kgLine, adaptiveMode, hc.cfg.Plugin.HookBudget())
+}
+
+// injectionWriteTimeout bounds the DB writes of injection tracking.
+const injectionWriteTimeout = 50 * time.Millisecond
+
+// injectionTotalBudget is the hard wall-clock cap for the entire tracking
+// call, including config load and directory/DB setup that the inner context
+// cannot bound.
+const injectionTotalBudget = 100 * time.Millisecond
+
+// recordInjection captures the usage-feedback signal for Feature D: which
+// memories were put in front of the model this turn. It merges the IDs into
+// the session working set (working_sets.memory_ids, existing cap/dedup) and
+// bumps injected_count/last_injected_at in each memory's metadata so a future
+// curation pass can demote always-injected-never-used memories. Fail-safe and
+// fire-and-forget: any error is logged at debug level and ignored.
+func recordInjection(configPath, sessionID, projectID string, hits []preSearchHit, dlog *debuglog.Logger) {
+	ids := make([]string, 0, len(hits))
+	for _, h := range hits {
+		if h.ID != "" {
+			ids = append(ids, h.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	whc, err := openHookContextWrite(configPath)
+	if err != nil {
+		dlog.Event("hook.userpromptsubmit.inject_track", map[string]any{"stage": "open_failed", "error": err.Error()})
+		return
+	}
+	defer whc.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), injectionWriteTimeout)
+	defer cancel()
+
+	if sessionID != "" {
+		mgr := session.NewManager(whc.db, nil)
+		if _, err := mgr.UpdateWorkingSet(ctx, sessionID, session.WorkingSetDelta{
+			ProjectID: projectID,
+			MemoryIDs: ids,
+		}); err != nil {
+			dlog.Event("hook.userpromptsubmit.inject_track", map[string]any{"stage": "ws_failed", "error": err.Error()})
+		}
+	}
+
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, time.Now().UTC().Format(time.RFC3339))
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	// The NULLIF chain normalises legacy rows whose metadata column holds ''
+	// or the JSON literal 'null' (json_set would fail on a non-object root).
+	if _, err := whc.db.ExecContext(ctx, `
+		UPDATE memories SET metadata = json_set(
+			COALESCE(NULLIF(NULLIF(metadata, ''), 'null'), '{}'),
+			'$.injected_count', COALESCE(json_extract(metadata, '$.injected_count'), 0) + 1,
+			'$.last_injected_at', ?
+		) WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
+		dlog.Event("hook.userpromptsubmit.inject_track", map[string]any{"stage": "count_failed", "error": err.Error()})
+		return
+	}
+	dlog.Event("hook.userpromptsubmit.inject_track", map[string]any{"stage": "tracked", "ids": len(ids)})
 }
 
 // adaptiveReminderMode controls which reminder variant to emit.
@@ -250,6 +337,7 @@ func classifyAdaptiveReminder(hits []preSearchHit) adaptiveReminderMode {
 
 // preSearchHit is a BM25 hit with optional explainability signals.
 type preSearchHit struct {
+	ID       string
 	Category string
 	Content  string
 	Signals  []string // e.g. "file_anchor", "working_set"
@@ -585,7 +673,7 @@ func bm25TopHits(ctx context.Context, db *sql.DB, q string, projectID string, li
 	}
 
 	sqlStmt := `
-		SELECT m.category, m.content
+		SELECT m.id, m.category, m.content
 		FROM memories_fts fts
 		JOIN memories m ON m.rowid = fts.rowid
 		WHERE memories_fts MATCH ?
@@ -612,7 +700,7 @@ func bm25TopHits(ctx context.Context, db *sql.DB, q string, projectID string, li
 	var out []preSearchHit
 	for rows.Next() {
 		var h preSearchHit
-		if err := rows.Scan(&h.Category, &h.Content); err != nil {
+		if err := rows.Scan(&h.ID, &h.Category, &h.Content); err != nil {
 			continue
 		}
 		out = append(out, h)
