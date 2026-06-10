@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] - 2026-06-09
+
+Push-based context injection: the hooks now put relevant memory in front of the
+model (and capture durable knowledge) instead of relying on the model calling
+the memory tools.
+
+> **Note:** after the plugin updates, restart Claude Code so the new `Stop`
+> hook in `hooks.json` is registered.
+
+### Added
+
+- **`pkg/contextbudget`** — deterministic tiered context assembler with a byte
+  ceiling: tiers fill in priority order, items are dropped whole (never split),
+  a higher tier never loses an item to a lower one, and `MinItems` reserves a
+  minimum per tier.
+- **Rich SessionStart context block** — the SessionStart hook now assembles
+  identity, pinned + recent decisions/learnings, the session working set, and
+  recent events into a budgeted `<anchored_context>` block
+  (`plugin.sessionstart_budget_bytes`, default 7000; `0` restores the previous
+  plain format).
+- **Stop hook (`anchored hook stop`)** — extracts durable decision/learning
+  candidates from the turn transcript (PT+EN markers, paragraph fallback for
+  short decisive sentences) and auto-saves them with dedup (content hash +
+  token Jaccard against the 50 most recent memories), capped at 2 saves per
+  turn with a 30-day TTL. Saves are embedder-free (`embedding NULL`; the
+  curation worker embeds asynchronously) so the hook stays well under its
+  500ms budget. Loop-guarded via `stop_hook_active`; disable with
+  `plugin.auto_save_stop: false`.
+- **Recall v2 in UserPromptSubmit** — the auto-recall query is now anchored to
+  the code being discussed: file/symbol anchors extracted from the prompt,
+  session working-set signals (files/symbols/entities), an expanded BM25 query
+  where anchors take precedence (24-token cap), a local re-rank boost with
+  explainability signals (`file_anchor`, `working_set`), and an optional
+  compact `<anchored_kg>` line when an anchor matches a knowledge-graph
+  entity.
+- **Adaptive recall reminder** — a strong one-line nudge when boosted hits are
+  injected ("consult before exploring files"), a short variant when recall is
+  empty (`plugin.adaptive_reminder`).
+- **Eval fixture** — recall fixture now includes a file-path-anchored query.
+
+### Changed
+
+- BM25 recall candidate limit raised from 3 to 5; the existing hook byte
+  budget decides how many survive.
+- `hooks/hooks.json` registers the new `Stop` hook.
+
 ## [0.5.8] - 2026-05-28
 
 ### Added
