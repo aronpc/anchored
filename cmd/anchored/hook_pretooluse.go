@@ -12,6 +12,8 @@ import (
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
+	"github.com/jholhewres/anchored/pkg/hookroute"
+	"github.com/jholhewres/anchored/pkg/mcp"
 	"github.com/jholhewres/anchored/pkg/memory"
 )
 
@@ -38,7 +40,7 @@ func runHookPreToolUse(args []string) {
 		// would abort the user's tool call.
 		slog.Error("failed to read stdin", "error", err)
 		dlog.Event("hook.pretooluse", map[string]any{"stage": "stdin_error", "error": err.Error()})
-		outputJSON(map[string]string{"decision": "allow"})
+		emitAllow()
 		return
 	}
 
@@ -50,9 +52,11 @@ func runHookPreToolUse(args []string) {
 		ToolInput map[string]any `json:"tool_input"`
 		Tool      string         `json:"tool"`
 		Arguments map[string]any `json:"arguments"`
+		SessionID string         `json:"session_id"`
+		Cwd       string         `json:"cwd"`
 	}
 	if err := json.Unmarshal(content, &input); err != nil {
-		outputJSON(map[string]string{"decision": "allow"})
+		emitAllow()
 		return
 	}
 	tool := input.ToolName
@@ -72,14 +76,20 @@ func runHookPreToolUse(args []string) {
 	// short-circuit on non-memory paths before any real work.
 	if blocked, reason := memoryFileSecretBlock(tool, args2); blocked {
 		dlog.Event("hook.pretooluse", map[string]any{"stage": "blocked_memory_file_secret", "tool": tool})
-		outputJSON(map[string]string{"decision": "block", "reason": reason})
+		emitDecision(&hookroute.Decision{Action: hookroute.ActionDeny, Reason: reason})
 		return
 	}
 
-	// Security checks for command execution tools
-	if tool == "anchored_execute" || tool == "anchored_execute_file" || tool == "anchored_batch_execute" {
+	// Security checks for command execution tools. Claude Code sends the
+	// fully-qualified MCP tool name (mcp__anchored__anchored_execute); strip the
+	// server prefix to the bare leaf so the match works regardless of wire form.
+	bareTool := tool
+	if i := strings.LastIndex(bareTool, "__"); i >= 0 {
+		bareTool = bareTool[i+2:]
+	}
+	if bareTool == "anchored_execute" || bareTool == "anchored_execute_file" || bareTool == "anchored_batch_execute" {
 		code, _ := args2["code"].(string)
-		if tool == "anchored_batch_execute" {
+		if bareTool == "anchored_batch_execute" {
 			if cmds, ok := args2["commands"].([]any); ok {
 				for _, cmd := range cmds {
 					if m, ok := cmd.(map[string]any); ok {
@@ -97,23 +107,35 @@ func runHookPreToolUse(args []string) {
 				"pattern": pattern,
 				"args":    debuglog.Snippet(string(content), 240),
 			})
-			outputJSON(map[string]string{
-				"decision": "block",
-				"reason":   "dangerous pattern detected: " + pattern,
+			emitDecision(&hookroute.Decision{
+				Action: hookroute.ActionDeny,
+				Reason: "dangerous pattern detected: " + pattern,
 			})
 			return
 		}
 	}
 
-	if mentionsMemory(args2) {
+	// Routing: steer native exploration tools (Read/Grep/Glob/Bash/WebFetch/
+	// Agent and external MCP) toward anchored's memory + sandbox tools. The
+	// optimizer flag gates sandbox redirects so we never deny into a tool that
+	// would itself error when context_optimizer is disabled.
+	optimizerEnabled := false
+	if cfg, cfgErr := loadConfig(*configPath); cfgErr == nil && cfg != nil {
+		optimizerEnabled = cfg.ContextOptimizer.Enabled
+	}
+	decision := hookroute.RoutePreToolUse(tool, args2, hookroute.Options{
+		OptimizerEnabled: optimizerEnabled,
+		SubagentBlock:    mcp.AnchoredSubagentBlock,
+		SessionID:        input.SessionID,
+		ProjectDir:       input.Cwd,
+	})
+	if decision != nil {
 		dlog.Event("hook.pretooluse", map[string]any{
-			"stage": "memory_hint",
-			"tool":  tool,
+			"stage":  "routed",
+			"tool":   tool,
+			"action": string(decision.Action),
 		})
-		outputJSON(map[string]string{
-			"decision": "allow",
-			"reason":   "consider anchored_search for memory queries",
-		})
+		emitDecision(decision)
 		return
 	}
 
@@ -121,6 +143,23 @@ func runHookPreToolUse(args []string) {
 		"stage": "allow",
 		"tool":  tool,
 	})
+	emitAllow()
+}
+
+// emitDecision writes a routing decision in Claude Code's PreToolUse wire
+// shape, falling back to a plain allow for passthrough.
+func emitDecision(d *hookroute.Decision) {
+	out := hookroute.FormatDecision(d)
+	if out == nil {
+		emitAllow()
+		return
+	}
+	outputJSON(out)
+}
+
+// emitAllow writes the explicit allow response. Kept as a single helper so the
+// fail-safe default is identical everywhere.
+func emitAllow() {
 	outputJSON(map[string]string{"decision": "allow"})
 }
 
@@ -188,25 +227,6 @@ func checkDangerousPattern(code string) (blocked bool, pattern string) {
 		}
 	}
 	return false, ""
-}
-
-// memoryWordRE matches whole words only — without \b we matched "memory leak"
-// and "in-memory" as memory-related. The list stays English-only because this
-// routing-advice hook is opt-in and English is the lowest-friction baseline;
-// PT-BR triggers live in the routing block instead.
-var memoryWordRE = regexp.MustCompile(`(?i)\b(memory|fact|decision|preference|preferences)\b`)
-
-func mentionsMemory(args map[string]any) bool {
-	for _, v := range args {
-		s, ok := v.(string)
-		if !ok {
-			continue
-		}
-		if memoryWordRE.MatchString(s) {
-			return true
-		}
-	}
-	return false
 }
 
 // outputJSON writes a hook response as a single JSON line. Hook handlers
