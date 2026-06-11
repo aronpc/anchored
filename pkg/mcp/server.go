@@ -287,7 +287,9 @@ func (s *Server) toolContext(ctx context.Context, args json.RawMessage) (string,
 	}
 
 	if s.sessions != nil && p.SessionID != "" {
-		_ = s.sessions.RecordActivity(ctx, p.SessionID)
+		if err := s.sessions.RecordActivity(ctx, p.SessionID); err != nil {
+			s.logger.Warn("anchored_context: failed to record session activity", "session_id", p.SessionID, "error", err)
+		}
 	}
 
 	// projectID is the dependency root for everything else — resolve it
@@ -325,14 +327,22 @@ func (s *Server) toolContext(ctx context.Context, args json.RawMessage) (string,
 		// the project's KG edges. Run sequentially in this goroutine so we don't
 		// fan out beyond what SQLite (MaxOpenConns=1) handles. Over-fetch recent
 		// memories so they can be ranked by importance/pin, not just recency.
-		recentMems, _ = s.mem.List(ctx, memory.ListOptions{
+		var listErr error
+		recentMems, listErr = s.mem.List(ctx, memory.ListOptions{
 			ProjectID:  projectID,
 			Categories: recentBundleCategories,
 			Limit:      30,
 		})
+		if listErr != nil {
+			s.logger.Warn("anchored_context: failed to list recent memories", "error", listErr)
+		}
 		events = s.recentSessionEvents(ctx, projectID, 5)
 		if s.kg != nil && projectID != "" {
-			rels, _ = s.kg.ListByProject(ctx, projectID)
+			var kgErr error
+			rels, kgErr = s.kg.ListByProject(ctx, projectID)
+			if kgErr != nil {
+				s.logger.Warn("anchored_context: failed to list KG triples", "error", kgErr)
+			}
 		}
 	}()
 	wg.Wait()
@@ -878,7 +888,7 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 				}
 				remoteName = target.Name
 			} else {
-				s.logger.Debug("remote merge skipped", "remote", target.Name, "error", rErr)
+				s.logger.Warn("remote merge skipped", "remote", target.Name, "error", rErr)
 			}
 		}
 		cancel()
@@ -1148,8 +1158,6 @@ func (s *Server) toolForget(ctx context.Context, args json.RawMessage) (string, 
 		return "", fmt.Errorf("parse args: %w", err)
 	}
 
-	_ = p.CWD
-
 	if p.Hard {
 		if err := s.mem.Forget(ctx, p.ID); err != nil {
 			return "", err
@@ -1173,8 +1181,6 @@ func (s *Server) toolUpdate(ctx context.Context, args json.RawMessage) (string, 
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
 	}
-
-	_ = p.CWD
 
 	m, err := s.mem.Update(ctx, p.ID, p.Content, p.Category)
 	if err != nil {
@@ -1442,7 +1448,9 @@ func (s *Server) toolCtxExecute(ctx context.Context, args json.RawMessage) (stri
 		output += "\n[output truncated]"
 	}
 	if len(output) > 5*1024 && p.Intent != "" {
-		_, _ = s.optimizer.IndexRaw(ctx, stdout, "execute", "auto-indexed", projectID)
+		if _, idxErr := s.optimizer.IndexRaw(ctx, stdout, "execute", "auto-indexed", projectID); idxErr != nil {
+			s.logger.Warn("ctx_execute: failed to index output", "error", idxErr)
+		}
 		hits, sErr := s.optimizer.Search(ctx, p.Intent, 5, "", "", projectID)
 		if sErr == nil && len(hits) > 0 {
 			var lines []string
