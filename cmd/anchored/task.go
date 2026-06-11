@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jholhewres/anchored/pkg/session"
+	syncpkg "github.com/jholhewres/anchored/pkg/sync"
 )
 
 // runTask manages cross-project task threads (Feature B): a ticket-keyed unit
@@ -98,6 +99,7 @@ func runTaskStart(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Task %s active (%d project(s) touched)\n", t.TaskKey, len(t.ProjectIDs))
+	pushTaskThreadBestEffort(*configPath, t.TaskKey)
 }
 
 func runTaskSetStatus(args []string, status, label string) {
@@ -120,6 +122,7 @@ func runTaskSetStatus(args []string, status, label string) {
 		os.Exit(1)
 	}
 	fmt.Printf("%s task %s\n", label, strings.ToUpper(key))
+	pushTaskThreadBestEffort(*configPath, key)
 }
 
 // runTaskDone closes the thread and consolidates it into a durable summary
@@ -174,6 +177,7 @@ func runTaskDone(args []string) {
 	}
 	fmt.Printf("Task %s done — consolidated into a summary memory (%d project(s), %d journal note(s))\n",
 		t.TaskKey, len(t.ProjectIDs), len(t.Journal))
+	pushTaskThreadBestEffort(*configPath, t.TaskKey)
 }
 
 func runTaskNote(args []string) {
@@ -198,6 +202,7 @@ func runTaskNote(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Noted on %s\n", strings.ToUpper(key))
+	pushTaskThreadBestEffort(*configPath, key)
 }
 
 func runTaskStatus(args []string) {
@@ -283,4 +288,66 @@ func renderTaskSummary(t *session.TaskThread, projectNames []string) string {
 		b.WriteString(".")
 	}
 	return b.String()
+}
+
+// pushTaskThreadBestEffort mirrors the thread to the cwd-resolved remote (the
+// personal kanban's storage) after a CLI mutation. Best-effort by design:
+// no remote, no key, or a network failure must never fail the local command —
+// the next mutation pushes the converged state anyway.
+func pushTaskThreadBestEffort(configPath, key string) {
+	cfg, err := loadConfig(configPath)
+	if err != nil || cfg == nil {
+		return
+	}
+	cwd, _ := os.Getwd()
+	entry := cfg.ResolveRemote(cwd)
+	if entry == nil || entry.APIKey == "" {
+		return
+	}
+
+	hc, err := openHookContext(configPath)
+	if err != nil {
+		return
+	}
+	defer hc.Close()
+	mgr := session.NewManager(hc.db, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	t, err := mgr.GetTaskThread(ctx, strings.ToUpper(strings.TrimSpace(key)))
+	if err != nil || t == nil {
+		return
+	}
+
+	// Local project IDs are meaningless to the server — resolve names.
+	names := make([]string, 0, len(t.ProjectIDs))
+	for _, pid := range t.ProjectIDs {
+		var name string
+		if err := hc.db.QueryRowContext(ctx, `SELECT name FROM projects WHERE id = ?`, pid).Scan(&name); err != nil || name == "" {
+			continue
+		}
+		names = append(names, name)
+	}
+
+	// PRIVACY GATE: the journal holds free-form personal notes (`anchored
+	// task note`) and goes through NO sanitizer. It is only ever sent to the
+	// user's DEFAULT (personal) server; when cwd routing resolves to a team
+	// server, the card syncs as metadata only (key/status/projects) and the
+	// user is told so.
+	journal := t.Journal
+	if !entry.Default {
+		journal = nil
+		fmt.Fprintf(os.Stderr, "note: syncing task card to team server %q WITHOUT journal notes (metadata only)\n", entry.Name)
+	}
+
+	client := syncpkg.NewClientFromEntry(*entry, "cli")
+	if _, err := client.PushTaskThreads(ctx, []syncpkg.RemoteTaskThread{{
+		TaskKey:     t.TaskKey,
+		ExternalRef: t.ExternalRef,
+		Status:      t.Status,
+		Projects:    names,
+		Journal:     journal,
+	}}); err != nil {
+		fmt.Fprintf(os.Stderr, "note: kanban sync skipped: %v\n", err)
+	}
 }
