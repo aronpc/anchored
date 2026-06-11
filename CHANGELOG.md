@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.8] - 2026-06-11
+
+Observability pass over the MCP tools and hooks: failures that used to vanish
+silently now leave a trace, making "why didn't anchored remember/find X?"
+diagnosable.
+
+### Fixed
+
+- **MCP server no longer swallows errors** — `anchored_context` now logs
+  failures from session-activity recording, recent-memory listing, and KG
+  triple listing; `anchored_execute` logs when auto-indexing a large output
+  fails; a skipped remote merge during `anchored_search` is logged at warn
+  (it silently degraded team search to local-only). All paths keep their
+  best-effort behavior — nothing new fails, it just stops failing invisibly.
+- **SessionStart hook logs parse/query failures** — malformed stdin JSON and
+  working-set lookups that error are recorded in the debug log instead of
+  being discarded; the hook remains fail-safe.
+- Removed dead `_ = p.CWD` placeholders in `anchored_forget`/`anchored_update`.
+
 ## [0.8.7] - 2026-06-11
 
 Hotfix for v0.8.6: the new PreToolUse routing emitted output Claude Code's hook

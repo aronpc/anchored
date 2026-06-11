@@ -48,7 +48,9 @@ func runHookSessionStart(args []string) {
 		Cwd       string `json:"cwd"`
 		Directory string `json:"directory"`
 	}
-	_ = json.Unmarshal(content, &input)
+	if err := json.Unmarshal(content, &input); err != nil {
+		slog.Debug("hook sessionstart: failed to parse stdin JSON", "error", err)
+	}
 
 	_ = sessionID
 
@@ -267,11 +269,13 @@ func crossRepoLines(ctx context.Context, hc *HookContext, t *session.TaskThread,
 			name = pid
 		}
 		var files string
-		_ = hc.db.QueryRowContext(ctx, `
+		if err := hc.db.QueryRowContext(ctx, `
 			SELECT files FROM working_sets
 			WHERE project_id = ? AND session_id IN (`+jsonListPlaceholders(len(t.SessionIDs))+`)
 			ORDER BY updated_at DESC LIMIT 1`,
-			append([]any{pid}, toAnySlice(t.SessionIDs)...)...).Scan(&files)
+			append([]any{pid}, toAnySlice(t.SessionIDs)...)...).Scan(&files); err != nil {
+			slog.Debug("hook sessionstart: failed to query working set files", "project_id", pid, "error", err)
+		}
 		fileList := decodeFilesPreview(files, 6)
 		line := fmt.Sprintf("<also_touched project=%q", sessionEscapeAttr(name))
 		if fileList != "" {
