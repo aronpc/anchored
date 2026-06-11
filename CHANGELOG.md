@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.5] - 2026-06-10
+
+### Added
+
+- **Personal kanban sync** — every `anchored task` mutation
+  (start/pause/resume/done/cancel/note) mirrors the thread to your server as
+  a card for the dashboard's new "My tasks" board (server v0.5.6+). Best
+  effort by design: no remote, no key or a network failure never fails the
+  local command. **Privacy gate:** the journal (free-form personal notes)
+  is only ever sent to your DEFAULT (personal) server — when cwd routing
+  resolves to a team server, the card syncs as metadata only
+  (key/status/projects) and the command says so.
+
 ## [0.8.4] - 2026-06-10
 
 The store stops growing forever: related memories consolidate into summaries
