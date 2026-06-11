@@ -263,7 +263,13 @@ func Defaults() *Config {
 			ContradictionAction: "flag",
 		},
 		ContextOptimizer: ContextOptimizerConfig{
-			Enabled:        false,
+			// Enabled by default: the sandbox tools (anchored_execute*,
+			// _fetch_and_index, _ctx_search) and the PreToolUse redirects that
+			// steer toward them only work when the optimizer is on. Shipping it
+			// off made those tools hard-error, training the model to stop
+			// reaching for them. The sandbox is a subprocess with a timeout and
+			// output cap, so on-by-default is low-risk.
+			Enabled:        true,
 			DefaultTTL:     336,
 			LRUCapMB:       50,
 			SandboxTimeout: 30,
