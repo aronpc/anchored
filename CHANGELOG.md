@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.4] - 2026-06-10
+
+The store stops growing forever: related memories consolidate into summaries
+and never-used ones fade with age.
+
+### Added
+
+- **Cluster synthesis (`anchored dream`)** — connected components of >= 3
+  near-duplicate memories become a "synthesize" proposal. Applying it creates
+  one deterministic summary memory (member IDs recorded in
+  `metadata.consolidated`/`supersedes`) inside a transaction, and DEMOTES the
+  raw members (`low_signal/consolidated`, with `consolidated_into`) — never
+  deletes them. Consolidated members are exempt from the mechanical
+  recuration lift: their demotion is structural, undone only explicitly.
+- **Age decay at search time** — memories never drawn on fade gently with
+  age (x0.85 after 90 days unused, x0.7 after 180), computed during ranking
+  with nothing written back. Any recorded use resets the clock; pinned
+  memories never decay; decay never stacks on an already-demoted memory
+  (the stacked-multiplier lesson from 0.5.8). Explain mode reports a
+  `decayed` signal.
+
 ## [0.8.3] - 2026-06-10
 
 Cross-project task threads: a ticket becomes a first-class unit of work that
