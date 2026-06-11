@@ -157,10 +157,16 @@ func emitDecision(d *hookroute.Decision) {
 	outputJSON(out)
 }
 
-// emitAllow writes the explicit allow response. Kept as a single helper so the
-// fail-safe default is identical everywhere.
+// emitAllow writes the passthrough response. It MUST be an empty object, not
+// {"decision":"allow"}: Claude Code's hook-output schema types `decision` as
+// enum("approve","block"), so "allow" is an invalid VALUE and fails validation
+// with "(root): Invalid input" on every passthrough call (the spam this fixes).
+// An empty object validates (all fields optional) and means "no opinion — run
+// the tool through the normal permission flow". We deliberately do NOT emit
+// {"decision":"approve"}, which would auto-approve and bypass permission
+// prompts.
 func emitAllow() {
-	outputJSON(map[string]string{"decision": "allow"})
+	outputJSON(map[string]any{})
 }
 
 // memoryFileSecretRe matches the instruction/memory files whose content gets

@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.7] - 2026-06-11
+
+Hotfix for v0.8.6: the new PreToolUse routing emitted output Claude Code's hook
+schema rejects, spamming `PreToolUse:Read hook error — (root): Invalid input`
+on nearly every tool call.
+
+### Fixed
+
+- **No more `additionalContext` from PreToolUse** — Claude Code's PreToolUse
+  hook schema accepts only `permissionDecision`, `permissionDecisionReason`, and
+  `updatedInput`; there is no `additionalContext` channel (that field exists
+  only for SessionStart / UserPromptSubmit / PostToolUse). The soft "search
+  memory first" nudges on `Read`/`Grep`/`Glob`/generic `Bash`/external MCP had
+  no valid wire shape and failed validation, so they are removed. That messaging
+  already lives in the SessionStart block, the per-prompt UserPromptSubmit
+  reminder, and the skill — all of which DO support `additionalContext`. The
+  high-value enforcement is unchanged: `WebFetch`/`curl`/`wget`/inline-HTTP/
+  build-tool **deny + redirect**, and `Agent`/`Task` subagent prompt injection.
+- **Passthrough no longer emits `{"decision":"allow"}`** — Claude Code types the
+  top-level `decision` field as `enum("approve","block")`, so `"allow"` is an
+  invalid value that failed validation on every passthrough. The hook now emits
+  an empty object `{}` (a valid no-op) instead. This was a latent bug that only
+  surfaced once v0.8.6 widened the PreToolUse matchers to `Read`/`Grep`/`Bash`.
+
 ## [0.8.6] - 2026-06-11
 
 The model now reaches for memory before it reaches for files. Anchored gains a
