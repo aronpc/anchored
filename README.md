@@ -76,6 +76,14 @@ The plugin is the easiest path because it installs MCP registration, slash comma
 
 Restart Claude Code after installation. Available slash commands include `/anchored:context`, `/anchored:search`, `/anchored:save`, `/anchored:stats`, `/anchored:doctor`, and `/anchored:purge`.
 
+> **Running context-mode too?** Anchored now ships its own PreToolUse routing —
+> it steers Read/Grep/Glob/Bash/WebFetch and subagents toward memory and the
+> sandbox tools, the same mechanism context-mode uses. Running both plugins
+> means two routing blocks competing for the model's attention, and
+> context-mode's redirects can shadow Anchored's. Uninstall context-mode for the
+> cleanest behavior — Anchored covers both the memory and the context-window
+> story on its own.
+
 ### MCP only
 
 ```bash
