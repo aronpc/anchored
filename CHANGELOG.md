@@ -4,6 +4,53 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.6] - 2026-06-11
+
+The model now reaches for memory before it reaches for files. Anchored gains a
+PreToolUse routing layer — the same enforcement mechanism context-mode uses —
+so native exploration tools are steered toward Anchored's memory and sandbox
+tools instead of being silently bypassed.
+
+### Added
+
+- **PreToolUse routing (`pkg/hookroute`)** — `Read`/`Grep`/`Glob`/`Bash`/
+  `WebFetch`/`Agent` and external MCP calls are now intercepted at the point of
+  action and steered toward Anchored:
+  - **Memory-first nudges** on codebase search (recursive `grep`/`rg`/`ag`/
+    `find`, `Grep`, `Glob`): "search memory before exploring". Re-fired
+    periodically so they survive context compaction.
+  - **WebFetch → deny + redirect** to `anchored_fetch_and_index` +
+    `anchored_ctx_search` (raw page bytes stay out of context).
+  - **`curl`/`wget` stdout floods, inline HTTP in `-e`/`-c` snippets, and
+    verbose build tools (gradle/maven/sbt) → deny + redirect** to
+    `anchored_execute`. Silent file downloads, quoted text, and structurally
+    bounded probes (`pwd`, `git status`, `--version`, …) pass through untouched.
+  - **Subagent prompt injection** (`Agent`/`Task`) — subagents now receive a
+    compact memory routing block plus a `ToolSearch` bootstrap for the deferred
+    `anchored_*` tools, so work done in subagents uses memory too.
+  - All sandbox redirects are gated on `context_optimizer.enabled` — when the
+    optimizer is off they degrade to a soft nudge instead of denying into a
+    tool that would error.
+- **Skill** — `skills/anchored/SKILL.md` gains a mandatory "memory-first" rule,
+  a decision tree, and an anti-patterns section.
+
+### Changed
+
+- **`context_optimizer.enabled` now defaults to `true`** — the sandbox tools
+  (`anchored_execute*`, `_fetch_and_index`, `_ctx_search`) and the routing
+  redirects that target them only work when the optimizer is on. (Existing
+  configs that set it explicitly are unchanged; flip it manually to opt in.)
+- **PreToolUse hook output migrated to `hookSpecificOutput`** — security blocks
+  (secret-into-memory-file, dangerous sandbox patterns) now emit
+  `permissionDecision: "deny"`, the shape Claude Code reliably honors.
+
+### Fixed
+
+- **Dangerous-pattern check now matches the fully-qualified MCP tool name** —
+  it compared `anchored_execute` but Claude Code sends
+  `mcp__anchored__anchored_execute`; the check now strips to the leaf name so
+  the sandbox security gate actually fires.
+
 ## [0.8.5] - 2026-06-10
 
 ### Added
