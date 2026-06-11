@@ -13,7 +13,10 @@ package hookroute
 //             the Agent tool (the modified subagent prompt reaches the
 //             subagent). Used ONLY for Agent here — Bash redirects are built as
 //             Deny directly because CC ignores updatedInput.command under allow.
-//   - context→ hookSpecificOutput.additionalContext (allow + inject text).
+//
+// Note: PreToolUse has NO additionalContext field (the schema accepts only
+// permissionDecision/permissionDecisionReason/updatedInput), so there is no
+// "inject context" action here — emitting one fails CC's output validation.
 func FormatDecision(d *Decision) map[string]any {
 	if d == nil || d.Action == ActionPass {
 		return nil
@@ -39,13 +42,6 @@ func FormatDecision(d *Decision) map[string]any {
 			"hookSpecificOutput": map[string]any{
 				"hookEventName": "PreToolUse",
 				"updatedInput":  d.UpdatedInput,
-			},
-		}
-	case ActionContext:
-		return map[string]any{
-			"hookSpecificOutput": map[string]any{
-				"hookEventName":     "PreToolUse",
-				"additionalContext": d.AdditionalContext,
 			},
 		}
 	}

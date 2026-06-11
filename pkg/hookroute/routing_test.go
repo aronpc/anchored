@@ -5,22 +5,11 @@ import (
 	"testing"
 )
 
-// freshSession returns a unique session id per subtest so the once-per-session
-// guidance throttle does not bleed between cases, and registers cleanup.
-func freshSession(t *testing.T) string {
-	t.Helper()
-	id := "test-" + strings.ReplaceAll(t.Name(), "/", "_")
-	ResetThrottle(id)
-	t.Cleanup(func() { ResetThrottle(id) })
-	return id
-}
-
-func optOn(sid string) Options  { return Options{OptimizerEnabled: true, SessionID: sid, SubagentBlock: "BLOCK"} }
-func optOff(sid string) Options { return Options{OptimizerEnabled: false, SessionID: sid, SubagentBlock: "BLOCK"} }
+func optOn() Options  { return Options{OptimizerEnabled: true, SubagentBlock: "BLOCK"} }
+func optOff() Options { return Options{OptimizerEnabled: false, SubagentBlock: "BLOCK"} }
 
 func TestWebFetchRedirectsWhenOptimizerOn(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("WebFetch", map[string]any{"url": "https://example.com"}, optOn(sid))
+	d := RoutePreToolUse("WebFetch", map[string]any{"url": "https://example.com"}, optOn())
 	if d == nil || d.Action != ActionDeny {
 		t.Fatalf("WebFetch should deny+redirect when optimizer on, got %+v", d)
 	}
@@ -29,17 +18,15 @@ func TestWebFetchRedirectsWhenOptimizerOn(t *testing.T) {
 	}
 }
 
-func TestWebFetchDegradesWhenOptimizerOff(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("WebFetch", map[string]any{"url": "https://example.com"}, optOff(sid))
-	if d == nil || d.Action != ActionContext {
-		t.Fatalf("WebFetch must NOT deny into a disabled sandbox; want context nudge, got %+v", d)
+func TestWebFetchPassesThroughWhenOptimizerOff(t *testing.T) {
+	d := RoutePreToolUse("WebFetch", map[string]any{"url": "https://example.com"}, optOff())
+	if d != nil {
+		t.Fatalf("WebFetch must pass through (not deny into a disabled sandbox), got %+v", d)
 	}
 }
 
 func TestCurlStdoutFloodRedirects(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Bash", map[string]any{"command": "curl https://api.example.com/data"}, optOn(sid))
+	d := RoutePreToolUse("Bash", map[string]any{"command": "curl https://api.example.com/data"}, optOn())
 	if d == nil || d.Action != ActionDeny {
 		t.Fatalf("curl stdout flood should deny+redirect, got %+v", d)
 	}
@@ -49,124 +36,83 @@ func TestCurlStdoutFloodRedirects(t *testing.T) {
 }
 
 func TestCurlSilentFileDownloadAllowed(t *testing.T) {
-	sid := freshSession(t)
-	// silent + file output → not a flood → falls through to generic bash nudge,
-	// never a deny.
-	d := RoutePreToolUse("Bash", map[string]any{"command": "curl -s -o out.bin https://example.com/f"}, optOn(sid))
-	if d != nil && d.Action == ActionDeny {
-		t.Fatalf("silent file download must not be denied, got %+v", d)
-	}
-}
-
-func TestCurlInsideQuotesNotFlagged(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Bash", map[string]any{"command": `gh issue edit 1 --body "use curl to fetch"`}, optOn(sid))
-	if d != nil && d.Action == ActionDeny {
-		t.Fatalf("curl inside a quoted string must not deny, got %+v", d)
+	d := RoutePreToolUse("Bash", map[string]any{"command": "curl -s -o out.bin https://example.com/f"}, optOn())
+	if d != nil {
+		t.Fatalf("silent file download must pass through, got %+v", d)
 	}
 }
 
 func TestCurlFileDownloadWithoutSilentAllowed(t *testing.T) {
-	sid := freshSession(t)
-	// Genuine file destination, no stdout alias, not verbose: nothing of
-	// substance reaches context → must NOT be denied (memory-first divergence
-	// from context-mode, which would require -s here).
-	d := RoutePreToolUse("Bash", map[string]any{"command": "curl -o report.json https://api.example.com/data"}, optOn(sid))
+	// Genuine file destination, no stdout alias, not verbose → not a flood.
+	d := RoutePreToolUse("Bash", map[string]any{"command": "curl -o report.json https://api.example.com/data"}, optOn())
 	if d != nil && d.Action == ActionDeny {
 		t.Fatalf("plain file download must not be denied, got %+v", d)
 	}
 }
 
 func TestCurlStdoutAliasStillFloods(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Bash", map[string]any{"command": "curl -o - https://api.example.com/data"}, optOn(sid))
+	d := RoutePreToolUse("Bash", map[string]any{"command": "curl -o - https://api.example.com/data"}, optOn())
 	if d == nil || d.Action != ActionDeny {
 		t.Fatalf("curl -o - is a stdout alias → must deny, got %+v", d)
 	}
 }
 
+func TestCurlInsideQuotesNotFlagged(t *testing.T) {
+	d := RoutePreToolUse("Bash", map[string]any{"command": `gh issue edit 1 --body "use curl to fetch"`}, optOn())
+	if d != nil {
+		t.Fatalf("curl inside a quoted string must pass through, got %+v", d)
+	}
+}
+
 func TestInlineHTTPInScriptLiteralRedirects(t *testing.T) {
-	sid := freshSession(t)
-	// The HTTP call lives inside a quoted -e literal but IS executed → redirect.
-	d := RoutePreToolUse("Bash", map[string]any{"command": `node -e "fetch('https://api.example.com/x')"`}, optOn(sid))
+	d := RoutePreToolUse("Bash", map[string]any{"command": `node -e "fetch('https://api.example.com/x')"`}, optOn())
 	if d == nil || d.Action != ActionDeny {
 		t.Fatalf("inline HTTP in a -e literal should deny+redirect, got %+v", d)
 	}
 }
 
 func TestBuildToolRedirects(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Bash", map[string]any{"command": "gradle build"}, optOn(sid))
+	d := RoutePreToolUse("Bash", map[string]any{"command": "gradle build"}, optOn())
 	if d == nil || d.Action != ActionDeny {
 		t.Fatalf("gradle build should deny+redirect, got %+v", d)
 	}
 }
 
-func TestStructurallyBoundedNoNudge(t *testing.T) {
-	sid := freshSession(t)
-	for _, cmd := range []string{"pwd", "git status", "whoami", "node --version", "git log -5"} {
-		d := RoutePreToolUse("Bash", map[string]any{"command": cmd}, optOn(sid))
-		if d != nil {
-			t.Errorf("%q is structurally bounded; want passthrough, got %+v", cmd, d)
+func TestBashPassesThroughWhenOptimizerOff(t *testing.T) {
+	// No sandbox to redirect into → never deny, regardless of command.
+	for _, cmd := range []string{"curl https://x/data", "gradle build", "ls"} {
+		if d := RoutePreToolUse("Bash", map[string]any{"command": cmd}, optOff()); d != nil {
+			t.Errorf("optimizer off: %q must pass through, got %+v", cmd, d)
 		}
 	}
 }
 
-func TestControlOperatorDisqualifiesAllowlist(t *testing.T) {
-	if isStructurallyBounded("git status | grep modified") {
-		t.Error("piped command must not be structurally bounded")
-	}
-	if isStructurallyBounded("pwd && cat /etc/passwd") {
-		t.Error("chained command must not be structurally bounded")
-	}
-	if isStructurallyBounded("git status\nfind /") {
-		t.Error("newline-injected command must not be structurally bounded")
+func TestOrdinaryBashPassesThrough(t *testing.T) {
+	for _, cmd := range []string{"pwd", "git status", "ls -la", "go test ./...", "grep -r foo ."} {
+		if d := RoutePreToolUse("Bash", map[string]any{"command": cmd}, optOn()); d != nil {
+			t.Errorf("%q has no valid PreToolUse nudge channel; want passthrough, got %+v", cmd, d)
+		}
 	}
 }
 
-func TestVerboseCpNotBounded(t *testing.T) {
-	if isStructurallyBounded("cp -rv src dst") {
-		t.Error("cp -rv floods one line per file; must not be bounded")
-	}
-	if isStructurallyBounded("ls -R /") {
-		t.Error("ls -R is recursive; must not be bounded")
-	}
-}
-
-func TestCodebaseSearchMemoryNudge(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Bash", map[string]any{"command": "grep -r authConvention ."}, optOn(sid))
-	if d == nil || d.Action != ActionContext {
-		t.Fatalf("recursive grep should emit a memory nudge, got %+v", d)
-	}
-	if !strings.Contains(d.AdditionalContext, "anchored_search") {
-		t.Errorf("memory nudge must mention anchored_search: %q", d.AdditionalContext)
+func TestReadGrepGlobPassThrough(t *testing.T) {
+	// PreToolUse has no additionalContext channel — these must never emit a
+	// decision (that's what caused the "Invalid input" hook errors).
+	for _, tool := range []string{"Read", "Grep", "Glob"} {
+		if d := RoutePreToolUse(tool, map[string]any{"file_path": "/x", "pattern": "y"}, optOn()); d != nil {
+			t.Errorf("%s must pass through, got %+v", tool, d)
+		}
 	}
 }
 
-func TestReadNeverDenies(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Read", map[string]any{"file_path": "/x/huge.json"}, optOn(sid))
-	if d != nil && d.Action == ActionDeny {
-		t.Fatalf("Read must never be denied (Edit needs the bytes), got %+v", d)
-	}
-}
-
-func TestGrepNudgeOncePerSession(t *testing.T) {
-	sid := freshSession(t)
-	first := RoutePreToolUse("Grep", map[string]any{"pattern": "x"}, optOn(sid))
-	if first == nil || first.Action != ActionContext {
-		t.Fatalf("first Grep should nudge, got %+v", first)
-	}
-	second := RoutePreToolUse("Grep", map[string]any{"pattern": "y"}, optOn(sid))
-	if second != nil {
-		t.Errorf("second Grep in same session should be throttled, got %+v", second)
+func TestExternalMCPPassesThrough(t *testing.T) {
+	if d := RoutePreToolUse("mcp__slack__post", map[string]any{}, optOn()); d != nil {
+		t.Errorf("external MCP has no valid PreToolUse nudge channel; want passthrough, got %+v", d)
 	}
 }
 
 func TestAgentPromptInjection(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Agent", map[string]any{"prompt": "do the thing", "subagent_type": "general-purpose"}, optOn(sid))
+	d := RoutePreToolUse("Agent", map[string]any{"prompt": "do the thing", "subagent_type": "general-purpose"}, optOn())
 	if d == nil || d.Action != ActionModify {
 		t.Fatalf("Agent should modify the prompt, got %+v", d)
 	}
@@ -180,28 +126,15 @@ func TestAgentPromptInjection(t *testing.T) {
 }
 
 func TestAgentTaskAliasInjects(t *testing.T) {
-	sid := freshSession(t)
-	d := RoutePreToolUse("Task", map[string]any{"prompt": "x"}, optOn(sid))
+	d := RoutePreToolUse("Task", map[string]any{"prompt": "x"}, optOn())
 	if d == nil || d.Action != ActionModify {
 		t.Fatalf("Task (legacy Agent) should modify the prompt, got %+v", d)
 	}
 }
 
-func TestExternalMCPNudgeGatedOnOptimizer(t *testing.T) {
-	sid := freshSession(t)
-	if d := RoutePreToolUse("mcp__slack__post", map[string]any{}, optOff(sid)); d != nil {
-		t.Errorf("external MCP nudge must be gated off when optimizer disabled, got %+v", d)
-	}
-	d := RoutePreToolUse("mcp__slack__post", map[string]any{}, optOn(sid))
-	if d == nil || d.Action != ActionContext {
-		t.Fatalf("external MCP should nudge when optimizer on, got %+v", d)
-	}
-}
-
-func TestAnchoredOwnToolsNotRoutedAsExternal(t *testing.T) {
-	sid := freshSession(t)
-	if d := RoutePreToolUse("mcp__anchored__anchored_save", map[string]any{}, optOn(sid)); d != nil {
-		t.Errorf("anchored's own tools must not get the external-MCP nudge, got %+v", d)
+func TestAnchoredOwnToolsPassThrough(t *testing.T) {
+	if d := RoutePreToolUse("mcp__anchored__anchored_save", map[string]any{}, optOn()); d != nil {
+		t.Errorf("anchored's own tools must pass through, got %+v", d)
 	}
 }
 
@@ -211,10 +144,21 @@ func TestFormatDecisionWireShapes(t *testing.T) {
 	if hso["permissionDecision"] != "deny" || hso["permissionDecisionReason"] != "no" {
 		t.Errorf("deny wire shape wrong: %+v", deny)
 	}
-	ctx := FormatDecision(&Decision{Action: ActionContext, AdditionalContext: "hi"})
-	hso2, _ := ctx["hookSpecificOutput"].(map[string]any)
-	if hso2["additionalContext"] != "hi" {
-		t.Errorf("context wire shape wrong: %+v", ctx)
+	if hso["hookEventName"] != "PreToolUse" {
+		t.Errorf("missing hookEventName: %+v", deny)
+	}
+	mod := FormatDecision(&Decision{Action: ActionModify, UpdatedInput: map[string]any{"prompt": "x"}})
+	hso2, _ := mod["hookSpecificOutput"].(map[string]any)
+	if _, ok := hso2["updatedInput"]; !ok {
+		t.Errorf("modify wire shape must carry updatedInput: %+v", mod)
+	}
+	// No PreToolUse output must ever carry additionalContext (the bug we fixed).
+	for _, m := range []map[string]any{deny, mod} {
+		if h, ok := m["hookSpecificOutput"].(map[string]any); ok {
+			if _, bad := h["additionalContext"]; bad {
+				t.Error("PreToolUse output must never include additionalContext")
+			}
+		}
 	}
 	if FormatDecision(nil) != nil {
 		t.Error("nil decision must format to nil (passthrough)")
