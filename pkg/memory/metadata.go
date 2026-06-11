@@ -38,8 +38,9 @@ const (
 	CurationStatusLowSignal = "low_signal"
 
 	// CurationRule values explaining a low_signal demotion.
-	CurationRuleQuality   = "quality"    // mechanical quality score below threshold
-	CurationRuleNeverUsed = "never_used" // injected many times, never drawn on
+	CurationRuleQuality      = "quality"      // mechanical quality score below threshold
+	CurationRuleNeverUsed    = "never_used"   // injected many times, never drawn on
+	CurationRuleConsolidated = "consolidated" // raw member of a synthesized cluster
 
 	// NeverUsedInjectionFloor is how many injections a memory gets before a
 	// zero used_count demotes it (Feature D). Generous on purpose: ten chances

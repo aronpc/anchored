@@ -146,9 +146,12 @@ func RecurateMetadata(m MemoryMetadata, content, category string, hasProject boo
 			m.CurationRule = CurationRuleNeverUsed
 			changed = true
 		}
-	case m.CurationStatus == CurationStatusLowSignal:
+	case m.CurationStatus == CurationStatusLowSignal && m.CurationRule != CurationRuleConsolidated:
 		// Neither demotion condition holds anymore (score recovered, memory
-		// got used, or it was pinned): lift the flag.
+		// got used, or it was pinned): lift the flag. Consolidated members
+		// are exempt — their demotion reflects a structural decision (a
+		// synthesis memory supersedes them), not a score, so only an explicit
+		// un-consolidation should lift it.
 		m.CurationStatus = ""
 		m.CurationRule = ""
 		changed = true

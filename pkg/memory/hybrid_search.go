@@ -412,8 +412,29 @@ func annotateBaseSignals(results []SearchResult, boostProjectID string, now time
 		if now.Sub(results[i].Memory.CreatedAt) <= 7*24*time.Hour {
 			results[i].Signals = appendSignal(results[i].Signals, "fresh")
 		}
+		if !meta.Pinned && !results[i].Memory.CreatedAt.IsZero() {
+			last := results[i].Memory.CreatedAt
+			if meta.LastUsedAt != "" {
+				if t, err := time.Parse(time.RFC3339, meta.LastUsedAt); err == nil && t.After(last) {
+					last = t
+				}
+			}
+			if now.Sub(last) > decayAgingAge {
+				results[i].Signals = appendSignal(results[i].Signals, "decayed")
+			}
+		}
 	}
 }
+
+// Age-decay bands (Feature E). Generous on purpose: decay is a gentle nudge
+// for never-reinforced memories, not a hard demotion — low_signal handles
+// those.
+const (
+	decayAgingAge    = 90 * 24 * time.Hour
+	decayAgingFactor = 0.85
+	decayStaleAge    = 180 * 24 * time.Hour
+	decayStaleFactor = 0.7
+)
 
 func appendSignal(sigs []string, s string) []string {
 	for _, existing := range sigs {
@@ -441,11 +462,38 @@ func applyLifecycleBoost(results []SearchResult, now time.Time) []SearchResult {
 		// quality-score band is a softer fallback for memories scored below
 		// threshold that were never flagged. Multiplying both stacked to
 		// ~0.0045 and effectively erased legitimate hits.
+		demoted := false
 		switch {
 		case meta.CurationStatus == CurationStatusLowSignal:
 			results[i].Score *= 0.03
+			demoted = true
 		case meta.QualityScore > 0 && meta.QualityScore < RemoteQualityThreshold && !meta.Pinned:
 			results[i].Score *= 0.15
+			demoted = true
+		}
+
+		// Age decay (Feature E): memories that were never drawn on fade
+		// gently with age instead of competing forever at full strength.
+		// Computed at search time — nothing is written back, so the decay is
+		// trivially reversible and never violates the "importance is only
+		// initialized, never reduced" rule. Reinforcement (any recorded use)
+		// resets the clock; pinned memories never decay, and decay never
+		// stacks on an already-demoted memory (the 0.5.8 lesson: stacked
+		// multipliers erase legitimate hits).
+		// A zero CreatedAt means "unknown", not "ancient" — never decay on it.
+		if !meta.Pinned && !demoted && !results[i].Memory.CreatedAt.IsZero() {
+			last := results[i].Memory.CreatedAt
+			if meta.LastUsedAt != "" {
+				if t, err := time.Parse(time.RFC3339, meta.LastUsedAt); err == nil && t.After(last) {
+					last = t
+				}
+			}
+			switch age := now.Sub(last); {
+			case age > decayStaleAge:
+				results[i].Score *= decayStaleFactor
+			case age > decayAgingAge:
+				results[i].Score *= decayAgingFactor
+			}
 		}
 
 		switch meta.Kind {

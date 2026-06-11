@@ -106,3 +106,19 @@ func TestRecurate_V3MigrationResetsInheritedInjections(t *testing.T) {
 		t.Errorf("scorer version must be stamped, got %d", got.ScorerVersion)
 	}
 }
+
+// TestRecurate_ConsolidatedNeverLifted: a consolidated member's demotion is
+// structural (a synthesis supersedes it) — the mechanical lift must not undo
+// it even though the quality score is fine and the memory is unused.
+func TestRecurate_ConsolidatedNeverLifted(t *testing.T) {
+	content := "we decided to adopt the tiered context budgeter for every hook injection path because it keeps the prompt size bounded and deterministic across sessions"
+	m := MemoryMetadata{
+		ScorerVersion:  QualityScorerVersion,
+		CurationStatus: CurationStatusLowSignal,
+		CurationRule:   CurationRuleConsolidated,
+	}
+	got, _ := RecurateMetadata(m, content, "decision", true, 0)
+	if got.CurationStatus != CurationStatusLowSignal || got.CurationRule != CurationRuleConsolidated {
+		t.Fatalf("consolidated demotion must survive recurate, got status=%q rule=%q", got.CurationStatus, got.CurationRule)
+	}
+}

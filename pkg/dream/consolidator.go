@@ -2,10 +2,14 @@ package dream
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
+	"time"
 )
 
 type ConsolidationResult struct {
@@ -232,7 +236,152 @@ func (c *DreamConsolidator) ApplyAction(ctx context.Context, actionID string) (*
 			Message:    fmt.Sprintf("memory %q consolidates %q (soft-deleted)", action.MemoryID, relatedID),
 		}, nil
 
+	case "synthesize":
+		return c.applySynthesize(ctx, action, actionID)
+
 	default:
 		return nil, fmt.Errorf("unknown action type %q", action.ActionType)
 	}
+}
+
+// applySynthesize consolidates a near-dup cluster (Feature E): a new summary
+// memory is created from the members' content (deterministic recap, no model)
+// and the raw members are DEMOTED — low_signal/consolidated, advisory and
+// reversible — never deleted. The summary records the member IDs in
+// metadata.consolidated; embedding stays NULL for the curation worker.
+func (c *DreamConsolidator) applySynthesize(ctx context.Context, action *DreamActionRecord, actionID string) (*ApplyActionResult, error) {
+	memberIDs := append([]string{action.MemoryID}, splitCSV(action.RelatedMemoryID)...)
+	if len(memberIDs) < 3 {
+		return nil, fmt.Errorf("synthesize requires a cluster of >= 3 members, got %d", len(memberIDs))
+	}
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(memberIDs)), ",")
+	args := make([]any, len(memberIDs))
+	for i, id := range memberIDs {
+		args[i] = id
+	}
+	rows, err := c.db.QueryContext(ctx, `
+		SELECT id, COALESCE(project_id, ''), category, content FROM memories
+		WHERE deleted_at IS NULL AND id IN (`+placeholders+`)
+		ORDER BY created_at DESC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("load cluster members: %w", err)
+	}
+	defer rows.Close()
+
+	type member struct{ id, projectID, category, content string }
+	var members []member
+	for rows.Next() {
+		var m member
+		if err := rows.Scan(&m.id, &m.projectID, &m.category, &m.content); err != nil {
+			continue
+		}
+		members = append(members, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("load cluster members: %w", err)
+	}
+	if len(members) < 3 {
+		return nil, fmt.Errorf("cluster shrank below 3 live members (%d), refusing to synthesize", len(members))
+	}
+
+	// Deterministic synthesis: newest member is the base, the others append
+	// as compact bullets. No model in the loop — the synthesis is honest
+	// about being a recap, not a rewrite.
+	var b strings.Builder
+	fmt.Fprintf(&b, "Consolidated from %d related memories: %s", len(members), strings.TrimSpace(members[0].content))
+	for _, m := range members[1:] {
+		fmt.Fprintf(&b, " | %s", truncate(strings.TrimSpace(m.content), 240))
+	}
+	content := b.String()
+
+	ids := make([]string, len(members))
+	for i, m := range members {
+		ids[i] = m.id
+	}
+	metaJSON, err := json.Marshal(map[string]any{
+		"memory_type":  "semantic",
+		"kind":         "summary",
+		"origin":       "dream",
+		"consolidated": ids,
+		"supersedes":   ids,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal synthesis metadata: %w", err)
+	}
+
+	// The three writes below (create summary, demote members, mark action
+	// applied) must land together — a partial apply would leave demoted
+	// members without their synthesis, or a synthesis nobody points at.
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin synthesize tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	newID := newDreamID()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO memories (id, project_id, category, content, content_hash, keywords, embedding,
+		                      source, created_at, updated_at, access_count, metadata, sync_dirty)
+		VALUES (?, NULLIF(?, ''), 'summary', ?, '', '[]', NULL, 'dream_consolidation',
+		        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 0, ?, 0)`,
+		newID, members[0].projectID, content, string(metaJSON)); err != nil {
+		return nil, fmt.Errorf("insert synthesis memory: %w", err)
+	}
+
+	// Demote (never delete) the raw members. curation_rule=consolidated is
+	// exempt from RecurateMetadata's lift, so the demotion is structural and
+	// stable until explicitly undone.
+	demoteArgs := make([]any, 0, len(ids)+1)
+	demoteArgs = append(demoteArgs, newID)
+	for _, id := range ids {
+		demoteArgs = append(demoteArgs, id)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE memories SET metadata = json_set(
+			COALESCE(NULLIF(NULLIF(metadata, ''), 'null'), '{}'),
+			'$.curation_status', 'low_signal',
+			'$.curation_rule', 'consolidated',
+			'$.consolidated_into', ?
+		), updated_at = CURRENT_TIMESTAMP
+		WHERE id IN (`+placeholders+`)`, demoteArgs...); err != nil {
+		return nil, fmt.Errorf("demote cluster members: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE dream_actions SET status = 'applied', applied_at = CURRENT_TIMESTAMP WHERE id = ?",
+		actionID); err != nil {
+		return nil, fmt.Errorf("update action status: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit synthesize tx: %w", err)
+	}
+
+	return &ApplyActionResult{
+		ActionID:   actionID,
+		ActionType: action.ActionType,
+		MemoryID:   newID,
+		Status:     "applied",
+		Message:    fmt.Sprintf("synthesized %d memories into summary %q (members demoted, not deleted)", len(members), newID),
+	}, nil
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// newDreamID generates a random 32-hex id, matching the format of the rest
+// of the store.
+func newDreamID() string {
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		return fmt.Sprintf("dream-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }

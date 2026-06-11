@@ -8,6 +8,7 @@ import (
 
 	"github.com/jholhewres/anchored/pkg/memory"
 	_ "github.com/mattn/go-sqlite3"
+	"strings"
 )
 
 func setupConsolidatorTestDB(t *testing.T) *sql.DB {
@@ -336,4 +337,73 @@ func containsSubstring(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestClustersFromPairs_UnionFind(t *testing.T) {
+	pairs := [][2]string{{"a", "b"}, {"b", "c"}, {"x", "y"}, {"c", "d"}}
+	clusters := clustersFromPairs(pairs, 3)
+	if len(clusters) != 1 {
+		t.Fatalf("want 1 cluster >=3 (a-b-c-d), got %d: %v", len(clusters), clusters)
+	}
+	if len(clusters[0]) != 4 || clusters[0][0] != "a" {
+		t.Errorf("cluster should be the sorted a-d component, got %v", clusters[0])
+	}
+	if got := clustersFromPairs([][2]string{{"p", "q"}}, 3); len(got) != 0 {
+		t.Errorf("pairs below minSize must not cluster, got %v", got)
+	}
+}
+
+func TestApplyAction_Synthesize_CreatesSummaryAndDemotes(t *testing.T) {
+	ctx := context.Background()
+	db := setupConsolidatorTestDB(t)
+	c := NewConsolidator(db, nil)
+
+	insertTestMemory(t, ctx, db, "mem-a", "the deploy pipeline requires TAG_NAME and DEPLOY_REASON")
+	insertTestMemory(t, ctx, db, "mem-b", "deploy pipeline validation needs TAG_NAME plus a reason")
+	insertTestMemory(t, ctx, db, "mem-c", "pipeline deploys are tag-driven with mandatory reason")
+	insertTestDreamAction(t, ctx, db, "act-syn", "mem-a", "mem-b,mem-c", "synthesize", 0.9, "proposed")
+
+	result, err := c.ApplyAction(ctx, "act-syn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "applied" {
+		t.Fatalf("want applied, got %q (%s)", result.Status, result.Message)
+	}
+
+	// A new summary memory exists, carrying the member IDs.
+	var newID, content, meta string
+	if err := db.QueryRowContext(ctx, `
+		SELECT id, content, metadata FROM memories
+		WHERE source = 'dream_consolidation' AND deleted_at IS NULL`).Scan(&newID, &content, &meta); err != nil {
+		t.Fatalf("synthesis memory not found: %v", err)
+	}
+	if !strings.Contains(content, "Consolidated from 3") {
+		t.Errorf("synthesis content unexpected: %s", content)
+	}
+	for _, id := range []string{"mem-a", "mem-b", "mem-c"} {
+		if !strings.Contains(meta, id) {
+			t.Errorf("metadata.consolidated missing %s: %s", id, meta)
+		}
+	}
+
+	// Members are demoted — never deleted.
+	for _, id := range []string{"mem-a", "mem-b", "mem-c"} {
+		var status, rule, into string
+		var deletedAt *string
+		if err := db.QueryRowContext(ctx, `
+			SELECT COALESCE(json_extract(metadata,'$.curation_status'),''),
+			       COALESCE(json_extract(metadata,'$.curation_rule'),''),
+			       COALESCE(json_extract(metadata,'$.consolidated_into'),''),
+			       deleted_at
+			FROM memories WHERE id = ?`, id).Scan(&status, &rule, &into, &deletedAt); err != nil {
+			t.Fatal(err)
+		}
+		if status != "low_signal" || rule != "consolidated" || into != newID {
+			t.Errorf("%s: status=%q rule=%q into=%q (want low_signal/consolidated/%s)", id, status, rule, into, newID)
+		}
+		if deletedAt != nil {
+			t.Errorf("%s must be demoted, NOT deleted", id)
+		}
+	}
 }
