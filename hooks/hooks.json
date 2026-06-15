@@ -34,7 +34,7 @@
         ]
       },
       {
-        "matcher": "mcp__",
+        "matcher": "mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -45,7 +45,16 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Write|Edit|Bash|mcp__anchored__",
+        "matcher": "Write|Edit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook posttooluse"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__anchored__.*",
         "hooks": [
           {
             "type": "command",
