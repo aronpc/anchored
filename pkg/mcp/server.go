@@ -749,6 +749,9 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		SessionID string `json:"session_id"`
 		// Debug surfaces per-result ranking signals and scores.
 		Debug bool `json:"debug"`
+		// Full lifts the per-hit preview cap (700 runes → 4096) for reading
+		// one specific memory in full. Pair with a low max_results.
+		Full bool `json:"full"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
@@ -758,6 +761,12 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	if limit <= 0 {
 		limit = 10
 	}
+
+	// Remote routing needs a real directory. An omitted cwd means "global
+	// LOCAL search", but it must not also silently mean "no team memory" —
+	// fall back to the server's own working directory (Claude Code launches
+	// the MCP server in the project dir), the same convention toolSave uses.
+	remoteCWD := defaultCWD(p.CWD)
 
 	// Explicit remote: query ONLY the remote server. A failure here must be
 	// VISIBLE in the output — falling back to local silently makes the agent
@@ -775,7 +784,7 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 			// that syncs to a named server is searched THERE — not on the
 			// default config entry, which may have never heard of it.
 			rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
-			entry, projectID = s.resolveAutoRemoteTarget(rctx, p.CWD)
+			entry, projectID = s.resolveAutoRemoteTarget(rctx, remoteCWD)
 			rcancel()
 			if entry == nil {
 				entry = s.resolveRemoteEntry(selector, p.CWD)
@@ -819,17 +828,17 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 			if len(results) == 0 {
 				return "<anchored_search count=\"0\" remote=\"" + escapeAttr(entry.Name) + "\"/>", nil
 			}
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "<anchored_search query=%q count=%q remote=%q>\n",
+			w := newSearchHitWriter(p.Full)
+			w.open("<anchored_search query=%q count=%q remote=%q>\n",
 				truncateRunes(p.Query, 200), fmt.Sprintf("%d", len(results)), escapeAttr(entry.Name))
 			for _, r := range results {
-				content := strings.ReplaceAll(r.Content, "\n", " ")
-				content = strings.ReplaceAll(content, "\r", " ")
-				fmt.Fprintf(&sb, "  <hit id=%q category=%q project=%q>%s</hit>\n",
-					r.ID, r.Category, r.ProjectID, escapeText(content))
+				w.hit([]string{
+					fmt.Sprintf("id=%q", escapeAttr(r.ID)),
+					fmt.Sprintf("category=%q", escapeAttr(r.Category)),
+					fmt.Sprintf("project=%q", escapeAttr(r.ProjectID)),
+				}, r.Content)
 			}
-			sb.WriteString("</anchored_search>")
-			return sb.String(), nil
+			return w.close(), nil
 		}
 	}
 
@@ -870,7 +879,13 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	remoteName := ""
 	if p.Remote == nil && s.cfg != nil {
 		rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if target, rpid := s.resolveAutoRemoteTarget(rctx, p.CWD); target != nil && rpid != "" {
+		if target, rpid := s.resolveAutoRemoteTarget(rctx, remoteCWD); target == nil || rpid == "" {
+			// Leave a trace: a configured-but-unresolved remote is the #1
+			// "why is team memory missing from my search?" report.
+			if s.hasAnyRemote() {
+				s.logger.Debug("auto remote merge: no project resolved for cwd", "cwd", remoteCWD)
+			}
+		} else {
 			client := remotesync.NewClientFromEntry(*target, "mcp")
 			if rs, rErr := client.SearchRemote(rctx, rpid, p.Query, limit); rErr == nil {
 				seen := make(map[string]bool, len(results))
@@ -909,7 +924,7 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	}
 
 	if len(remoteHits) == 0 {
-		out := renderSearchResults(p.Query, p.CWD == "", results, p.Debug)
+		out := renderSearchResults(p.Query, p.CWD == "", results, p.Debug, p.Full)
 		if fallbackAttrs != "" {
 			out = strings.Replace(out, "<anchored_search ", "<anchored_search"+fallbackAttrs+" ", 1)
 		}
@@ -920,12 +935,10 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 	// tagged origin="remote" so the agent can attribute them to the team
 	// memory server.
 	globalMode := p.CWD == ""
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "<anchored_search query=%q count=%q remote=%q>\n",
+	w := newSearchHitWriter(p.Full)
+	w.open("<anchored_search query=%q count=%q remote=%q>\n",
 		truncateRunes(p.Query, 200), fmt.Sprintf("%d", len(results)+len(remoteHits)), escapeAttr(remoteName))
 	for _, r := range results {
-		content := strings.ReplaceAll(r.Memory.Content, "\n", " ")
-		content = strings.ReplaceAll(content, "\r", " ")
 		attrs := []string{
 			fmt.Sprintf("id=%q", escapeAttr(r.Memory.ID)),
 			fmt.Sprintf("category=%q", escapeAttr(r.Memory.Category)),
@@ -937,16 +950,16 @@ func (s *Server) toolSearch(ctx context.Context, args json.RawMessage) (string, 
 		if p.Debug && len(r.Signals) > 0 {
 			attrs = append(attrs, fmt.Sprintf("signals=%q", escapeAttr(strings.Join(r.Signals, ","))))
 		}
-		fmt.Fprintf(&sb, "  <hit %s>%s</hit>\n", strings.Join(attrs, " "), escapeText(content))
+		w.hit(attrs, r.Memory.Content)
 	}
 	for _, r := range remoteHits {
-		content := strings.ReplaceAll(r.Content, "\n", " ")
-		content = strings.ReplaceAll(content, "\r", " ")
-		fmt.Fprintf(&sb, "  <hit id=%q category=%q origin=\"remote\">%s</hit>\n",
-			r.ID, r.Category, escapeText(content))
+		w.hit([]string{
+			fmt.Sprintf("id=%q", escapeAttr(r.ID)),
+			fmt.Sprintf("category=%q", escapeAttr(r.Category)),
+			`origin="remote"`,
+		}, r.Content)
 	}
-	sb.WriteString("</anchored_search>")
-	return sb.String(), nil
+	return w.close(), nil
 }
 
 // resolveRemoteEntry maps an explicit remote selector to a config entry:
@@ -969,14 +982,12 @@ func (s *Server) resolveRemoteEntry(selector, cwd string) *config.RemoteEntry {
 // attribute-level metadata + one entry per result. Score is rendered with
 // three decimals to keep the snippet stable across runs (BM25/RRF jitter at
 // the fourth decimal would create noisy diffs in tests).
-func renderSearchResults(query string, globalMode bool, results []memory.SearchResult, debug bool) string {
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "<anchored_search query=%q count=%q>\n",
+func renderSearchResults(query string, globalMode bool, results []memory.SearchResult, debug, full bool) string {
+	w := newSearchHitWriter(full)
+	w.open("<anchored_search query=%q count=%q>\n",
 		truncateRunes(query, 200), fmt.Sprintf("%d", len(results)),
 	)
 	for _, r := range results {
-		content := strings.ReplaceAll(r.Memory.Content, "\n", " ")
-		content = strings.ReplaceAll(content, "\r", " ")
 		var attrs []string
 		attrs = append(attrs,
 			fmt.Sprintf("id=%q", escapeAttr(r.Memory.ID)),
@@ -989,10 +1000,9 @@ func renderSearchResults(query string, globalMode bool, results []memory.SearchR
 		if debug && len(r.Signals) > 0 {
 			attrs = append(attrs, fmt.Sprintf("signals=%q", escapeAttr(strings.Join(r.Signals, ","))))
 		}
-		fmt.Fprintf(&sb, "  <hit %s>%s</hit>\n", strings.Join(attrs, " "), escapeText(content))
+		w.hit(attrs, r.Memory.Content)
 	}
-	sb.WriteString("</anchored_search>")
-	return sb.String()
+	return w.close()
 }
 
 func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, error) {
@@ -1010,9 +1020,7 @@ func (s *Server) toolSave(ctx context.Context, args json.RawMessage) (string, er
 		return "", fmt.Errorf("parse args: %w", err)
 	}
 
-	if p.CWD == "" {
-		p.CWD = "."
-	}
+	p.CWD = defaultCWD(p.CWD)
 
 	m, err := s.mem.SaveWithOptions(ctx, memory.SaveOptions{
 		Content:         p.Content,
@@ -1142,7 +1150,13 @@ func (s *Server) toolList(ctx context.Context, args json.RawMessage) (string, er
 
 	var lines []string
 	for i, m := range memories {
-		lines = append(lines, fmt.Sprintf("%d. [%s] %s — %s", i+1, m.Category, m.CreatedAt.Format("2006-01-02 15:04"), m.Content))
+		// One flattened, capped line per memory — a page of long multi-line
+		// memories would otherwise blow the response budget (the full text
+		// of one memory is readable via anchored_search full=true).
+		content := strings.ReplaceAll(m.Content, "\n", " ")
+		content = strings.ReplaceAll(content, "\r", " ")
+		lines = append(lines, fmt.Sprintf("%d. [%s] %s — %s",
+			i+1, m.Category, m.CreatedAt.Format("2006-01-02 15:04"), truncateRunes(content, listItemRunes)))
 	}
 
 	return fmt.Sprintf("Showing %d memories:\n\n%s", len(memories), joinLines(lines)), nil
@@ -1304,6 +1318,10 @@ func (s *Server) toolKGAdd(ctx context.Context, args json.RawMessage) (string, e
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("parse args: %w", err)
 	}
+	// Same convention as toolSave: an omitted cwd resolves to the server's
+	// own working directory so the triple lands project-scoped and the auto
+	// write-through below can find the linked remote.
+	p.CWD = defaultCWD(p.CWD)
 
 	var projectID *string
 	if pid := s.mem.ResolveProject(p.CWD); pid != "" {
@@ -1441,27 +1459,40 @@ func (s *Server) toolCtxExecute(ctx context.Context, args json.RawMessage) (stri
 		return fmt.Sprintf("TIMEOUT after %s", dur), nil
 	}
 	if exitCode != 0 {
-		return fmt.Sprintf("ERROR (exit %d): %s", exitCode, stderr), nil
+		return fmt.Sprintf("ERROR (exit %d): %s", exitCode, headTail(stderr, execErrHead, execErrTail)), nil
 	}
 	output := stdout
 	if truncated {
-		output += "\n[output truncated]"
+		output += "\n[output truncated by the sandbox cap]"
 	}
-	if len(output) > 5*1024 && p.Intent != "" {
-		if _, idxErr := s.optimizer.IndexRaw(ctx, stdout, "execute", "auto-indexed", projectID); idxErr != nil {
-			s.logger.Warn("ctx_execute: failed to index output", "error", idxErr)
-		}
-		hits, sErr := s.optimizer.Search(ctx, p.Intent, 5, "", "", projectID)
+	return s.renderExecOutput(ctx, output, stdout, p.Intent, projectID, dur), nil
+}
+
+// renderExecOutput bounds a successful execution's reply. Small outputs go
+// back verbatim; anything over execInlineBytes is indexed (so it stays
+// queryable) and answered with intent-matched sections or a head/tail
+// preview — never the full dump, which the harness would persist to a file
+// the agent then re-reads in slices or gives up on.
+func (s *Server) renderExecOutput(ctx context.Context, output, raw, intent, projectID, dur string) string {
+	if len(output) <= execInlineBytes {
+		return fmt.Sprintf("```\n%s\n```\nExit: 0 (%s)", output, dur)
+	}
+	if _, idxErr := s.optimizer.IndexRaw(ctx, raw, "execute", "auto-indexed", projectID); idxErr != nil {
+		s.logger.Warn("ctx_execute: failed to index output", "error", idxErr)
+	}
+	if intent != "" {
+		hits, sErr := s.optimizer.Search(ctx, intent, 5, "", "", projectID)
 		if sErr == nil && len(hits) > 0 {
 			var lines []string
 			for i, r := range hits {
 				lines = append(lines, fmt.Sprintf("%d. [%s] %s", i+1, r.Label, r.Snippet))
 			}
-			return fmt.Sprintf("Large output indexed (%d bytes). Matching sections:\n\n%s", len(stdout), joinLines(lines)), nil
+			return fmt.Sprintf("Large output indexed (%d bytes). Matching sections:\n\n%s", len(raw), joinLines(lines))
 		}
-		return fmt.Sprintf("Large output indexed (%d bytes). No sections matched intent.", len(stdout)), nil
+		return fmt.Sprintf("Large output indexed (%d bytes). No sections matched intent — query specifics with anchored_ctx_search(queries=[...]).", len(raw))
 	}
-	return fmt.Sprintf("```\n%s\n```\nExit: 0 (%s)", output, dur), nil
+	return fmt.Sprintf("Output indexed (%d bytes) — query specifics with anchored_ctx_search(queries=[...]). Preview:\n```\n%s\n```\nExit: 0 (%s)",
+		len(raw), headTail(output, execPreviewHead, execPreviewTail), dur)
 }
 
 func (s *Server) toolCtxExecuteFile(ctx context.Context, args json.RawMessage) (string, error) {
@@ -1498,13 +1529,13 @@ func (s *Server) toolCtxExecuteFile(ctx context.Context, args json.RawMessage) (
 		return fmt.Sprintf("TIMEOUT after %s", dur), nil
 	}
 	if exitCode != 0 {
-		return fmt.Sprintf("ERROR (exit %d): %s", exitCode, stderr), nil
+		return fmt.Sprintf("ERROR (exit %d): %s", exitCode, headTail(stderr, execErrHead, execErrTail)), nil
 	}
 	output := stdout
 	if truncated {
-		output += "\n[output truncated]"
+		output += "\n[output truncated by the sandbox cap]"
 	}
-	return fmt.Sprintf("```\n%s\n```\nExit: 0 (%s)", output, dur), nil
+	return s.renderExecOutput(ctx, output, stdout, p.Intent, projectID, dur), nil
 }
 
 func (s *Server) toolCtxBatchExecute(ctx context.Context, args json.RawMessage) (string, error) {
@@ -1558,7 +1589,8 @@ func (s *Server) toolCtxBatchExecute(ctx context.Context, args json.RawMessage) 
 	}
 	for i, r := range result.Results {
 		if r.ExitCode != 0 {
-			lines = append(lines, fmt.Sprintf("\nCommand %d failed (exit %d): %s", i+1, r.ExitCode, r.Stderr))
+			lines = append(lines, fmt.Sprintf("\nCommand %d failed (exit %d): %s",
+				i+1, r.ExitCode, headTail(r.Stderr, execErrHead, execErrTail)))
 		}
 	}
 	return joinLines(lines), nil
