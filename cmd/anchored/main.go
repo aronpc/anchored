@@ -71,6 +71,8 @@ func main() {
 		runRemote(os.Args[2:])
 	case "eval":
 		runEval(os.Args[2:])
+	case "backfill":
+		runBackfillEmbeddings(os.Args[2:])
 	case "--version", "-v":
 		fmt.Printf("anchored %s\n", Version)
 	case "--help", "-h":

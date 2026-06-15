@@ -464,7 +464,27 @@ func (s *Service) notifyObservers(fn func(obs MemoryObserver)) {
 	}
 }
 
+// EmbeddingsEnabled reports whether vector embedding is available (provider
+// loaded + cache present). Callers use it to skip embedding-only background
+// work (e.g. the serve-time backfill) instead of looping on a guaranteed error.
+func (s *Service) EmbeddingsEnabled() bool {
+	return s.embedder != nil && s.cache != nil
+}
+
+// BackfillEmbeddings embeds every memory still missing a vector, as fast as the
+// machine allows (no pause between batches). Used by the one-shot `import`
+// command where blocking-until-done is the desired behavior.
 func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, error) {
+	return s.BackfillEmbeddingsThrottled(ctx, batchSize, 0)
+}
+
+// BackfillEmbeddingsThrottled is the same backfill but sleeps `pause` between
+// batches so a long historical backfill on a user's machine stays gentle on the
+// CPU instead of pinning a core. It honors ctx cancellation between batches and
+// between items, so a serve shutdown stops it promptly. Idempotent and
+// resumable: it drains ListWithoutEmbedding, so re-running after an interrupted
+// pass just continues where it left off.
+func (s *Service) BackfillEmbeddingsThrottled(ctx context.Context, batchSize int, pause time.Duration) (int, error) {
 	if s.embedder == nil || s.cache == nil {
 		return 0, fmt.Errorf("embedder not available")
 	}
@@ -478,6 +498,10 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 	const maxStuck = 3
 
 	for {
+		if ctx.Err() != nil {
+			return total, ctx.Err()
+		}
+
 		mems, err := s.store.ListWithoutEmbedding(ctx, batchSize)
 		if err != nil {
 			return total, fmt.Errorf("list pending: %w", err)
@@ -488,6 +512,9 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 
 		batchOK := 0
 		for _, m := range mems {
+			if ctx.Err() != nil {
+				return total, ctx.Err()
+			}
 			vecs, err := s.embedder.Embed(ctx, []string{m.Content})
 			if err != nil || len(vecs) == 0 {
 				s.logger.Warn("backfill embedding failed", "id", m.ID, "error", err)
@@ -517,6 +544,14 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 			stuckCount = 0
 		}
 		lastTotal = total
+
+		if pause > 0 {
+			select {
+			case <-ctx.Done():
+				return total, ctx.Err()
+			case <-time.After(pause):
+			}
+		}
 	}
 
 	return total, nil
