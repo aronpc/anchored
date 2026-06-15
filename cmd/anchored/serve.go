@@ -7,20 +7,21 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/kg"
-	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/mcp"
+	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/session"
 	"github.com/jholhewres/anchored/pkg/updater"
 )
 
 func runServe() {
-	logger := slog.Default()
+	logger := newServeLogger()
 
 	cfg, err := loadConfig("")
 	if err != nil {
@@ -75,6 +76,28 @@ func runServe() {
 		slog.Error("serve error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// newServeLogger builds the logger for the long-running MCP server. It writes
+// to stderr (stdout is reserved for the JSON-RPC protocol over STDIO) but
+// defaults to WARN: MCP clients such as Cursor surface every stderr line as an
+// "[error]", so routine operational INFO (vector cache loaded, ONNX init,
+// recurring eviction cycles) used to flood the client's error pane with false
+// alarms. Warnings and errors still pass through. Set ANCHORED_LOG_LEVEL to
+// debug|info|warn|error to override (e.g. when diagnosing the server itself).
+func newServeLogger() *slog.Logger {
+	level := slog.LevelWarn
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ANCHORED_LOG_LEVEL"))) {
+	case "debug":
+		level = slog.LevelDebug
+	case "info":
+		level = slog.LevelInfo
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }
 
 func serveSTDIO(ctx context.Context, memSvc *memory.Service, cfg *config.Config, logFn *slog.Logger) error {
