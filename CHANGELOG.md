@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.9] - 2026-06-15
+
+Quiets the MCP server's log output and bounds every tool response that scales
+with stored or executed content, so neither floods the host (Cursor's error
+pane, or Claude Code's on-disk persistence of oversized results).
+
+### Fixed
+
+- **Server no longer spams MCP clients with false `[error]` lines** — the
+  `serve` logger now defaults to WARN instead of INFO. STDIO MCP clients (e.g.
+  Cursor) surface every stderr line as an `[error]`, so routine operational
+  INFO (`vector cache loaded`, `ONNX embedder initialized`, and the recurring
+  eviction-cycle logs that fire every few minutes) was showing up as a steady
+  stream of fake errors in the client's log pane. Warnings and errors still
+  pass through; set `ANCHORED_LOG_LEVEL=debug|info|warn|error` to override when
+  diagnosing the server itself.
+- **Tool responses are now bounded** — `anchored_search`, `anchored_list`, and
+  `anchored_execute`/`execute_file`/`batch_execute` cap their output (per-hit
+  rune cap + whole-response byte budget; head/tail previews for large execution
+  output and echoed stderr). An oversized result used to be persisted to a file
+  by Claude Code, defeating the point of the plugin; over-budget search hits are
+  now counted in an `<omitted>` note instead of silently dropped.
+- **Team memory no longer silently skipped on an omitted `cwd`** — search, save,
+  and `kg_add` resolve an empty `cwd` to the server's working directory (the
+  same convention `save` already used), so the auto remote merge can find the
+  linked project instead of degrading to local-only. An unresolved-but-
+  configured remote now leaves a debug trace.
+- **Hook matchers corrected** — `mcp__` → `mcp__.*` and the `PostToolUse`
+  matcher split so `Write|Edit|Bash` and `mcp__anchored__.*` are matched
+  independently.
+
+### Added
+
+- **`anchored backfill`** — standalone, observable one-shot that embeds every
+  memory still missing a vector (`--batch`, `--pause` to stay gentle on CPU).
+  Idempotent and resumable; does not depend on the MCP server being up.
+- **`anchored_search` `full=true`** — lifts the per-hit preview cap for reading
+  one specific memory in full (pair with a low `max_results`).
+- **`context_gate` plugin option** (off by default) — optional deterministic
+  PreToolUse enforcement that the agent consult anchored memory before its first
+  substantive tool call in a session. Bounded and fail-open: relents after a few
+  denies and never hard-blocks the user.
+
 ## [0.8.8] - 2026-06-11
 
 Observability pass over the MCP tools and hooks: failures that used to vanish
