@@ -101,6 +101,16 @@ type PluginConfig struct {
 	// AdaptiveReminder controls whether the UserPromptSubmit hook adjusts
 	// the recall reminder based on the quality of the hits. nil resolves to true.
 	AdaptiveReminder *bool `yaml:"adaptive_reminder"`
+	// ContextGate controls the PreToolUse enforcement that requires the agent
+	// to consult anchored memory before its first substantive tool call in a
+	// session:
+	//   "off"     — no enforcement (default; soft recall injection only)
+	//   "enforce" — deny the first work tool until the agent calls
+	//               anchored_context/anchored_search, then never again that
+	//               session. Relents after a few denies so it can NEVER
+	//               hard-block the user.
+	// Empty resolves to "off". "on" is accepted as an alias for "enforce".
+	ContextGate string `yaml:"context_gate"`
 }
 
 // AutoRecallMode resolves the configured mode to one of off|hits|full,
@@ -147,6 +157,17 @@ func (p PluginConfig) AdaptiveReminderEnabled() bool {
 		return *p.AdaptiveReminder
 	}
 	return true
+}
+
+// ContextGateMode resolves the configured context-gate mode to one of
+// off|enforce, defaulting to "off". "on" is accepted as an alias for "enforce".
+func (p PluginConfig) ContextGateMode() string {
+	switch p.ContextGate {
+	case "enforce", "on":
+		return "enforce"
+	default:
+		return "off"
+	}
 }
 
 // DebugConfig controls anchored's optional NDJSON event log.

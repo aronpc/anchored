@@ -115,14 +115,31 @@ func runHookPreToolUse(args []string) {
 		}
 	}
 
+	// Load config once for both the context gate and the routing/optimizer
+	// gating below. A load failure leaves cfg nil — both features then no-op
+	// (fail-open), and routing falls back to optimizer-disabled behavior.
+	cfg, _ := loadConfig(*configPath)
+
+	// Context gate: optional deterministic enforcement that the agent consult
+	// anchored memory (anchored_context/search) before its first substantive
+	// tool call in a session. Off by default; only "enforce" arms it. Runs
+	// after the security blocks (a gate deny must never pre-empt a security
+	// deny) and before routing (a gated tool need not be routed).
+	if cfg != nil && cfg.Plugin.ContextGateMode() == "enforce" {
+		if dec, stage := contextGateDecision(cfg.Memory.StorageDir, input.SessionID, bareTool, tool); dec != nil {
+			dlog.Event("hook.pretooluse", map[string]any{"stage": "context_gate_" + stage, "tool": tool})
+			emitDecision(dec)
+			return
+		} else if stage == "satisfied" {
+			dlog.Event("hook.pretooluse", map[string]any{"stage": "context_gate_satisfied", "tool": tool})
+		}
+	}
+
 	// Routing: steer native exploration tools (Read/Grep/Glob/Bash/WebFetch/
 	// Agent and external MCP) toward anchored's memory + sandbox tools. The
 	// optimizer flag gates sandbox redirects so we never deny into a tool that
 	// would itself error when context_optimizer is disabled.
-	optimizerEnabled := false
-	if cfg, cfgErr := loadConfig(*configPath); cfgErr == nil && cfg != nil {
-		optimizerEnabled = cfg.ContextOptimizer.Enabled
-	}
+	optimizerEnabled := cfg != nil && cfg.ContextOptimizer.Enabled
 	decision := hookroute.RoutePreToolUse(tool, args2, hookroute.Options{
 		OptimizerEnabled: optimizerEnabled,
 		SubagentBlock:    mcp.AnchoredSubagentBlock,
