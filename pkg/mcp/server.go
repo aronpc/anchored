@@ -165,7 +165,7 @@ func (s *Server) handleInitialize(id json.RawMessage, params json.RawMessage) []
 			Name:    "anchored",
 			Version: s.version,
 		},
-		Instructions: AnchoredRoutingBlock,
+		Instructions: AnchoredMCPInstructions,
 	}
 	result.Capabilities.Tools.ListChanged = false
 	result.Capabilities.Resources.Subscribe = false
