@@ -27,6 +27,37 @@ func TestPluginConfig_AdaptiveReminderEnabled_Defaults(t *testing.T) {
 	}
 }
 
+// The context gate is forced ON by default: empty, "on", "enforce", and the
+// legacy "off" (the value older defaults serialized into existing configs)
+// all resolve to "enforce", so a version bump alone arms the gate with no
+// config edit. Only a deliberate "disabled" opts out.
+func TestPluginConfig_ContextGateMode_ForcedOnByDefault(t *testing.T) {
+	for _, v := range []string{"", "on", "enforce", "off", "OFF", "garbage"} {
+		p := PluginConfig{ContextGate: v}
+		if got := p.ContextGateMode(); got != "enforce" {
+			t.Errorf("ContextGateMode(%q) = %q, want enforce (gate forced on)", v, got)
+		}
+	}
+	if got := (PluginConfig{ContextGate: "disabled"}).ContextGateMode(); got != "off" {
+		t.Errorf("ContextGateMode(disabled) = %q, want off (the only opt-out)", got)
+	}
+}
+
+// Auto-recall defaults to the richest "full" mode for empty/unknown values;
+// explicit "off"/"hits" still opt down.
+func TestPluginConfig_AutoRecallMode_DefaultsFull(t *testing.T) {
+	for _, v := range []string{"", "garbage"} {
+		if got := (PluginConfig{AutoRecall: v}).AutoRecallMode(); got != "full" {
+			t.Errorf("AutoRecallMode(%q) = %q, want full (default)", v, got)
+		}
+	}
+	for _, v := range []string{"off", "hits", "full"} {
+		if got := (PluginConfig{AutoRecall: v}).AutoRecallMode(); got != v {
+			t.Errorf("AutoRecallMode(%q) = %q, want %q (explicit honored)", v, got, v)
+		}
+	}
+}
+
 func TestPluginConfig_SessionStartBudget_ExplicitZero(t *testing.T) {
 	v := 0
 	p := PluginConfig{SessionStartBudgetBytes: &v}

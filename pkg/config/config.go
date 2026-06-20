@@ -85,7 +85,8 @@ type PluginConfig struct {
 	//   "off"  — inject only the routing reminder (no retrieval)
 	//   "hits" — inject the routing reminder + top relevant memories (default)
 	//   "full" — "hits" plus recent artifacts (test reports, stack traces)
-	// Empty resolves to "hits".
+	// Empty/unknown resolves to "full" — the most complete push within the
+	// hook byte budget, so a version bump alone gives the richest recall.
 	AutoRecall string `yaml:"auto_recall"`
 	// HookBudgetBytes caps the size of the auto-recall context block. Lowest-
 	// relevance hits are dropped to fit rather than truncating mid-content.
@@ -104,23 +105,33 @@ type PluginConfig struct {
 	// ContextGate controls the PreToolUse enforcement that requires the agent
 	// to consult anchored memory before its first substantive tool call in a
 	// session:
-	//   "off"     — no enforcement (default; soft recall injection only)
 	//   "enforce" — deny the first work tool until the agent calls
 	//               anchored_context/anchored_search, then never again that
 	//               session. Relents after a few denies so it can NEVER
-	//               hard-block the user.
-	// Empty resolves to "off". "on" is accepted as an alias for "enforce".
+	//               hard-block the user. This is the default: soft injection
+	//               (SessionStart block, UserPromptSubmit recall) is reliably
+	//               ignored by some agents — Claude Code in particular — when
+	//               handed a concrete task, so the deterministic gate is the
+	//               only channel that makes them actually consult memory.
+	//   "disabled" — the ONLY opt-out: no enforcement (soft recall injection
+	//               only). For users who deliberately don't want the
+	//               one-deny-per-session.
+	// Every other value — empty, "on", "enforce", and the legacy "off" that
+	// the previous default serialized into existing configs — resolves to
+	// "enforce", so a version bump alone forces the gate on without any
+	// config edit.
 	ContextGate string `yaml:"context_gate"`
 }
 
 // AutoRecallMode resolves the configured mode to one of off|hits|full,
-// defaulting to "hits" for any empty/unknown value.
+// defaulting to "full" for any empty/unknown value so recall is richest
+// out of the box. An explicit "off" or "hits" still opts down.
 func (p PluginConfig) AutoRecallMode() string {
 	switch p.AutoRecall {
 	case "off", "hits", "full":
 		return p.AutoRecall
 	default:
-		return "hits"
+		return "full"
 	}
 }
 
@@ -160,13 +171,22 @@ func (p PluginConfig) AdaptiveReminderEnabled() bool {
 }
 
 // ContextGateMode resolves the configured context-gate mode to one of
-// off|enforce, defaulting to "off". "on" is accepted as an alias for "enforce".
+// off|enforce, defaulting to "enforce".
+//
+// The gate is forced ON for every value EXCEPT a deliberate "disabled"
+// opt-out. This is intentional: soft injection is reliably ignored by some
+// agents (Claude Code especially), so the gate is the only channel that makes
+// them consult memory — it must therefore be the floor behavior. Crucially,
+// the legacy literal "off" (the value the previous default serialized into
+// existing config.yaml files) ALSO resolves to "enforce", so users get the
+// gate by simply updating the binary, with no config edit. A user who truly
+// wants the gate off must opt out explicitly with `context_gate: disabled`.
 func (p PluginConfig) ContextGateMode() string {
 	switch p.ContextGate {
-	case "enforce", "on":
-		return "enforce"
-	default:
+	case "disabled":
 		return "off"
+	default:
+		return "enforce"
 	}
 }
 
@@ -266,6 +286,12 @@ func Defaults() *Config {
 			VectorWeight: 0.7,
 			BM25Weight:   0.3,
 			MaxResults:   20,
+			// On by default so fresh installs get ranked, deduplicated,
+			// freshness-aware results out of the box — not raw BM25 order.
+			MMREnabled:                true,
+			MMRLambda:                 0.7,
+			TemporalDecayEnabled:      true,
+			TemporalDecayHalfLifeDays: 30,
 		},
 		Sanitizer: SanitizerConfig{
 			Enabled: false,
