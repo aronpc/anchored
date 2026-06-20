@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,8 +17,8 @@ import (
 	"github.com/jholhewres/anchored/pkg/debuglog"
 	"github.com/jholhewres/anchored/pkg/intent"
 	"github.com/jholhewres/anchored/pkg/kg"
-	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/mcp"
+	"github.com/jholhewres/anchored/pkg/memory"
 	"github.com/jholhewres/anchored/pkg/session"
 )
 
@@ -185,6 +186,19 @@ func autoRecallPreview(configPath, cwd, prompt, sessionID string, dlog *debuglog
 	allAnchorTokens := anchorTokens(fileAnchors, symAnchors, wsSignals)
 	hits = reRankHits(hits, allAnchorTokens, fileAnchors, wsSignals)
 
+	// ── P1-1: memory-to-memory vector expansion (full mode only) ─────────────
+	// Keyword recall can miss memories that are semantically related but share
+	// no literal tokens. We can't embed the raw prompt in-hook (separate
+	// process, no warm ONNX embedder, mutex + cold-start blow the budget), but
+	// we CAN use the top BM25 hit's PRECOMPUTED embedding as a seed vector and
+	// pull its nearest neighbours from the vector cache — real vector recall
+	// with zero embedding work. Gated to "full" mode and to a non-saturated BM25
+	// result (room to add value); fully bounded + fail-open so it can never
+	// delay or block the prompt.
+	if mode == "full" && len(hits) > 0 && len(hits) < preSearchLimit {
+		hits = vectorExpandHits(hc.db, hits, projectID, dlog)
+	}
+
 	// For debugging/test intents in "full" mode, surface the most recent
 	// captured artifacts so the model can pull the failing test output or
 	// stack trace without guessing it exists.
@@ -194,8 +208,21 @@ func autoRecallPreview(configPath, cwd, prompt, sessionID string, dlog *debuglog
 	}
 
 	if len(hits) == 0 && len(arts) == 0 {
+		// Semantic-miss recovery. We reached here only because the prompt
+		// cleared the retrieval threshold (trivial/below-threshold prompts
+		// already returned ""), yet keyword (BM25) recall found nothing. That
+		// is exactly the case the BM25-only push is blind to: a prompt that is
+		// semantically related to a stored memory but shares no literal tokens.
+		// True in-hook vector recall is not possible cheaply (the hook is a
+		// separate process with no warm ONNX embedder, and embedding a fresh
+		// prompt would block on the embedder mutex past the hook budget), so we
+		// do the next best, zero-cost thing: tell the model that keyword recall
+		// came up empty and to call anchored_search, whose hybrid BM25+vector
+		// search in the serve process CAN catch the semantic match. This turns a
+		// silent miss into a directed tool call instead of just the generic
+		// reminder.
 		dlog.Event("hook.userpromptsubmit.recall", map[string]any{"stage": "no_hits", "intent": string(in.Kind), "query": debuglog.Snippet(expandedQ, 80)})
-		return ""
+		return renderRecallMissNudge(expandedQ)
 	}
 
 	// ── G2: KG lookup for anchors ─────────────────────────────────────────────
@@ -789,6 +816,155 @@ func sanitizeFTSQuery(s string) string {
 		filtered = filtered[:16]
 	}
 	return strings.Join(filtered, " ")
+}
+
+// Vector-expansion tuning. These bound the cost so the push stays inside the
+// hook budget and never embeds the raw prompt.
+const (
+	// vectorExpandBudget hard-caps the whole expansion (cache load + score +
+	// fetch). On timeout we return the BM25 hits unchanged — fail-open.
+	vectorExpandBudget = 100 * time.Millisecond
+	// vectorExpandTopK is how many neighbours Score returns before filtering.
+	vectorExpandTopK = 8
+	// vectorExpandMax caps how many NEW memories we merge into the push.
+	vectorExpandMax = 3
+	// vectorExpandMinScore is the cosine floor for a neighbour to be worth
+	// surfacing — below this the "semantic" link is noise.
+	vectorExpandMinScore = 0.6
+)
+
+// vectorExpandHits augments the BM25 hits with semantically-near memories using
+// the top hit's precomputed embedding as the seed (no raw-prompt embedding).
+// The vector cache load is unbounded by ctx, so the whole computation runs in a
+// goroutine guarded by vectorExpandBudget; on timeout/empty/error the original
+// hits are returned unchanged. Fail-open by contract.
+func vectorExpandHits(db *sql.DB, hits []preSearchHit, projectID string, dlog *debuglog.Logger) []preSearchHit {
+	ch := make(chan []preSearchHit, 1) // buffered: a late goroutine never leaks/blocks
+	go func() {
+		// Discard logger: VectorCache.Load logs an Info line per call, which
+		// would spam the hook's stderr on every prompt.
+		vc := memory.NewVectorCache(slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err := vc.Load(db); err != nil || vc.Len() == 0 {
+			ch <- nil
+			return
+		}
+		ch <- expandFromCache(vc, db, hits, projectID)
+	}()
+
+	select {
+	case extra := <-ch:
+		if len(extra) == 0 {
+			return hits
+		}
+		dlog.Event("hook.userpromptsubmit.recall", map[string]any{"stage": "vector_expanded", "added": len(extra)})
+		return append(hits, extra...)
+	case <-time.After(vectorExpandBudget):
+		dlog.Event("hook.userpromptsubmit.recall", map[string]any{"stage": "vector_expand_timeout"})
+		return hits
+	}
+}
+
+// expandFromCache scores the cache against the top hit's precomputed vector and
+// returns up to vectorExpandMax NEW memories (not already in hits) tagged with a
+// "vector" signal. Split out from vectorExpandHits so tests can drive it with a
+// Put-populated cache instead of a Load from disk.
+func expandFromCache(vc *memory.VectorCache, db *sql.DB, hits []preSearchHit, projectID string) []preSearchHit {
+	if len(hits) == 0 {
+		return nil
+	}
+	seed, ok := vc.Get(hits[0].ID)
+	if !ok || len(seed) == 0 {
+		return nil
+	}
+	norm := memory.VectorNorm(seed)
+	if norm == 0 {
+		return nil
+	}
+
+	existing := make(map[string]bool, len(hits))
+	for _, h := range hits {
+		existing[h.ID] = true
+	}
+
+	var newIDs []string
+	for _, s := range vc.Score(seed, norm, vectorExpandMinScore, vectorExpandTopK) {
+		if existing[s.ID] {
+			continue // already in the BM25 set (incl. the seed itself, score 1.0)
+		}
+		newIDs = append(newIDs, s.ID)
+		if len(newIDs) >= vectorExpandMax {
+			break
+		}
+	}
+	if len(newIDs) == 0 {
+		return nil
+	}
+
+	out := fetchMemoriesByIDs(db, newIDs, projectID)
+	for i := range out {
+		out[i].Signals = appendUnique(out[i].Signals, "vector")
+	}
+	return out
+}
+
+// fetchMemoriesByIDs loads id/category/content for the given memory IDs, keeping
+// the same liveness/quality filters as bm25TopHits (skip deleted + low_signal,
+// project-scope when projectID != ""). Order follows the input ids slice.
+func fetchMemoriesByIDs(db *sql.DB, ids []string, projectID string) []preSearchHit {
+	if len(ids) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+2)
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, projectID, projectID)
+	stmt := `SELECT id, category, content FROM memories
+		WHERE id IN (` + strings.Join(placeholders, ",") + `)
+		  AND deleted_at IS NULL
+		  AND COALESCE(json_extract(metadata, '$.curation_status'), '') != 'low_signal'
+		  AND (? = '' OR project_id = ?)`
+
+	ctx, cancel := context.WithTimeout(context.Background(), preSearchTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, stmt, args...)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	byID := make(map[string]preSearchHit, len(ids))
+	for rows.Next() {
+		var h preSearchHit
+		if err := rows.Scan(&h.ID, &h.Category, &h.Content); err != nil {
+			continue
+		}
+		byID[h.ID] = h
+	}
+	// Preserve the (relevance-ordered) input order.
+	out := make([]preSearchHit, 0, len(ids))
+	for _, id := range ids {
+		if h, ok := byID[id]; ok {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// renderRecallMissNudge builds the semantic-miss nudge injected when keyword
+// recall found nothing for a threshold-passing prompt. It is intentionally
+// short and adds no DB/embedding work: its whole job is to redirect the model
+// to anchored_search (hybrid BM25+vector in the serve process), which can find
+// the semantic match that the hook's keyword-only pass cannot. The query is
+// echoed (rune-capped, escaped) so the model sees what was already tried.
+func renderRecallMissNudge(query string) string {
+	return fmt.Sprintf("<anchored_recall query=%q hits=\"0\">\n"+
+		"  Keyword recall found no stored memories for this prompt. If it touches prior work, "+
+		"decisions, conventions, preferences, or a named project/library, call anchored_search "+
+		"before relying on the codebase — its hybrid semantic+keyword search catches matches this "+
+		"keyword-only pass misses.\n</anchored_recall>", truncateRunes(query, 80))
 }
 
 // renderRecallPreview renders the recall block under a byte budget. Hits are
