@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -51,6 +52,13 @@ type PostToolUseDeps struct {
 	// into the session working set so retrieval can boost in-focus memories.
 	// nil disables the update. Best-effort; errors never block the tool call.
 	UpdateWorkingSet func(sessionID, projectID string, files, commands, tests []string) error
+	// GateStorageDir + GateEnforced wire the redundant context-gate
+	// satisfaction path: when the gate is enforced and this PostToolUse event
+	// is a satisfying anchored tool call, mark the session's gate satisfied so
+	// a missed PreToolUse credit can't strand the gate in deny-then-relent.
+	// Empty GateStorageDir / false GateEnforced disables it (a no-op).
+	GateStorageDir string
+	GateEnforced   bool
 }
 
 // ExecContexter is the small slice of *sql.DB the hook actually needs;
@@ -131,6 +139,8 @@ func runHookPostToolUse(args []string) {
 		Logger:           dlog,
 		CaptureArtifact:  capture,
 		UpdateWorkingSet: updateWorkingSet,
+		GateStorageDir:   hc.cfg.Memory.StorageDir,
+		GateEnforced:     hc.cfg.Plugin.ContextGateMode() == "enforce",
 	})
 }
 
@@ -169,6 +179,20 @@ func recordPostToolUseEvent(deps PostToolUseDeps) {
 		dlog.Event("hook.posttooluse", map[string]any{"stage": "missing_session_id"})
 		writePostToolUseResp(deps.Stdout, map[string]any{"recorded": false, "reason": "missing session_id"})
 		return
+	}
+
+	// Redundant context-gate satisfaction: if the agent just ran a satisfying
+	// anchored tool, credit it here too (PreToolUse may have missed it on a
+	// stale plugin matcher). Done before the artifact early-return so a large
+	// anchored_search response still satisfies the gate. Best-effort.
+	if deps.GateEnforced {
+		bareTool := input.ToolName
+		if i := strings.LastIndex(bareTool, "__"); i >= 0 {
+			bareTool = bareTool[i+2:]
+		}
+		if satisfyGateFromPostToolUse(deps.GateStorageDir, sessionID, bareTool) {
+			dlog.Event("hook.posttooluse", map[string]any{"stage": "context_gate_satisfied", "tool": input.ToolName})
+		}
 	}
 
 	cwdVal := input.Cwd

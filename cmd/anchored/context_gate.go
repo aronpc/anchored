@@ -135,6 +135,24 @@ func contextGateDecision(storageDir, sessionID, bareTool, fullTool string) (*hoo
 	}, "denied"
 }
 
+// satisfyGateFromPostToolUse is the redundant satisfaction path. PostToolUse
+// fires AFTER a tool runs, so if the agent DID call a satisfying anchored tool
+// (anchored_context/search/ctx_search/kg_query), mark the gate satisfied for
+// the rest of the session — even when the PreToolUse credit was missed. The
+// missed-credit case is real: a stale plugin hooks.json whose PreToolUse
+// matcher doesn't fire for mcp__ tools would otherwise let the gate deny the
+// agent's work three times and relent, never crediting the memory call. This
+// PostToolUse path closes that hole. Best-effort and a no-op unless the tool is
+// a satisfying anchored tool. Returns true when it wrote the satisfied marker.
+func satisfyGateFromPostToolUse(storageDir, sessionID, bareTool string) bool {
+	if storageDir == "" || sessionID == "" || !contextGateSatisfyingTools[bareTool] {
+		return false
+	}
+	gateDir := filepath.Join(storageDir, "ctxgate")
+	writeGateMarker(gateDir, filepath.Join(gateDir, sanitizeSessionID(sessionID)), ctxGateSatisfied)
+	return true
+}
+
 // writeGateMarker best-effort writes content to the session marker, creating the
 // gate dir if needed. Errors are swallowed: a failed write degrades to "gate not
 // yet satisfied", which at worst costs one extra (bounded) deny — never a block.
