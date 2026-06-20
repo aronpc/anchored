@@ -131,6 +131,9 @@ func contextGateDecision(storageDir, sessionID, bareTool, fullTool string) (*hoo
 			"anchored_context(cwd: \"<this project's absolute path>\") to load identity, " +
 			"the project, and recent decisions — your prior work and the user's conventions " +
 			"live there, not in the codebase. (Already know what you need? anchored_search works too.) " +
+			"If the anchored_* tools are not loaded yet (deferred — a direct call fails as not-found), " +
+			"FIRST run ToolSearch(query: \"select:mcp__anchored__anchored_context,mcp__anchored__anchored_search\") " +
+			"to load them, THEN call anchored_context — do not retry the blocked tool until you have. " +
 			"This gate runs once per session.",
 	}, "denied"
 }
