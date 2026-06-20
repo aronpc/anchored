@@ -57,8 +57,8 @@ type PluginDrift struct {
 	MirrorVersion     string // version field of mirror's plugin.json; "" when unreadable
 	CacheVersion      string // newest semver dir under CacheDir; "" when absent
 	HasDrift          bool
-	MirrorBehind      bool   // mirror lags binary (anchored can fix via git pull)
-	CacheBehind       bool   // cache lags mirror/binary
+	MirrorBehind      bool // mirror lags binary (anchored can fix via git pull)
+	CacheBehind       bool // cache lags mirror/binary
 	MarketplaceDir    string
 	CacheDir          string
 	RegistryPath      string // resolved path to installed_plugins.json (for tests)
@@ -298,7 +298,61 @@ func gitFastForward(dir string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), gitFastForwardTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "pull", "--ff-only", "--quiet")
+
+	// Fast path: a clean mirror fast-forwards cleanly.
+	if out, err := runGitCmd(ctx, dir, "pull", "--ff-only", "--quiet"); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("timeout after %s", gitFastForwardTimeout)
+		}
+		// Recovery path: the marketplace mirror is a MANAGED, read-only cache.
+		// A dirty worktree (e.g. a hand-edited hooks/hooks.json, plus a stray
+		// .bak file) makes `--ff-only` fail and permanently pins the user to a
+		// stale plugin version — the documented cause of "auto-sync failed:
+		// local changes would be overwritten by merge". Since nothing in the
+		// mirror is the user's to keep, hard-reset it to its upstream and retry
+		// once. This is what makes "just update the binary" actually heal the
+		// plugin install instead of wedging on a leftover local edit.
+		if rerr := gitHardResetToUpstream(ctx, dir); rerr != nil {
+			return fmt.Errorf("ff-only failed (%s); hard-reset recovery failed: %w",
+				strings.TrimSpace(string(out)), rerr)
+		}
+		return nil
+	}
+	return nil
+}
+
+// gitHardResetToUpstream force-syncs a managed mirror to its tracked upstream,
+// discarding any local commits, working-tree edits, and untracked files. It is
+// ONLY called after `--ff-only` has already failed on a cache directory the
+// user does not own, so the destructive reset is safe by construction. Best
+// effort within the caller's context budget.
+func gitHardResetToUpstream(ctx context.Context, dir string) error {
+	if _, err := runGitCmd(ctx, dir, "fetch", "--quiet", "origin"); err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return fmt.Errorf("fetch timeout after %s", gitFastForwardTimeout)
+		}
+		return fmt.Errorf("fetch failed: %w", err)
+	}
+	// Prefer the configured upstream (@{u}); fall back to origin/HEAD then
+	// origin/main so a mirror with no tracking ref still recovers.
+	var lastErr error
+	for _, ref := range []string{"@{u}", "origin/HEAD", "origin/main"} {
+		if _, err := runGitCmd(ctx, dir, "reset", "--hard", "--quiet", ref); err == nil {
+			// Drop the stray .bak / untracked files that also block ff-only.
+			_, _ = runGitCmd(ctx, dir, "clean", "-fd", "--quiet")
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return fmt.Errorf("reset --hard failed for all refs: %w", lastErr)
+}
+
+// runGitCmd runs a git subcommand in dir with a non-interactive environment so
+// a missing credential never hangs the SessionStart hook, and returns combined
+// output. Shared by the fast-forward and hard-reset recovery paths.
+func runGitCmd(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	// Strip anything that could open an interactive prompt: no terminal
 	// prompts, no SSH askpass GUI, no credential helper UI. If auth is
@@ -312,12 +366,9 @@ func gitFastForward(dir string) error {
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("timeout after %s", gitFastForwardTimeout)
-		}
-		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+		return out, fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return out, nil
 }
 
 // renderPluginUpdateNotice builds an XML snippet for the SessionStart
