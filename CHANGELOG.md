@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.0] - 2026-06-20
+
+Makes anchored reliably invoked on every session and prompt — especially in
+Claude Code, which routinely ignored the soft memory-routing injection when
+handed a concrete task. The context gate becomes the floor behavior, the plugin
+self-heals a wedged marketplace mirror, the MCP instructions survive client
+truncation, and the recall push gains real vector recall.
+
+### Changed
+
+- **Context gate is ON by default** — `context_gate` now resolves to `enforce`
+  for every value except an explicit `context_gate: disabled` (the only opt-out).
+  The legacy `off` the previous default serialized into existing configs also
+  resolves to `enforce`, so a version bump alone arms the gate with no config
+  edit. It still fires at most once per session and relents after a few denies,
+  so it can never hard-block work.
+- **Auto-recall defaults to `full`**, and `Defaults()` now enables MMR and
+  temporal decay, so fresh installs get ranked, deduplicated, freshness-aware
+  results out of the box instead of raw BM25 order.
+
+### Added
+
+- **Vector recall in the UserPromptSubmit push** — when keyword (BM25) recall is
+  sparse, anchored seeds from the top hit's precomputed embedding and pulls its
+  nearest neighbours from the vector cache (memory-to-memory expansion, no
+  raw-prompt embedding), bounded by a 100ms budget and fail-open. When keyword
+  recall finds nothing, it injects a directed nudge to call `anchored_search`
+  (the serve-side hybrid search) instead of the generic reminder.
+- **PostToolUse context-gate fallback** — the gate is credited even when the
+  PreToolUse credit is missed (e.g. a stale plugin matcher), so consulting
+  memory always satisfies it.
+
+### Fixed
+
+- **Self-heal a stale marketplace mirror** — a dirty or hand-edited mirror made
+  `git pull --ff-only` fail and permanently pinned the plugin to a stale
+  version. Anchored now hard-resets the managed mirror to its upstream and
+  retries within the same budget, so a binary update heals the plugin install
+  instead of wedging on a leftover local edit.
+- **MCP server instructions survive Claude Code's 2048-char truncation** — the
+  handshake now ships a separate compact `AnchoredMCPInstructions` constant
+  (~1.6KB) that keeps every load-bearing directive; the full rich block still
+  ships verbatim via the (untruncated) SessionStart hook.
+- **Gate deny guides deferred-tool harnesses** — the deny reason now tells the
+  agent to `ToolSearch`-load the anchored tools first when they are deferred,
+  collapsing repeated denies to a single one.
+- **Plugin manifest versions** (`plugin.json`, `marketplace.json`) now track
+  `VERSION`, so drift detection no longer re-syncs the plugin every session.
+
 ## [0.8.9] - 2026-06-15
 
 Quiets the MCP server's log output and bounds every tool response that scales
