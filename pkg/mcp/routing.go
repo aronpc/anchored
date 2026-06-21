@@ -32,6 +32,12 @@ const AnchoredRoutingBlock = `<anchored_memory>
     On every new conversation: call anchored_context(cwd=...) BEFORE any other tool and BEFORE answering — it loads identity, project, and recent decisions. Re-call only when the project changes.
   </call_first>
 
+  <deferred_tool_bootstrap>
+    The anchored_* tools may be DEFERRED in your harness — their schemas are not loaded yet, so calling one directly fails ("tool not found" / InputValidationError). Load them ONCE before your first anchored call:
+    ToolSearch(query: "select:mcp__anchored__anchored_context,mcp__anchored__anchored_search,mcp__anchored__anchored_save,mcp__anchored__anchored_execute,mcp__anchored__anchored_fetch_and_index,mcp__anchored__anchored_ctx_search")
+    After that they are callable. If ANY anchored_* call fails as not-found, ToolSearch it and retry — never fall back to Bash/Read/WebFetch or silently drop the task just because the schema was not loaded yet.
+  </deferred_tool_bootstrap>
+
   <when_to_search>
     Call anchored_search whenever the user's request would benefit from prior context. This is the rule, not a checklist:
     - Any mention of memory ("memória", "memory", "lembra", "remember", "guarda", "salva", "what did we") — search first, even if the wording is short or casual.
@@ -81,6 +87,8 @@ const AnchoredMCPInstructions = `<anchored_memory>
 Anchored is the user's persistent cross-tool memory, shared across every IDE and AI tool, and it IS the memory system: when the user asks to remember, save, note, or recall ANYTHING, the anchored_* tools are the ONLY correct destination — never a native/built-in memory, a scratch file, CLAUDE.md, or AGENTS.md. Use it silently; never narrate "checking memory" or "saving this".
 
 CALL FIRST — on every new conversation, call anchored_context(cwd=...) BEFORE any other tool and BEFORE answering; it loads identity, project, and recent decisions. Re-call only when the project changes.
+
+DEFERRED TOOLS — if an anchored_* call fails as not-found (the tools are deferred in your harness), run ToolSearch(query: "select:mcp__anchored__anchored_context,mcp__anchored__anchored_search,mcp__anchored__anchored_save") to load them, then retry. Never fall back to native tools or drop the task because the schema was not loaded yet.
 
 SEARCH (anchored_search) before answering anything that touches past work, prior decisions, conventions, preferences ("we"/"our"/"always"/"never"/"from now on"), or a named project/service/repo/person/library. Pair with anchored_kg_query for structured edges. Default to searching when in doubt.
 
