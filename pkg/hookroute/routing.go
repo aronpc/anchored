@@ -79,6 +79,14 @@ func RoutePreToolUse(tool string, toolInput map[string]any, opt Options) *Decisi
 	return nil
 }
 
+// deferredToolHint is appended to every sandbox-redirect deny. Claude Code
+// often registers the anchored_* tools as DEFERRED, so a direct call to the
+// redirect target (anchored_execute / anchored_fetch_and_index) fails as
+// not-found — and the agent then tends to abandon anchored entirely, falling
+// back to nothing because the original command is blocked. This tells it to
+// load the tools once via ToolSearch and keep going instead of giving up.
+const deferredToolHint = " If the anchored_* tools are not loaded yet (deferred — a direct call fails as not-found), FIRST run ToolSearch(query: \"select:mcp__anchored__anchored_execute,mcp__anchored__anchored_fetch_and_index,mcp__anchored__anchored_ctx_search\") to load them, THEN make the call — do not stop using anchored or silently drop the task just because the schema was not loaded yet."
+
 // ─── WebFetch ───────────────────────────────────────────────────────────────
 
 func routeWebFetch(toolInput map[string]any, opt Options) *Decision {
@@ -91,7 +99,7 @@ func routeWebFetch(toolInput map[string]any, opt Options) *Decision {
 	return &Decision{
 		Action: ActionDeny,
 		Reason: "anchored: WebFetch redirected. Call anchored_fetch_and_index(url: \"" + url +
-			"\", source: \"...\") to fetch + index the page, then anchored_ctx_search(queries: [...]) to query it — the raw page bytes stay out of your context. Full network access; retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH).",
+			"\", source: \"...\") to fetch + index the page, then anchored_ctx_search(queries: [...]) to query it — the raw page bytes stay out of your context. Full network access; retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)." + deferredToolHint,
 	}
 }
 
@@ -113,7 +121,7 @@ func routeBash(toolInput map[string]any, opt Options) *Decision {
 	if curlWgetFloods(stripped) {
 		return &Decision{
 			Action: ActionDeny,
-			Reason: "anchored: curl/wget redirected. Call anchored_execute(language, code) to fetch the URL, derive your answer in code, and print only the result — the raw HTTP body stays in the sandbox instead of entering your context. Or anchored_fetch_and_index(url, source) when you want to query the response later. Full network access; retry on transient DNS errors (EAI_AGAIN, ETIMEDOUT, ENETUNREACH).",
+			Reason: "anchored: curl/wget redirected. Call anchored_execute(language, code) to fetch the URL, derive your answer in code, and print only the result — the raw HTTP body stays in the sandbox instead of entering your context. Or anchored_fetch_and_index(url, source) when you want to query the response later. Full network access; retry on transient DNS errors (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)." + deferredToolHint,
 		}
 	}
 
@@ -127,7 +135,7 @@ func routeBash(toolInput map[string]any, opt Options) *Decision {
 	if inlineHTTPRe.MatchString(noHeredoc) {
 		return &Decision{
 			Action: ActionDeny,
-			Reason: "anchored: inline HTTP redirected. Call anchored_execute(language, code) to fetch, derive your answer in code, and print only the result — the raw response body stays in the sandbox. Full network access; retry on transient DNS errors.",
+			Reason: "anchored: inline HTTP redirected. Call anchored_execute(language, code) to fetch, derive your answer in code, and print only the result — the raw response body stays in the sandbox. Full network access; retry on transient DNS errors." + deferredToolHint,
 		}
 	}
 
@@ -135,7 +143,7 @@ func routeBash(toolInput map[string]any, opt Options) *Decision {
 	if buildToolRe.MatchString(stripped) {
 		return &Decision{
 			Action: ActionDeny,
-			Reason: "anchored: build tool redirected. Call anchored_execute(language: \"shell\", code: \"<your build cmd> 2>&1 | tail -30\") so the verbose build log stays in the sandbox and only the tail enters your context. Swap tail for grep -E '(error|warning|FAIL)' to surface only what matters.",
+			Reason: "anchored: build tool redirected. Call anchored_execute(language: \"shell\", code: \"<your build cmd> 2>&1 | tail -30\") so the verbose build log stays in the sandbox and only the tail enters your context. Swap tail for grep -E '(error|warning|FAIL)' to surface only what matters." + deferredToolHint,
 		}
 	}
 
