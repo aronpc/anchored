@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.1] - 2026-06-21
+
+Stops the agent from abandoning anchored when its tools are deferred in the
+harness — the follow-up to v0.9.0's reliable-invocation work.
+
+### Fixed
+
+- **Sandbox redirects guide deferred-tool harnesses** — the optimizer redirects
+  (curl/wget, WebFetch, inline HTTP, build tools) point the agent at
+  `anchored_execute` / `anchored_fetch_and_index`. When those tools are deferred
+  (Claude Code loads anchored_* schemas on demand), a direct call fails as
+  not-found and the agent abandoned anchored entirely, falling back to nothing
+  since the original command was blocked. Each redirect now tells the agent to
+  `ToolSearch`-load the tools first and not to drop the task on a not-found.
+- **Deferred-tool bootstrap in the main routing block** — the `ToolSearch`
+  bootstrap previously lived only in the subagent block. It is now in
+  `AnchoredRoutingBlock` (SessionStart) and, compactly, in
+  `AnchoredMCPInstructions`, so the main agent learns once to load the anchored
+  tools — covering every call site (gate, redirects, secret-block, miss-nudge)
+  systemically. Mirrors context-mode's fix for the same stall (their #724).
+
 ## [0.9.0] - 2026-06-20
 
 Makes anchored reliably invoked on every session and prompt — especially in
