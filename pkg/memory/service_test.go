@@ -96,6 +96,13 @@ func (s *svcMockStore) SoftDelete(_ context.Context, id string) error {
 	return s.Delete(context.Background(), id)
 }
 
+// Restore satisfies the Store interface (inverse of SoftDelete). The mock
+// doesn't track a separate soft-deleted state, so it's a no-op here; tests
+// that exercise restore semantics use the real SQLiteStore.
+func (s *svcMockStore) Restore(_ context.Context, _ string) error {
+	return nil
+}
+
 func (s *svcMockStore) DeleteByScope(_ context.Context, _ DeleteScopeOptions) (int, error) {
 	return 0, nil
 }
