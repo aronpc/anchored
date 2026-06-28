@@ -134,7 +134,9 @@ func contextGateDecision(storageDir, sessionID, bareTool, fullTool string) (*hoo
 			"If the anchored_* tools are not loaded yet (deferred — a direct call fails as not-found), " +
 			"FIRST run ToolSearch(query: \"select:mcp__anchored__anchored_context,mcp__anchored__anchored_search\") " +
 			"to load them, THEN call anchored_context — do not retry the blocked tool until you have. " +
-			"This gate runs once per session.",
+			"Calling anchored_context (or a search) clears this gate for the rest of the session. " +
+			"It is NOT a permanent block: it auto-relents after a few denies, so consulting memory is the " +
+			"way through, not retrying the same tool.",
 	}, "denied"
 }
 
