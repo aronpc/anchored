@@ -247,11 +247,12 @@ func TestDashboardAPI_Restore(t *testing.T) {
 // defence (non-loopback Host rejected), CSRF defence (cross-origin write
 // rejected), and the optional bearer token on writes.
 func TestDashboardGuard(t *testing.T) {
-	g := &dashboardGuard{writeToken: "s3cret"}
-	h := g.wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-	}))
-
+	})
+	wrap := func(token string) http.Handler {
+		return (&dashboardGuard{writeToken: token}).wrap(inner)
+	}
 	req := func(method, host, origin string) *http.Request {
 		r := httptest.NewRequest(method, "/api/memories/x", nil)
 		if host != "" {
@@ -262,36 +263,55 @@ func TestDashboardGuard(t *testing.T) {
 		}
 		return r
 	}
-	code := func(r *http.Request) int {
+	withBearer := func(r *http.Request, tok string) *http.Request {
+		r.Header.Set("Authorization", "Bearer "+tok)
+		return r
+	}
+	code := func(h http.Handler, r *http.Request) int {
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		return w.Code
 	}
 
-	if c := code(req("GET", "evil.example.com", "")); c != http.StatusForbidden {
+	gTok := wrap("s3cret") // --token configured: every request gated
+	gNone := wrap("")      // local default: reads + same-origin writes open
+
+	// DNS-rebinding: non-loopback Host is rejected before auth in both modes.
+	if c := code(gTok, req("GET", "evil.example.com", "")); c != http.StatusForbidden {
 		t.Errorf("non-loopback Host: got %d, want 403", c)
 	}
-	if c := code(req("GET", "127.0.0.1:17777", "")); c != http.StatusOK {
-		t.Errorf("loopback GET: got %d, want 200", c)
-	}
-	if c := code(req("DELETE", "127.0.0.1:17777", "https://evil.example.com")); c != http.StatusForbidden {
-		t.Errorf("cross-origin write: got %d, want 403", c)
-	}
-	if c := code(req("DELETE", "127.0.0.1:17777", "")); c != http.StatusUnauthorized {
-		t.Errorf("write without token: got %d, want 401", c)
-	}
-	r := req("DELETE", "127.0.0.1:17777", "")
-	r.Header.Set("Authorization", "Bearer s3cret")
-	if c := code(r); c != http.StatusOK {
-		t.Errorf("write with valid token: got %d, want 200", c)
+	if c := code(gNone, req("GET", "evil.example.com", "")); c != http.StatusForbidden {
+		t.Errorf("non-loopback Host (no token): got %d, want 403", c)
 	}
 
-	// empty Host (HTTP/1.0 / some clients) must still be allowed locally.
-	// (httptest.NewRequest defaults Host to "example.com", so force the empty
-	// case explicitly rather than going through the helper.)
+	// Without a token, loopback reads are open.
+	if c := code(gNone, req("GET", "127.0.0.1:17777", "")); c != http.StatusOK {
+		t.Errorf("loopback GET (no token): got %d, want 200", c)
+	}
+	// With a token, reads are gated too — no auth -> 401, bearer -> 200.
+	if c := code(gTok, req("GET", "127.0.0.1:17777", "")); c != http.StatusUnauthorized {
+		t.Errorf("loopback GET without auth (token set): got %d, want 401", c)
+	}
+	if c := code(gTok, withBearer(req("GET", "127.0.0.1:17777", ""), "s3cret")); c != http.StatusOK {
+		t.Errorf("loopback GET with bearer (token set): got %d, want 200", c)
+	}
+
+	// CSRF blocks a cross-origin write even when authenticated.
+	if c := code(gTok, withBearer(req("DELETE", "127.0.0.1:17777", "https://evil.example.com"), "s3cret")); c != http.StatusForbidden {
+		t.Errorf("cross-origin write (authed): got %d, want 403", c)
+	}
+	if c := code(gNone, req("DELETE", "127.0.0.1:17777", "https://evil.example.com")); c != http.StatusForbidden {
+		t.Errorf("cross-origin write (no token): got %d, want 403", c)
+	}
+	// Same-origin write passes once authed.
+	if c := code(gTok, withBearer(req("DELETE", "127.0.0.1:17777", ""), "s3cret")); c != http.StatusOK {
+		t.Errorf("same-origin write (authed): got %d, want 200", c)
+	}
+
+	// empty Host (HTTP/1.0 / some clients) is allowed locally without a token.
 	emptyReq := httptest.NewRequest("GET", "/api/memories/x", nil)
 	emptyReq.Host = ""
-	if c := code(emptyReq); c != http.StatusOK {
-		t.Errorf("empty Host GET: got %d, want 200", c)
+	if c := code(gNone, emptyReq); c != http.StatusOK {
+		t.Errorf("empty Host GET (no token): got %d, want 200", c)
 	}
 }

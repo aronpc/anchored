@@ -52,7 +52,7 @@ func runDashboard(args []string) {
 	addr := flagSet.String("addr", "127.0.0.1:17777", "listen address (host:port)")
 	noOpen := flagSet.Bool("no-open", false, "do not open the browser automatically")
 	allowRemote := flagSet.Bool("allow-remote", false, "allow binding to non-loopback interfaces (DANGEROUS: the dashboard has no built-in auth; pair with --token)")
-	writeToken := flagSet.String("token", "", "require this bearer secret for write endpoints (soft-delete/restore); recommended with --allow-remote")
+	writeToken := flagSet.String("token", "", "require this bearer secret for every request (reads included); recommended with --allow-remote")
 	flagSet.Parse(args)
 
 	// The dashboard has no authentication layer, so by default it must only bind
@@ -175,9 +175,10 @@ func cacheControl(next http.Handler) http.Handler {
 //   - CSRF defence: state-changing methods (anything that isn't a safe read)
 //     are rejected when an Origin/Referer header names a non-loopback origin.
 //     Same-origin browser writes and curl carry no such header and pass.
-//   - Optional bearer token: when --token is set, write endpoints additionally
-//     require a matching Bearer header or the anchored_dash cookie (minted from
-//     ?token= on first load), so a remote opt-in can still gate mutation.
+//   - Optional bearer token: when --token is set, every request (reads
+//     included) requires a matching Bearer header or the anchored_dash cookie
+//     (minted from ?token= on first load), so pairing --token with
+//     --allow-remote keeps the whole corpus private.
 //   - Hardening headers: CSP, nosniff, no-referrer, no framing.
 type dashboardGuard struct {
 	writeToken string // empty = no token required on writes
@@ -242,16 +243,24 @@ func (g *dashboardGuard) wrap(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 
-		// State-changing methods get the CSRF + token checks.
+		// With --token configured, gate EVERYTHING — reads included — on the
+		// bearer header or anchored_dash cookie, so the corpus can't be read
+		// without the secret. This matters when --token is paired with
+		// --allow-remote; locally (no token) it's a no-op. The ?token= bootstrap
+		// above has already minted the cookie before we reach here.
+		if g.writeToken != "" && !g.authed(r) {
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+
+		// CSRF: state-changing methods must additionally not be driven from a
+		// non-loopback origin (same-origin browser writes and curl carry no
+		// such header and pass).
 		switch r.Method {
 		case http.MethodGet, http.MethodHead, http.MethodOptions:
 		default:
 			if !g.allowOrigin(r) {
 				writeErr(w, http.StatusForbidden, "forbidden: cross-origin write blocked")
-				return
-			}
-			if g.writeToken != "" && !g.authed(r) {
-				writeErr(w, http.StatusUnauthorized, "unauthorized")
 				return
 			}
 		}
