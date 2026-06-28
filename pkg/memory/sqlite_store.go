@@ -2,7 +2,6 @@ package memory
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -66,9 +65,7 @@ func (s *SQLiteStore) DB() *sql.DB               { return s.db }
 func (s *SQLiteStore) VectorCache() *VectorCache { return s.cache }
 
 func newUUID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	return util.NewID()
 }
 
 // contentHash is the exact-dedup key. It hashes content verbatim (no

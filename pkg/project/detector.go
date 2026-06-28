@@ -1,7 +1,6 @@
 package project
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -10,6 +9,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	util "github.com/jholhewres/anchored/pkg/util"
 )
 
 type Project struct {
@@ -101,9 +102,7 @@ func gitRoot(dir string) (string, error) {
 }
 
 func newID() string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	return hex.EncodeToString(b)
+	return util.NewID()
 }
 
 func getGitRemoteURL(cwd string) string {
