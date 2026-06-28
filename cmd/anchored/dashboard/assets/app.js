@@ -614,7 +614,7 @@ async function renderSystem() {
     el("system-health").innerHTML = [
       card("Total memórias", health.memories?.total ?? 0, "ativas (não deletadas)", "good"),
       card("Com embedding", health.memories?.with_embedding ?? 0, `${pct.toFixed(0)}% do total`, covKind),
-      card("DB no disco", fmtBytes(health.db_bytes), ""),
+      card("DB (alocado)", fmtBytes(health.db_bytes), "páginas × page_size"),
       card("Sync dirty", dirty, `projetos sync: ${health.sync?.projects ?? 0}`, dirtyKind),
       card("Sessões", sessions.total ?? 0, `${sessions.active ?? 0} ativas`),
       card("Último sync", fmtDate(health.sync?.last_sync_at), `watermark: ${health.sync?.last_watermark || "—"}`),

@@ -168,6 +168,10 @@ func (a *dashboardAPI) handleTimeline(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, catpt{Period: period.String, Category: category, Count: count})
 		}
+		if err := crows.Err(); err != nil {
+			writeErr(w, http.StatusInternalServerError, "timeline rows: %v", err)
+			return
+		}
 		dashWriteJSON(w, http.StatusOK, map[string]any{"bucket": bucket, "by_category": true, "points": out})
 		return
 	}
@@ -202,6 +206,10 @@ func (a *dashboardAPI) handleTimeline(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out = append(out, point{Period: period.String, Count: count})
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "timeline rows: %v", err)
+		return
 	}
 	// oldest first reads better as a left-to-right timeline
 	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
@@ -242,10 +250,17 @@ func (a *dashboardAPI) handleMemoriesList(w http.ResponseWriter, r *http.Request
 		add("source = ?", s)
 	}
 	if v := q.Get("since"); v != "" {
-		add("created_at >= ?", v)
+		// Compare on the YYYY-MM-DD prefix only. The corpus stores created_at in
+		// several text shapes (RFC3339, "YYYY-MM-DD HH:MM:SS", Go's time.String,
+		// …) — see dashDateFormats / toISO. A bare lexical comparison on the full
+		// column is wrong across those shapes (a "until" of 2026-06-01 fails to
+		// match "2026-06-01 10:00:00"). The date picker sends YYYY-MM-DD, which
+		// is exactly the 10-char prefix every format shares, so substr makes the
+		// range filter format-agnostic and correct.
+		add("substr(created_at, 1, 10) >= ?", v)
 	}
 	if v := q.Get("until"); v != "" {
-		add("created_at <= ?", v)
+		add("substr(created_at, 1, 10) <= ?", v)
 	}
 	orderCol := "created_at"
 	switch q.Get("order") {
@@ -286,6 +301,10 @@ func (a *dashboardAPI) handleMemoriesList(w http.ResponseWriter, r *http.Request
 		m.CreatedAt = toISO(created.String)
 		out = append(out, m)
 	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "list rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"items": out, "count": len(out), "total": total})
 }
 
@@ -309,16 +328,21 @@ func (a *dashboardAPI) handleMemoryDelete(w http.ResponseWriter, r *http.Request
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	res, err := a.db.ExecContext(r.Context(),
-		`UPDATE memories SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-		 WHERE id = ? AND deleted_at IS NULL`, id)
+	// Existence + not-already-deleted check via the cache-aware Get (which
+	// filters deleted_at IS NULL), then mutate through Service.SoftForget so
+	// the in-memory cache is invalidated and observers (sync/KG/events) fire —
+	// a raw UPDATE here would silently skip them.
+	m, err := a.svc.Get(r.Context(), id)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "delete: %v", err)
+		writeErr(w, http.StatusInternalServerError, "get: %v", err)
 		return
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	if m == nil {
 		writeErr(w, http.StatusNotFound, "not found (already deleted?)")
+		return
+	}
+	if err := a.svc.SoftForget(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "delete: %v", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -389,6 +413,10 @@ func (a *dashboardAPI) handleKeywords(w http.ResponseWriter, r *http.Request) {
 	if len(out) > limit {
 		out = out[:limit]
 	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "keywords rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"items": out})
 }
 
@@ -421,27 +449,31 @@ func (a *dashboardAPI) handleEntities(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, e)
 	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "entities rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"items": out})
 }
 
-// handleMemoryRestore undoes a soft-delete (deleted_at back to NULL), mirroring
-// the dashboard's delete handler in reverse.
+// handleMemoryRestore undoes a soft-delete so the memory re-enters search/list
+// results. The mutation goes through Service.Restore (cache invalidation +
+// observer fan-out); only the existence-of-deleted-row check reads the DB.
 func (a *dashboardAPI) handleMemoryRestore(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if id == "" {
 		writeErr(w, http.StatusBadRequest, "missing id")
 		return
 	}
-	res, err := a.db.ExecContext(r.Context(),
-		`UPDATE memories SET deleted_at = NULL, updated_at = CURRENT_TIMESTAMP
-		 WHERE id = ? AND deleted_at IS NOT NULL`, id)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "restore: %v", err)
+	var one int
+	_ = a.db.QueryRowContext(r.Context(),
+		`SELECT 1 FROM memories WHERE id = ? AND deleted_at IS NOT NULL`, id).Scan(&one)
+	if one != 1 {
+		writeErr(w, http.StatusNotFound, "not found (not deleted?)")
 		return
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		writeErr(w, http.StatusNotFound, "not found (not deleted?)")
+	if err := a.svc.Restore(r.Context(), id); err != nil {
+		writeErr(w, http.StatusInternalServerError, "restore: %v", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -477,6 +509,10 @@ func (a *dashboardAPI) handleDeletedMemories(w http.ResponseWriter, r *http.Requ
 			return
 		}
 		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "deleted rows: %v", err)
+		return
 	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"items": out, "count": len(out)})
 }
@@ -587,6 +623,10 @@ func (a *dashboardAPI) handleSessions(w http.ResponseWriter, r *http.Request) {
 		s.LastActivity = toISO(last.String)
 		recent = append(recent, s)
 	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "sessions rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{
 		"total":         total,
 		"active":        active,
@@ -629,6 +669,10 @@ func (a *dashboardAPI) handleProjects(w http.ResponseWriter, r *http.Request) {
 		p.CreatedAt = toISO(created.String)
 		p.LastActivity = toISO(last.String)
 		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "projects rows: %v", err)
+		return
 	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"items": out})
 }
@@ -706,6 +750,10 @@ func (a *dashboardAPI) handleDream(w http.ResponseWriter, r *http.Request) {
 		x.AppliedAt = toISO(appl.String)
 		recent = append(recent, x)
 	}
+	if err := rrows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "dream rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{
 		"total_runs":    totalRuns,
 		"total_actions": totalActions,
@@ -776,6 +824,10 @@ func (a *dashboardAPI) handleArtifacts(w http.ResponseWriter, r *http.Request) {
 		x.ExpiresAt = toISO(exp.String)
 		recent = append(recent, x)
 	}
+	if err := rrows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "artifacts rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"by_type": byType, "recent": recent})
 }
 
@@ -801,6 +853,10 @@ func (a *dashboardAPI) handleChunks(w http.ResponseWriter, r *http.Request) {
 		byType[t] += c
 		bySource[s] += c
 		total += c
+	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "chunks rows: %v", err)
+		return
 	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"total": total, "by_type": byType, "by_source": bySource})
 }
@@ -865,6 +921,10 @@ func (a *dashboardAPI) handleEvents(w http.ResponseWriter, r *http.Request) {
 		x.CreatedAt = toISO(created.String)
 		recent = append(recent, x)
 	}
+	if err := rrows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "events rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"total": total, "by_type": byType, "top_tools": topTools, "recent": recent})
 }
 
@@ -899,6 +959,10 @@ func (a *dashboardAPI) handleImports(w http.ResponseWriter, r *http.Request) {
 		x.EndedAt = toISO(ended.String)
 		out = append(out, x)
 	}
+	if err := rows.Err(); err != nil {
+		writeErr(w, http.StatusInternalServerError, "imports rows: %v", err)
+		return
+	}
 	dashWriteJSON(w, http.StatusOK, map[string]any{"items": out})
 }
 
@@ -926,6 +990,9 @@ func (a *dashboardAPI) handleHealth(w http.ResponseWriter, r *http.Request) {
 	var pageCount, pageSize int64
 	_ = a.db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount)
 	_ = a.db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize)
+	// Allocated DB size (page_count × page_size), reported as db_bytes. This is
+	// the on-disk footprint SQLite has reserved — it ignores WAL/free-list
+	// shrinkage until a VACUUM, so treat it as an upper bound on store size.
 	dbBytes = pageCount * pageSize
 
 	var syncProjects int
