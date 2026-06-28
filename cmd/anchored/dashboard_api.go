@@ -271,6 +271,14 @@ func (a *dashboardAPI) handleMemoriesList(w http.ResponseWriter, r *http.Request
 	if q.Get("dir") == "asc" {
 		dir = "ASC"
 	}
+	// created_at is stored in several text shapes (RFC3339, "YYYY-MM-DD
+	// HH:MM:SS", Go's time.String()…). Sort on datetime() so ISO and
+	// SQLite-text rows compare chronologically instead of lexically; rows
+	// datetime() can't parse (rare legacy imports) fall back to lexical order.
+	orderExpr := orderCol
+	if orderCol == "created_at" {
+		orderExpr = "COALESCE(datetime(created_at), created_at)"
+	}
 
 	whereSQL := "deleted_at IS NULL"
 	if len(clauses) > 0 {
@@ -284,7 +292,7 @@ func (a *dashboardAPI) handleMemoriesList(w http.ResponseWriter, r *http.Request
 	pageArgs := append(append([]any{}, args...), limit, offset)
 	rows, err := a.db.QueryContext(r.Context(),
 		"SELECT id, category, content, source, COALESCE(project_id,''), created_at FROM memories WHERE "+whereSQL+
-			" ORDER BY "+orderCol+" "+dir+" LIMIT ? OFFSET ?", pageArgs...)
+			" ORDER BY "+orderExpr+" "+dir+" LIMIT ? OFFSET ?", pageArgs...)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "list: %v", err)
 		return
