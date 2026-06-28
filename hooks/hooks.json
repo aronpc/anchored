@@ -1,5 +1,5 @@
 {
-  "description": "Anchored hooks — SessionStart + UserPromptSubmit inject the persistent-memory routing block (with pre-search hits when prompts mention memory); PostToolUse / PreCompact capture session events; PreToolUse blocks dangerous code inside anchored sandbox tools.",
+  "description": "Anchored hooks — SessionStart injects the full persistent-memory routing block; UserPromptSubmit runs intent-aware auto-recall (top memories + recent artifacts) within a token budget; PostToolUse captures state-changing tool events and indexes large outputs as searchable artifacts; PreCompact snapshots the conversation; PreToolUse blocks dangerous code inside anchored sandbox tools and blocks writing a secret into shared memory/instruction files.",
   "hooks": {
     "SessionStart": [
       {
@@ -25,7 +25,16 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__anchored__anchored_execute|mcp__anchored__anchored_execute_file|mcp__anchored__anchored_batch_execute",
+        "matcher": "Write|Edit|MultiEdit|Read|Grep|Glob|Bash|WebFetch|Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook pretooluse"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*",
         "hooks": [
           {
             "type": "command",
@@ -36,7 +45,16 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Bash|Read|Write|Edit|Grep|Glob|TodoWrite|Skill|Agent|mcp__",
+        "matcher": "Write|Edit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook posttooluse"
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__anchored__.*",
         "hooks": [
           {
             "type": "command",
@@ -52,6 +70,17 @@
           {
             "type": "command",
             "command": "anchored hook precompact"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "anchored hook stop"
           }
         ]
       }

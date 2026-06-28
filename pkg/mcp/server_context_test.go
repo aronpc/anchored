@@ -6,13 +6,17 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jholhewres/anchored/pkg/kg"
 	"github.com/jholhewres/anchored/pkg/memory"
 )
 
 func TestRenderContextBundle_Empty(t *testing.T) {
-	out := renderContextBundle("", "", "", "", 0, nil, nil, nil, anchoredContextBudget)
-	if !strings.Contains(out, "<anchored_context>") || !strings.Contains(out, "</anchored_context>") {
+	out := renderContextBundle("", "", "", "", 0, nil, nil, nil, nil, anchoredContextBudget)
+	if !strings.Contains(out, "<anchored_context ") || !strings.Contains(out, "</anchored_context>") {
 		t.Fatalf("missing wrapper tags: %q", out)
+	}
+	if !strings.Contains(out, "not instructions") {
+		t.Fatalf("missing data-not-instructions fencing note: %q", out)
 	}
 	if strings.Contains(out, "<identity>") || strings.Contains(out, "<project ") || strings.Contains(out, "<recent>") || strings.Contains(out, "<events>") {
 		t.Fatalf("expected no inner sections, got: %q", out)
@@ -32,7 +36,7 @@ func TestRenderContextBundle_AllSections(t *testing.T) {
 	out := renderContextBundle(
 		"# Identity\nGo dev",
 		"anchored", "/home/x/anchored", "proj-1", 24,
-		byCat, mems, events, anchoredContextBudget,
+		byCat, mems, events, nil, anchoredContextBudget,
 	)
 
 	for _, want := range []string{
@@ -57,7 +61,7 @@ func TestRenderContextBundle_TruncatesOversizeIdentity(t *testing.T) {
 	// is intentionally smaller than identityCap (600) so that path is the
 	// budget enforcer, not the per-section cap.
 	huge := strings.Repeat("x", 500)
-	out := renderContextBundle(huge, "", "", "", 0, nil, nil, nil, 200)
+	out := renderContextBundle(huge, "", "", "", 0, nil, nil, nil, nil, 200)
 	if len(out) > 200 {
 		t.Fatalf("budget breach: %d > 200", len(out))
 	}
@@ -72,7 +76,7 @@ func TestRenderContextBundle_TruncatesOversizeIdentity(t *testing.T) {
 // kick in and the result must be ≤ budget.
 func TestRenderContextBundle_HardCapsIdentityWithoutNewlines(t *testing.T) {
 	one := strings.Repeat("x", 5000)
-	out := renderContextBundle(one, "", "", "", 0, nil, nil, nil, 300)
+	out := renderContextBundle(one, "", "", "", 0, nil, nil, nil, nil, 300)
 	if len(out) > 300 {
 		t.Fatalf("budget breach: %d > 300\n%s", len(out), out)
 	}
@@ -94,7 +98,7 @@ func TestRenderContextBundle_BudgetIsHard(t *testing.T) {
 	}
 	out := renderContextBundle(
 		strings.Repeat("ipsum ", 200), "anchored", "/p", "id-1", 99,
-		map[string]int{"decision": 5, "fact": 3}, mems, nil, 1024,
+		map[string]int{"decision": 5, "fact": 3}, mems, nil, nil, 1024,
 	)
 	if len(out) > 1024 {
 		t.Fatalf("budget breach: %d > 1024", len(out))
@@ -105,7 +109,7 @@ func TestRenderContextBundle_BudgetIsHard(t *testing.T) {
 // multibyte rune. Uses combining characters and accented PT-BR.
 func TestRenderContextBundle_PreservesUTF8AfterTruncate(t *testing.T) {
 	identity := strings.Repeat("ção é ñ ", 500) // multi-byte runes
-	out := renderContextBundle(identity, "", "", "", 0, nil, nil, nil, 256)
+	out := renderContextBundle(identity, "", "", "", 0, nil, nil, nil, nil, 256)
 	if !utf8.ValidString(out) {
 		t.Fatalf("output is not valid UTF-8 after truncation:\n%q", out)
 	}
@@ -123,7 +127,7 @@ func TestRenderContextBundle_EscapesXML(t *testing.T) {
 	}
 	out := renderContextBundle(
 		"identity & co", "weird & name", `/path/with"quote`, "p1", 1,
-		nil, mems, nil, anchoredContextBudget,
+		nil, mems, nil, nil, anchoredContextBudget,
 	)
 	for _, banned := range []string{
 		`name="weird & name"`,
@@ -210,5 +214,22 @@ func TestEscapeAttrAndText(t *testing.T) {
 	}
 	if got := escapeText(`a&b<c>d"e`); got != `a&amp;b&lt;c&gt;d"e` {
 		t.Errorf("escapeText (quote should pass through): %q", got)
+	}
+}
+
+func TestRankBundleMemories_PrefersFresher(t *testing.T) {
+	old := memory.Memory{Content: "old", CreatedAt: time.Now().AddDate(0, 0, -120)}
+	fresh := memory.Memory{Content: "fresh", CreatedAt: time.Now()}
+	ranked := rankBundleMemories([]memory.Memory{old, fresh}, 5)
+	if len(ranked) != 2 || ranked[0].Content != "fresh" {
+		t.Fatalf("fresh memory should rank first, got %+v", ranked)
+	}
+}
+
+func TestRenderContextBundle_Relationships(t *testing.T) {
+	rels := []kg.Triple{{Subject: "payments", Predicate: "depends_on", Object: "postgres"}}
+	out := renderContextBundle("", "", "", "p1", 0, nil, nil, nil, rels, anchoredContextBudget)
+	if !strings.Contains(out, "<relationships>") || !strings.Contains(out, "payments depends_on postgres") {
+		t.Fatalf("missing relationships section: %q", out)
 	}
 }

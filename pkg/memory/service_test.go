@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/project"
 )
 
@@ -62,6 +63,15 @@ func (s *svcMockStore) Update(_ context.Context, id, content, category string) e
 	}
 	m.Content = content
 	m.Category = category
+	return nil
+}
+
+func (s *svcMockStore) UpdateMetadata(_ context.Context, id string, metadata any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m, ok := s.memories[id]; ok {
+		m.Metadata = metadata
+	}
 	return nil
 }
 
@@ -154,8 +164,8 @@ func (s *svcMockStore) FindByContentHash(_ context.Context, hash string, _ *stri
 
 func (s *svcMockStore) BackfillContentHash(_ context.Context) (int, error) { return 0, nil }
 func (s *svcMockStore) DB() *sql.DB                                        { return nil }
-func (s *svcMockStore) VectorCache() *VectorCache                           { return nil }
-func (s *svcMockStore) Close() error                                        { return nil }
+func (s *svcMockStore) VectorCache() *VectorCache                          { return nil }
+func (s *svcMockStore) Close() error                                       { return nil }
 
 // --- Mock Embedder ---
 
@@ -190,9 +200,9 @@ func (e *svcMockEmbedder) Embed(_ context.Context, texts []string) ([][]float32,
 }
 
 func (e *svcMockEmbedder) Dimensions() int { return e.dims }
-func (e *svcMockEmbedder) Name() string     { return "mock" }
-func (e *svcMockEmbedder) Model() string    { return "mock-model" }
-func (e *svcMockEmbedder) Close() error     { e.closed = true; return nil }
+func (e *svcMockEmbedder) Name() string    { return "mock" }
+func (e *svcMockEmbedder) Model() string   { return "mock-model" }
+func (e *svcMockEmbedder) Close() error    { e.closed = true; return nil }
 
 // --- Helpers ---
 
@@ -200,7 +210,7 @@ func newTestService(t *testing.T, store Store, embedder EmbeddingProvider) *Serv
 	t.Helper()
 	return &Service{
 		store:     store,
-		sanitizer: NewSanitizer(false),
+		sanitizer: NewSanitizer(config.SanitizerConfig{Enabled: false}),
 		projDet:   project.NewDetector(nil),
 		embedder:  embedder,
 		logger:    slog.Default(),
@@ -449,7 +459,7 @@ func TestService_Search(t *testing.T) {
 
 	svc.Save(ctx, "Go is a programming language", "fact", "test", "")
 
-	results, err := svc.Search(ctx, "Go", SearchOptions{MaxResults: 10})
+	results, err := svc.Search(ctx, "programming", SearchOptions{MaxResults: 10})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -546,7 +556,7 @@ func TestService_BackfillEmbeddings_WithEmbedder(t *testing.T) {
 
 	svc := &Service{
 		store:     store,
-		sanitizer: NewSanitizer(false),
+		sanitizer: NewSanitizer(config.SanitizerConfig{Enabled: false}),
 		projDet:   project.NewDetector(nil),
 		embedder:  embedder,
 		cache:     embCache,
@@ -556,14 +566,21 @@ func TestService_BackfillEmbeddings_WithEmbedder(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	svc.Save(ctx, "embed me 1", "fact", "test", "")
-	svc.Save(ctx, "embed me 2", "fact", "test", "")
+	// Insert directly into the store (bypassing svc.Save) so the memories land
+	// without embeddings. Going through svc.Save would race its async embed
+	// goroutine against the backfill loop, which intermittently hits SQLITE_BUSY
+	// under modernc's deferred transaction locking.
+	if err := store.Save(ctx, Memory{Content: "embed me 1", Category: "fact", Source: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(ctx, Memory{Content: "embed me 2", Category: "fact", Source: "test"}); err != nil {
+		t.Fatal(err)
+	}
 
 	total, err := svc.BackfillEmbeddings(ctx, 10)
 	if err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
-	// At least 1 should succeed (may lose some to SQLITE_BUSY)
 	if total < 1 {
 		t.Errorf("expected at least 1 backfilled, got %d", total)
 	}
@@ -579,7 +596,7 @@ func TestService_BackfillEmbeddings_DefaultBatchSize(t *testing.T) {
 
 	svc := &Service{
 		store:     store,
-		sanitizer: NewSanitizer(false),
+		sanitizer: NewSanitizer(config.SanitizerConfig{Enabled: false}),
 		projDet:   project.NewDetector(nil),
 		embedder:  embedder,
 		cache:     embCache,
@@ -589,7 +606,11 @@ func TestService_BackfillEmbeddings_DefaultBatchSize(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	svc.Save(ctx, "content for backfill", "fact", "test", "")
+	// Insert directly into the store (bypassing svc.Save) to avoid racing the
+	// async embed goroutine against the backfill loop (SQLITE_BUSY under modernc).
+	if err := store.Save(ctx, Memory{Content: "content for backfill", Category: "fact", Source: "test"}); err != nil {
+		t.Fatal(err)
+	}
 
 	total, err := svc.BackfillEmbeddings(ctx, 0)
 	if err != nil {
@@ -660,7 +681,7 @@ func TestService_Close_NilEmbedder(t *testing.T) {
 func TestService_Save_Sanitizer(t *testing.T) {
 	store := newSvcMockStore()
 	svc := newTestService(t, store, nil)
-	svc.sanitizer = NewSanitizer(true)
+	svc.sanitizer = NewSanitizer(config.SanitizerConfig{Enabled: true})
 	ctx := context.Background()
 
 	m, err := svc.Save(ctx, "the api_key = skabc123def456ghi789jkl012mno345", "fact", "test", "")

@@ -11,10 +11,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 	"unicode/utf8"
 
+	ctxpkg "github.com/jholhewres/anchored/pkg/context"
 	"github.com/jholhewres/anchored/pkg/debuglog"
+	"github.com/jholhewres/anchored/pkg/session"
 )
 
 // postToolUseInsertSQL is exposed as a package-level constant so tests can
@@ -32,15 +35,30 @@ const postToolUseInsertSQL = `INSERT INTO session_events
 // os.Stdin, stdout to os.Stdout, and DB+ResolveProject through HookContext;
 // tests pass an in-memory DB and a stub resolver.
 type PostToolUseDeps struct {
-	Stdin           io.Reader
-	Stdout          io.Writer
-	DB              ExecContexter
-	ResolveProject  func(cwd string) string
-	SessionIDFlag   string
-	CwdFlag         string
-	Now             func() time.Time
-	NewID           func() string
-	Logger          *debuglog.Logger
+	Stdin          io.Reader
+	Stdout         io.Writer
+	DB             ExecContexter
+	ResolveProject func(cwd string) string
+	SessionIDFlag  string
+	CwdFlag        string
+	Now            func() time.Time
+	NewID          func() string
+	Logger         *debuglog.Logger
+	// CaptureArtifact indexes a large tool output as a searchable artifact and
+	// returns its id. nil disables artifact capture (the event-only path).
+	// Production wires it to the artifact store; tests may stub or omit it.
+	CaptureArtifact func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error)
+	// UpdateWorkingSet records the files/commands/tests this tool call touched
+	// into the session working set so retrieval can boost in-focus memories.
+	// nil disables the update. Best-effort; errors never block the tool call.
+	UpdateWorkingSet func(sessionID, projectID string, files, commands, tests []string) error
+	// GateStorageDir + GateEnforced wire the redundant context-gate
+	// satisfaction path: when the gate is enforced and this PostToolUse event
+	// is a satisfying anchored tool call, mark the session's gate satisfied so
+	// a missed PreToolUse credit can't strand the gate in deny-then-relent.
+	// Empty GateStorageDir / false GateEnforced disables it (a no-op).
+	GateStorageDir string
+	GateEnforced   bool
 }
 
 // ExecContexter is the small slice of *sql.DB the hook actually needs;
@@ -77,16 +95,52 @@ func runHookPostToolUse(args []string) {
 	}
 	defer hc.Close()
 
+	// Wire artifact capture to the content-optimizer store. AddArtifact ->
+	// InsertChunk uses prepared statements, so PrepareStatements MUST run
+	// first; on failure we leave capture nil and fall back to the event-only
+	// path rather than risk a nil-statement panic in the fail-safe hook.
+	var capture func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error)
+	artStore := ctxpkg.NewStore(hc.db, nil)
+	if perr := artStore.PrepareStatements(); perr != nil {
+		slog.Warn("posttooluse: prepare statements failed; artifact capture disabled", "error", perr)
+		dlog.Event("hook.posttooluse", map[string]any{"stage": "artifact_prepare_failed", "error": perr.Error()})
+	} else {
+		chunker := ctxpkg.NewChunker(4096)
+		capture = func(projectID, sessionID, artifactType, sourceTool, sourceLabel, content string) (string, error) {
+			return artStore.AddArtifact(context.Background(), chunker, ctxpkg.ArtifactInput{
+				ProjectID: projectID, SessionID: sessionID, Type: artifactType,
+				SourceTool: sourceTool, SourceLabel: sourceLabel, Content: content,
+			}, 72) // 72h TTL: long enough to debug from, short enough to self-clean
+		}
+	}
+
+	// Working-set feed: best-effort, shares the hook's DB. A failure to build
+	// the manager simply leaves the updater nil (event recording proceeds).
+	wsMgr := session.NewManager(hc.db, nil)
+	updateWorkingSet := func(sessionID, projectID string, files, commands, tests []string) error {
+		_, err := wsMgr.UpdateWorkingSet(context.Background(), sessionID, session.WorkingSetDelta{
+			ProjectID: projectID,
+			Files:     files,
+			Commands:  commands,
+			Tests:     tests,
+		})
+		return err
+	}
+
 	recordPostToolUseEvent(PostToolUseDeps{
-		Stdin:          os.Stdin,
-		Stdout:         os.Stdout,
-		DB:             hc.db,
-		ResolveProject: hc.ResolveProject,
-		SessionIDFlag:  *sessionIDFlag,
-		CwdFlag:        *cwdFlag,
-		Now:            time.Now,
-		NewID:          newHookID,
-		Logger:         dlog,
+		Stdin:            os.Stdin,
+		Stdout:           os.Stdout,
+		DB:               hc.db,
+		ResolveProject:   hc.ResolveProject,
+		SessionIDFlag:    *sessionIDFlag,
+		CwdFlag:          *cwdFlag,
+		Now:              time.Now,
+		NewID:            newHookID,
+		Logger:           dlog,
+		CaptureArtifact:  capture,
+		UpdateWorkingSet: updateWorkingSet,
+		GateStorageDir:   hc.cfg.Memory.StorageDir,
+		GateEnforced:     hc.cfg.Plugin.ContextGateMode() == "enforce",
 	})
 }
 
@@ -127,6 +181,20 @@ func recordPostToolUseEvent(deps PostToolUseDeps) {
 		return
 	}
 
+	// Redundant context-gate satisfaction: if the agent just ran a satisfying
+	// anchored tool, credit it here too (PreToolUse may have missed it on a
+	// stale plugin matcher). Done before the artifact early-return so a large
+	// anchored_search response still satisfies the gate. Best-effort.
+	if deps.GateEnforced {
+		bareTool := input.ToolName
+		if i := strings.LastIndex(bareTool, "__"); i >= 0 {
+			bareTool = bareTool[i+2:]
+		}
+		if satisfyGateFromPostToolUse(deps.GateStorageDir, sessionID, bareTool) {
+			dlog.Event("hook.posttooluse", map[string]any{"stage": "context_gate_satisfied", "tool": input.ToolName})
+		}
+	}
+
 	cwdVal := input.Cwd
 	if cwdVal == "" {
 		cwdVal = deps.CwdFlag
@@ -139,6 +207,49 @@ func recordPostToolUseEvent(deps PostToolUseDeps) {
 	if deps.ResolveProject != nil {
 		projectID = deps.ResolveProject(cwdVal)
 	}
+
+	inputText := rawText(input.ToolInput)
+
+	// Feed the working set from this tool call (files edited, commands/tests
+	// run) so retrieval can boost in-focus memories. Best-effort: a failure is
+	// logged but never blocks the tool call.
+	if deps.UpdateWorkingSet != nil {
+		files, commands, tests := workingSetDelta(input.ToolName, inputText)
+		if len(files)+len(commands)+len(tests) > 0 {
+			if wErr := deps.UpdateWorkingSet(sessionID, projectID, files, commands, tests); wErr != nil {
+				dlog.Event("hook.posttooluse", map[string]any{"stage": "working_set_update_failed", "error": wErr.Error()})
+			}
+		}
+	}
+
+	// Large tool outputs become searchable artifacts instead of bloating the
+	// session-event summary. The event still records that an artifact was
+	// captured so the timeline stays complete. Best-effort: a capture failure
+	// falls through to the normal event path.
+	response := rawText(input.ToolResponse)
+	if deps.CaptureArtifact != nil && len(response) > artifactMinBytes {
+		atype := classifyArtifact(input.ToolName, inputText, response)
+		label := artifactSourceLabel(input.ToolName, inputText)
+		if artID, aerr := deps.CaptureArtifact(projectID, sessionID, atype, input.ToolName, label, response); aerr == nil {
+			eventID := deps.NewID()
+			summary := fmt.Sprintf("captured %s artifact %s (%d bytes) — search with: anchored artifact search", atype, artID, len(response))
+			metadata := buildPostToolUseMetadata(cwdVal, input.HookEventName, len(body))
+			if _, derr := deps.DB.ExecContext(context.Background(), postToolUseInsertSQL,
+				eventID, sessionID, projectID, input.ToolName, summary, metadata); derr != nil {
+				dlog.Event("hook.posttooluse", map[string]any{"stage": "artifact_event_insert_failed", "error": derr.Error()})
+			}
+			dlog.Event("hook.posttooluse", map[string]any{
+				"stage": "artifact_captured", "session_id": sessionID, "project_id": projectID,
+				"artifact_id": artID, "artifact_type": atype, "bytes": len(response),
+			})
+			writePostToolUseResp(deps.Stdout, map[string]any{"recorded": true, "artifact_id": artID, "artifact_type": atype})
+			return
+		} else {
+			dlog.Event("hook.posttooluse", map[string]any{"stage": "artifact_capture_failed", "error": aerr.Error()})
+			// fall through to event-only path
+		}
+	}
+
 	summary := summarizeToolEvent(input.ToolResponse, input.ToolInput, 500)
 	metadata := buildPostToolUseMetadata(cwdVal, input.HookEventName, len(body))
 	eventID := deps.NewID()
@@ -226,6 +337,25 @@ func buildPostToolUseMetadata(cwd, hookEvent string, rawLen int) string {
 		meta = meta[:1024]
 	}
 	return string(meta)
+}
+
+// rawText returns the decoded string of a JSON value: a JSON string is
+// unquoted to its content (so a Bash tool_response that is a JSON string of
+// stdout is measured/classified by its real text), anything else is returned
+// as its compact JSON form.
+func rawText(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return string(raw)
+	}
+	return buf.String()
 }
 
 func newHookID() string {

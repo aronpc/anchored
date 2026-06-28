@@ -17,17 +17,18 @@ import (
 )
 
 type Service struct {
-	store        Store
-	searcher     *HybridSearcher
-	sanitizer    *Sanitizer
-	projDet      *project.Detector
-	embedder     EmbeddingProvider
-	cache        *EmbeddingCache
-	logger       *slog.Logger
-	embedSem     chan struct{}
-	kgExtractor  *kg.PatternExtractor
-	shutdown     chan struct{}
-	wg           sync.WaitGroup
+	store       Store
+	searcher    *HybridSearcher
+	sanitizer   *Sanitizer
+	projDet     *project.Detector
+	embedder    EmbeddingProvider
+	cache       *EmbeddingCache
+	logger      *slog.Logger
+	embedSem    chan struct{}
+	kgExtractor *kg.PatternExtractor
+	shutdown    chan struct{}
+	wg          sync.WaitGroup
+	observers   []MemoryObserver
 }
 
 func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
@@ -40,7 +41,7 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 
 	projDet := project.NewDetector(store.DB())
 
-	sanitizer := NewSanitizer(cfg.Sanitizer.Enabled)
+	sanitizer := NewSanitizer(cfg.Sanitizer)
 
 	svc := &Service{
 		store:     store,
@@ -51,13 +52,27 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 		shutdown:  make(chan struct{}),
 	}
 
-	embedder, err := NewONNXEmbedder(cfg.Embedding.ModelDir, logger)
-	if err != nil {
-		logger.Warn("ONNX embedder not available, search will be BM25-only", "error", err)
+	// provider "none" disables embeddings entirely (BM25-only search). It
+	// must short-circuit BEFORE NewONNXEmbedder, which downloads the ONNX
+	// runtime and model when ModelDir is empty — tests and minimal installs
+	// rely on this to stay offline and fast.
+	//
+	// embedder is declared as the INTERFACE type on purpose: assigning a nil
+	// *ONNXEmbedder would produce a non-nil interface, defeating the
+	// `embedder == nil` guards in the searcher and panicking on first query.
+	var embedder EmbeddingProvider
+	if cfg.Embedding.Provider == "none" {
+		logger.Info("embeddings disabled (provider: none), search will be BM25-only")
 	} else {
-		svc.embedder = embedder
-		svc.cache = NewEmbeddingCache(store.DB(), logger)
-		svc.cache.MigrateFromLegacy(embedder.Model())
+		e, err := NewONNXEmbedder(cfg.Embedding.ModelDir, logger)
+		if err != nil {
+			logger.Warn("ONNX embedder not available, search will be BM25-only", "error", err)
+		} else {
+			embedder = e
+			svc.embedder = e
+			svc.cache = NewEmbeddingCache(store.DB(), logger)
+			svc.cache.MigrateFromLegacy(e.Model())
+		}
 	}
 
 	searchCfg := DefaultHybridSearchConfig()
@@ -101,6 +116,13 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 		opts.Category = Categorize(opts.Content)
 	}
 
+	var metadata any
+	if opts.Metadata != nil {
+		metadata = opts.Metadata
+	} else {
+		metadata = WithPreferenceScope(nil, opts.Category, opts.PreferenceScope)
+	}
+
 	var projectID *string
 	if opts.CWD != "" {
 		proj, err := s.projDet.Detect(opts.CWD)
@@ -110,12 +132,22 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 			projectID = &proj.ID
 		}
 	}
+	hasProject := projectID != nil
 
 	hash := util.ContentHash(opts.Content)
 	existing, err := s.store.FindByContentHash(ctx, hash, projectID)
 	if err != nil {
 		s.logger.Warn("content hash lookup failed, proceeding with save", "error", err)
-	} else if existing != nil {
+	}
+	// Exact-hash miss: look for a near-duplicate (a restatement of an existing
+	// memory). Updating it in place keeps the store from accumulating
+	// paraphrased duplicates that exact hashing can't catch.
+	if existing == nil {
+		existing = s.findNearDuplicate(ctx, opts.Content, projectID)
+	}
+	if existing != nil {
+		metadata = WithPreferenceScope(existing.Metadata, opts.Category, opts.PreferenceScope)
+		metadata = ApplyQualityMetadata(metadata, opts.Content, opts.Category, hasProject)
 		upd := Memory{
 			ID:          existing.ID,
 			Content:     opts.Content,
@@ -126,14 +158,24 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 			ContentHash: hash,
 			Keywords:    ExtractKeywords(opts.Content),
 			CreatedAt:   existing.CreatedAt,
+			Metadata:    metadata,
 		}
 		if err := s.store.Save(ctx, upd); err != nil {
 			return nil, fmt.Errorf("save: %w", err)
 		}
+		s.notifyObservers(func(obs MemoryObserver) {
+			obs.OnMemoryUpdated(ctx, upd)
+		})
 		return &upd, nil
 	}
 
+	metadata = ApplyQualityMetadata(metadata, opts.Content, opts.Category, hasProject)
 	m := Memory{
+		// Assign the ID here rather than letting store.Save generate it: Save
+		// takes Memory by value, so an ID generated there never propagates back
+		// and embedAsync/observers would run with an empty ID — leaving the
+		// embedding column unpopulated on the create path.
+		ID:          newUUID(),
 		Content:     opts.Content,
 		Category:    opts.Category,
 		Source:      opts.Source,
@@ -141,6 +183,7 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 		ProjectID:   projectID,
 		ContentHash: hash,
 		Keywords:    ExtractKeywords(opts.Content),
+		Metadata:    metadata,
 	}
 
 	if err := s.store.Save(ctx, m); err != nil {
@@ -163,6 +206,10 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 		}(m.Content, m.ProjectID)
 	}
 
+	s.notifyObservers(func(obs MemoryObserver) {
+		obs.OnMemorySaved(ctx, m)
+	})
+
 	return &m, nil
 }
 
@@ -176,7 +223,18 @@ func (s *Service) Search(ctx context.Context, query string, opts SearchOptions) 
 		return s.searcher.Search(ctx, query, opts)
 	}
 
-	return s.store.Search(ctx, query, opts)
+	// BM25-only fallback (no hybrid searcher): expand the raw query into a safe
+	// FTS expression so punctuation can't crash the match and multi-word queries
+	// OR their tokens — mirroring HybridSearcher.searchBM25 so this path has the
+	// same recall instead of FTS5's implicit-AND.
+	fts := ExpandQueryAdvanced(query)
+	if fts == "" {
+		fts = ExpandQueryForFTS(ExtractKeywords(query))
+	}
+	if fts == "" {
+		return nil, nil
+	}
+	return s.store.Search(ctx, fts, opts)
 }
 
 func (s *Service) Get(ctx context.Context, id string) (*Memory, error) {
@@ -188,7 +246,19 @@ func (s *Service) List(ctx context.Context, opts ListOptions) ([]Memory, error) 
 }
 
 func (s *Service) Forget(ctx context.Context, id string) error {
-	return s.store.Delete(ctx, id)
+	m, _ := s.store.Get(ctx, id)
+	var pid *string
+	if m != nil {
+		pid = m.ProjectID
+	}
+	err := s.store.Delete(ctx, id)
+	if err != nil {
+		return err
+	}
+	s.notifyObservers(func(obs MemoryObserver) {
+		obs.OnMemoryDeleted(ctx, id, pid)
+	})
+	return nil
 }
 
 func (s *Service) Update(ctx context.Context, id, content, category string) (*Memory, error) {
@@ -218,22 +288,47 @@ func (s *Service) Update(ctx context.Context, id, content, category string) (*Me
 	if updateCategory == "" {
 		updateCategory = m.Category
 	}
+	updatedMetadata := ApplyQualityMetadata(m.Metadata, updateContent, updateCategory, m.ProjectID != nil)
 
 	if err := s.store.Update(ctx, id, updateContent, updateCategory); err != nil {
 		return nil, fmt.Errorf("update: %w", err)
+	}
+	if err := s.store.UpdateMetadata(ctx, id, updatedMetadata); err != nil {
+		return nil, fmt.Errorf("update metadata: %w", err)
 	}
 
 	if content != "" {
 		s.embedAsync(id, content)
 	}
 
+	s.notifyObservers(func(obs MemoryObserver) {
+		obs.OnMemoryUpdated(ctx, Memory{ID: id, Content: updateContent, Category: updateCategory, ProjectID: m.ProjectID})
+	})
+
 	m.Content = updateContent
 	m.Category = updateCategory
+	m.Metadata = updatedMetadata
 	return m, nil
 }
 
+func (s *Service) UpdateMetadata(ctx context.Context, id string, metadata any) error {
+	return s.store.UpdateMetadata(ctx, id, metadata)
+}
+
 func (s *Service) SoftForget(ctx context.Context, id string) error {
-	return s.store.SoftDelete(ctx, id)
+	m, _ := s.store.Get(ctx, id)
+	var pid *string
+	if m != nil {
+		pid = m.ProjectID
+	}
+	err := s.store.SoftDelete(ctx, id)
+	if err != nil {
+		return err
+	}
+	s.notifyObservers(func(obs MemoryObserver) {
+		obs.OnMemoryDeleted(ctx, id, pid)
+	})
+	return nil
 }
 
 func (s *Service) ForgetByScope(ctx context.Context, projectID, category, source string, hard bool) (int, error) {
@@ -275,6 +370,27 @@ func (s *Service) ResolveProject(cwd string) string {
 		return ""
 	}
 	return proj.ID
+}
+
+// ResolveProjectInfo returns the full project for a working directory (ID,
+// Name and git-origin RemoteKey), or nil when cwd is not inside a git repo.
+// Repo-scoped sync uses RemoteKey to identify a repository independent of its
+// local directory name.
+func (s *Service) ResolveProjectInfo(cwd string) (*project.Project, error) {
+	if cwd == "" || s.projDet == nil {
+		return nil, nil
+	}
+	return s.projDet.Detect(cwd)
+}
+
+func (s *Service) SaveMemory(ctx context.Context, content, category, source string, cwd string) error {
+	_, err := s.SaveWithOptions(ctx, SaveOptions{
+		Content:  content,
+		Category: category,
+		Source:   source,
+		CWD:      cwd,
+	})
+	return err
 }
 
 func (s *Service) SaveRaw(ctx context.Context, content, category, source string, cwd string) error {
@@ -331,7 +447,44 @@ func (s *Service) SetKGExtractor(extractor *kg.PatternExtractor) {
 	s.kgExtractor = extractor
 }
 
+func (s *Service) RegisterObserver(obs MemoryObserver) {
+	s.observers = append(s.observers, obs)
+}
+
+func (s *Service) notifyObservers(fn func(obs MemoryObserver)) {
+	for _, obs := range s.observers {
+		go func(o MemoryObserver) {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Debug("observer panic recovered", "error", r)
+				}
+			}()
+			fn(o)
+		}(obs)
+	}
+}
+
+// EmbeddingsEnabled reports whether vector embedding is available (provider
+// loaded + cache present). Callers use it to skip embedding-only background
+// work (e.g. the serve-time backfill) instead of looping on a guaranteed error.
+func (s *Service) EmbeddingsEnabled() bool {
+	return s.embedder != nil && s.cache != nil
+}
+
+// BackfillEmbeddings embeds every memory still missing a vector, as fast as the
+// machine allows (no pause between batches). Used by the one-shot `import`
+// command where blocking-until-done is the desired behavior.
 func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, error) {
+	return s.BackfillEmbeddingsThrottled(ctx, batchSize, 0)
+}
+
+// BackfillEmbeddingsThrottled is the same backfill but sleeps `pause` between
+// batches so a long historical backfill on a user's machine stays gentle on the
+// CPU instead of pinning a core. It honors ctx cancellation between batches and
+// between items, so a serve shutdown stops it promptly. Idempotent and
+// resumable: it drains ListWithoutEmbedding, so re-running after an interrupted
+// pass just continues where it left off.
+func (s *Service) BackfillEmbeddingsThrottled(ctx context.Context, batchSize int, pause time.Duration) (int, error) {
 	if s.embedder == nil || s.cache == nil {
 		return 0, fmt.Errorf("embedder not available")
 	}
@@ -345,6 +498,10 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 	const maxStuck = 3
 
 	for {
+		if ctx.Err() != nil {
+			return total, ctx.Err()
+		}
+
 		mems, err := s.store.ListWithoutEmbedding(ctx, batchSize)
 		if err != nil {
 			return total, fmt.Errorf("list pending: %w", err)
@@ -362,6 +519,9 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 
 		batchOK := 0
 		for i, m := range mems {
+			if ctx.Err() != nil {
+				return total, ctx.Err()
+			}
 			if embedErr != nil {
 				s.logger.Warn("backfill embedding failed", "id", m.ID, "error", embedErr)
 				break
@@ -403,6 +563,14 @@ func (s *Service) BackfillEmbeddings(ctx context.Context, batchSize int) (int, e
 			stuckCount = 0
 		}
 		lastTotal = total
+
+		if pause > 0 {
+			select {
+			case <-ctx.Done():
+				return total, ctx.Err()
+			case <-time.After(pause):
+			}
+		}
 	}
 
 	return total, nil
@@ -417,4 +585,46 @@ func (s *Service) Close() {
 	if s.store != nil {
 		s.store.Close()
 	}
+}
+
+// normalizeForDedup folds the trivial variations exact hashing misses:
+// case and whitespace. It deliberately does NOT tokenize or measure fuzzy
+// similarity — two memories merge only when they are the SAME text modulo
+// case/spacing, never when they merely share vocabulary (e.g. "deployed v1"
+// and "deployed v2", or "...decision A..." and "...decision B...", stay
+// distinct).
+func normalizeForDedup(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
+
+// findNearDuplicate returns an existing memory whose content is identical to
+// `content` after case/whitespace normalization, within the same project, or
+// nil. It fetches a few BM25 candidates so the check stays cheap (no
+// synchronous embedding). This catches "Postgres" vs "postgres " without the
+// false-merge risk of fuzzy similarity.
+func (s *Service) findNearDuplicate(ctx context.Context, content string, projectID *string) *Memory {
+	kws := ExtractKeywords(content)
+	if len(kws) == 0 {
+		return nil
+	}
+	fts := ExpandQueryForFTS(kws)
+	if fts == "" {
+		return nil
+	}
+	opts := SearchOptions{MaxResults: 10}
+	if projectID != nil {
+		opts.ProjectID = *projectID
+	}
+	cands, err := s.store.Search(ctx, fts, opts)
+	if err != nil {
+		return nil
+	}
+	want := normalizeForDedup(content)
+	for i := range cands {
+		if normalizeForDedup(cands[i].Memory.Content) == want {
+			m := cands[i].Memory
+			return &m
+		}
+	}
+	return nil
 }

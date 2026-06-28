@@ -4,10 +4,15 @@ builds:
   - id: anchored
     main: ./cmd/anchored
     binary: anchored
+    # zig cc pins the glibc baseline to 2.31 (Ubuntu 20.04 / Debian 11) so the
+    # released binaries run on older distros; the runner's native gcc would
+    # link against its current glibc and break them there. Wrappers are
+    # installed by the release workflow.
     env:
       - CGO_ENABLED=1
       - CGO_CFLAGS=-DSQLITE_ENABLE_FTS5
       - CGO_LDFLAGS=-lm
+      - CC=zcc-amd64
     ldflags:
       - -s -w -X main.Version={{.Version}}
     goos:
@@ -19,7 +24,7 @@ builds:
       - goos: linux
         goarch: arm64
         env:
-          - CC=aarch64-linux-gnu-gcc
+          - CC=zcc-arm64
 
   - id: anchored-windows
     main: ./cmd/anchored

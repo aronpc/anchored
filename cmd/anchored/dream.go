@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,7 @@ import (
 func runDream(args []string) {
 	fs := newFlagSet("dream")
 	dryRun := fs.Bool("dry-run", true, "analyze only, do not apply changes")
+	applyAction := fs.String("apply", "", "apply a single dream action by ID (skips analysis)")
 	aggressiveness := fs.String("aggressiveness", "moderate", "conservative, moderate, or aggressive")
 	maxDeletions := fs.Int("max-deletions", 50, "maximum soft-deletions per run")
 	configPath := fs.String("config", "", "path to config file")
@@ -27,6 +29,11 @@ func runDream(args []string) {
 
 	db := svc.StoreDB()
 	ctx := context.Background()
+
+	if *applyAction != "" {
+		runDreamApply(ctx, db, logger, *applyAction)
+		return
+	}
 
 	dreamCfg := dream.DreamConfigForAggressiveness(*aggressiveness)
 	dreamCfg.MaxDeletionsPerRun = *maxDeletions
@@ -81,4 +88,18 @@ func runDream(args []string) {
 	} else {
 		fmt.Println("\n(dry-run mode — no changes applied)")
 	}
+}
+
+func runDreamApply(ctx context.Context, db *sql.DB, logger *slog.Logger, actionID string) {
+	consolidator := dream.NewConsolidator(db, logger)
+	result, err := consolidator.ApplyAction(ctx, actionID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "apply failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Action applied: %s\n", result.ActionID)
+	fmt.Printf("  Type:     %s\n", result.ActionType)
+	fmt.Printf("  Memory:   %s\n", result.MemoryID)
+	fmt.Printf("  Status:   %s\n", result.Status)
+	fmt.Printf("  Message:  %s\n", result.Message)
 }

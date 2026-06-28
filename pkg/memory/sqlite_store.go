@@ -2,12 +2,16 @@ package memory
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "modernc.org/sqlite"
 
@@ -61,6 +65,24 @@ func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
 func (s *SQLiteStore) DB() *sql.DB               { return s.db }
 func (s *SQLiteStore) VectorCache() *VectorCache { return s.cache }
 
+func newUUID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// contentHash is the exact-dedup key. It hashes content verbatim (no
+// normalization) ON PURPOSE: the same hash is sent in the sync payload
+// (SyncMemory.ContentHash) and the server + older clients dedup on it, so the
+// algorithm must stay byte-identical across versions for backwards
+// compatibility. Trivial case/whitespace variants are folded by the
+// near-duplicate merge on the save path instead (Service.findNearDuplicate),
+// which keeps the sync contract stable.
+func contentHash(content string) string {
+	h := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(h[:])
+}
+
 func (s *SQLiteStore) Save(ctx context.Context, m Memory) error {
 	now := time.Now().UTC()
 
@@ -100,8 +122,8 @@ func (s *SQLiteStore) Save(ctx context.Context, m Memory) error {
 	}
 
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO memories (id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO memories (id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata, sync_dirty, sync_origin, author, remote_project_key)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 			project_id = excluded.project_id,
 			category = excluded.category,
@@ -113,9 +135,14 @@ func (s *SQLiteStore) Save(ctx context.Context, m Memory) error {
 			source_id = excluded.source_id,
 			updated_at = excluded.updated_at,
 			metadata = excluded.metadata,
+			sync_dirty = excluded.sync_dirty,
+			sync_origin = excluded.sync_origin,
+			author = excluded.author,
+			remote_project_key = excluded.remote_project_key,
 			deleted_at = NULL`,
 		m.ID, m.ProjectID, m.Category, m.Content, m.ContentHash, keywordsJSON, embeddingBlob, m.Source, m.SourceID,
 		m.CreatedAt, m.UpdatedAt, m.AccessCount, m.LastAccessed, metadataJSON,
+		m.SyncDirty, m.SyncOrigin, m.Author, m.RemoteProjectKey,
 	)
 	if err != nil {
 		return fmt.Errorf("save memory: %w", err)
@@ -132,7 +159,7 @@ func (s *SQLiteStore) Save(ctx context.Context, m Memory) error {
 
 func (s *SQLiteStore) Get(ctx context.Context, id string) (*Memory, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata
+		`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata, sync_dirty, sync_origin, author, remote_project_key
 		 FROM memories WHERE id = ? AND deleted_at IS NULL`, id,
 	)
 
@@ -144,6 +171,41 @@ func (s *SQLiteStore) Get(ctx context.Context, id string) (*Memory, error) {
 		return nil, fmt.Errorf("get memory %s: %w", id, err)
 	}
 	return m, nil
+}
+
+// isFTSSyntaxError reports whether err is an FTS5 query-parse failure (as
+// opposed to a real I/O/DB error), so Search can retry with a sanitized query.
+func isFTSSyntaxError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// FTS5 surfaces a malformed MATCH expression in several shapes: a bare
+	// "fts5: syntax error", a "no such column: X" when a token contains a colon
+	// (col:term filter), an unterminated quoted string, or an unknown special
+	// query. In this Search the only dynamic input is the MATCH argument and the
+	// surrounding SQL is static/valid, so any of these means the query — not the
+	// schema — is at fault.
+	for _, needle := range []string{"fts5", "syntax error", "no such column", "unterminated", "unknown special query", "malformed match"} {
+		if strings.Contains(msg, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// safeFTSOr reduces an arbitrary string to a safe FTS5 MATCH expression: each
+// alphanumeric token is double-quoted (so it's a literal, immune to operators)
+// and the tokens are OR-joined. Returns "" when the input has no usable tokens.
+func safeFTSOr(query string) string {
+	fields := strings.FieldsFunc(query, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	quoted := make([]string, 0, len(fields))
+	for _, f := range fields {
+		quoted = append(quoted, `"`+f+`"`)
+	}
+	return strings.Join(quoted, " OR ")
 }
 
 func (s *SQLiteStore) Search(ctx context.Context, query string, opts SearchOptions) ([]SearchResult, error) {
@@ -172,50 +234,73 @@ func (s *SQLiteStore) Search(ctx context.Context, query string, opts SearchOptio
 
 	qb.WriteString(" ORDER BY rank LIMIT ?")
 	args = append(args, maxResults)
+	sqlStr := qb.String()
 
-	rows, err := s.db.QueryContext(ctx, qb.String(), args...)
+	// exec runs the prepared query with a given MATCH expression and fully
+	// drains the rows. FTS5 (via mattn) surfaces a malformed MATCH lazily during
+	// iteration, not at QueryContext, so the error must be caught here for the
+	// crash-safe retry to work.
+	exec := func(matchExpr string) ([]SearchResult, error) {
+		// Build a private args slice (don't mutate the shared one in place) so
+		// the closure stays safe under any future concurrent use.
+		execArgs := append([]any{matchExpr}, args[1:]...)
+		rows, err := s.db.QueryContext(ctx, sqlStr, execArgs...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		var results []SearchResult
+		for rows.Next() {
+			var m Memory
+			var rank float64
+			var keywordsStr, metadataStr sql.NullString
+			var projectID, sourceID sql.NullString
+			var lastAccessedTime sql.NullTime
+
+			if err := rows.Scan(
+				&m.ID, &projectID, &m.Category, &m.Content, &keywordsStr, &m.Source, &sourceID,
+				&m.CreatedAt, &m.UpdatedAt, &m.AccessCount, &lastAccessedTime, &metadataStr,
+				&rank,
+			); err != nil {
+				return nil, err
+			}
+
+			m.ProjectID = nilIfNull(projectID)
+			m.SourceID = nilIfNull(sourceID)
+			m.Keywords = unmarshalKeywords(keywordsStr)
+			m.LastAccessed = nilTimeIfZero(lastAccessedTime)
+			if metadataStr.Valid {
+				json.Unmarshal([]byte(metadataStr.String), &m.Metadata)
+			}
+
+			// BM25 rank is negative (more negative = better match).
+			// Negate and normalize to positive [0,1] range for hybrid fusion.
+			score := 0.0
+			if rank < 0 {
+				score = 1.0 / (1.0 + -rank)
+			}
+			results = append(results, SearchResult{Memory: m, Score: score})
+		}
+		return results, rows.Err()
+	}
+
+	results, err := exec(query)
+	if err != nil && isFTSSyntaxError(err) {
+		// Crash-safe: the caller passed a raw query with FTS5 metacharacters
+		// (punctuation, a bare colon, unbalanced quotes) that isn't a valid MATCH
+		// expression. Retry once with the query reduced to a safe OR of quoted
+		// tokens rather than failing the search.
+		safe := safeFTSOr(query)
+		if safe == "" {
+			return nil, nil
+		}
+		results, err = exec(safe)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("search: %w", err)
 	}
-	defer rows.Close()
-
-	var results []SearchResult
-	for rows.Next() {
-		var m Memory
-		var rank float64
-		var keywordsStr, metadataStr sql.NullString
-		var projectID, sourceID sql.NullString
-		var lastAccessedTime sql.NullTime
-
-		err := rows.Scan(
-			&m.ID, &projectID, &m.Category, &m.Content, &keywordsStr, &m.Source, &sourceID,
-			&m.CreatedAt, &m.UpdatedAt, &m.AccessCount, &lastAccessedTime, &metadataStr,
-			&rank,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("scan search result: %w", err)
-		}
-
-		m.ProjectID = nilIfNull(projectID)
-		m.SourceID = nilIfNull(sourceID)
-		m.Keywords = unmarshalKeywords(keywordsStr)
-		m.LastAccessed = nilTimeIfZero(lastAccessedTime)
-		if metadataStr.Valid {
-			if err := json.Unmarshal([]byte(metadataStr.String), &m.Metadata); err != nil {
-				slog.Warn("failed to unmarshal metadata in search result", "error", err)
-			}
-		}
-
-		// BM25 rank is negative (more negative = better match).
-		// Negate and normalize to positive [0,1] range for hybrid fusion.
-		score := 0.0
-		if rank < 0 {
-			score = 1.0 / (1.0 + -rank)
-		}
-		results = append(results, SearchResult{Memory: m, Score: score})
-	}
-
-	return results, rows.Err()
+	return results, nil
 }
 
 func (s *SQLiteStore) Delete(ctx context.Context, id string) error {
@@ -229,11 +314,13 @@ func (s *SQLiteStore) Delete(ctx context.Context, id string) error {
 
 func (s *SQLiteStore) List(ctx context.Context, opts ListOptions) ([]Memory, error) {
 	qb := strings.Builder{}
-	qb.WriteString(`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata FROM memories`)
+	qb.WriteString(`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata, sync_dirty, sync_origin, author, remote_project_key FROM memories`)
 	var args []any
 	var conditions []string
 
-	conditions = append(conditions, "deleted_at IS NULL")
+	if !opts.IncludeDeleted {
+		conditions = append(conditions, "deleted_at IS NULL")
+	}
 
 	switch {
 	case len(opts.Categories) > 0:
@@ -252,6 +339,10 @@ func (s *SQLiteStore) List(ctx context.Context, opts ListOptions) ([]Memory, err
 	if opts.ProjectID != "" {
 		conditions = append(conditions, "project_id = ?")
 		args = append(args, opts.ProjectID)
+	}
+	if opts.Source != "" {
+		conditions = append(conditions, "source = ?")
+		args = append(args, opts.Source)
 	}
 
 	if len(conditions) > 0 {
@@ -402,10 +493,12 @@ func scanMemory(row rowScanner) (*Memory, error) {
 	var lastAccessed sql.NullTime
 	var embeddingBlob []byte
 	var contentHash sql.NullString
+	var syncOrigin, author, remoteProjectKey sql.NullString
 
 	err := row.Scan(
 		&m.ID, &projectID, &m.Category, &m.Content, &contentHash, &keywordsStr, &embeddingBlob, &m.Source, &sourceID,
 		&m.CreatedAt, &m.UpdatedAt, &m.AccessCount, &lastAccessed, &metadataStr,
+		&m.SyncDirty, &syncOrigin, &author, &remoteProjectKey,
 	)
 	if err != nil {
 		return nil, err
@@ -416,10 +509,52 @@ func scanMemory(row rowScanner) (*Memory, error) {
 	m.ContentHash = contentHash.String
 	m.Keywords = unmarshalKeywords(keywordsStr)
 	m.LastAccessed = nilTimeIfZero(lastAccessed)
+	m.SyncOrigin = syncOrigin.String
+	m.Author = nilIfNull(author)
+	m.RemoteProjectKey = nilIfNull(remoteProjectKey)
 	if metadataStr.Valid {
-		if err := json.Unmarshal([]byte(metadataStr.String), &m.Metadata); err != nil {
-			slog.Warn("failed to unmarshal metadata", "error", err)
-		}
+		json.Unmarshal([]byte(metadataStr.String), &m.Metadata)
+	}
+	if len(embeddingBlob) > 0 {
+		m.Embedding, _ = blobToFloat32s(embeddingBlob)
+	}
+
+	return &m, nil
+}
+
+func scanMemoryRow(rows *sql.Rows) (*Memory, error) {
+	var m Memory
+	var keywordsStr, metadataStr sql.NullString
+	var projectID, sourceID sql.NullString
+	var lastAccessed sql.NullTime
+	var embeddingBlob []byte
+	var contentHash sql.NullString
+	// source is nullable in the schema; rows inserted outside Save (raw
+	// tooling, older imports) can carry NULL and must not break a full-corpus
+	// scan like `curation reconcile`.
+	var source sql.NullString
+	var syncOrigin, author, remoteProjectKey sql.NullString
+
+	err := rows.Scan(
+		&m.ID, &projectID, &m.Category, &m.Content, &contentHash, &keywordsStr, &embeddingBlob, &source, &sourceID,
+		&m.CreatedAt, &m.UpdatedAt, &m.AccessCount, &lastAccessed, &metadataStr,
+		&m.SyncDirty, &syncOrigin, &author, &remoteProjectKey,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("scan memory row: %w", err)
+	}
+	m.Source = source.String
+
+	m.ProjectID = nilIfNull(projectID)
+	m.SourceID = nilIfNull(sourceID)
+	m.ContentHash = contentHash.String
+	m.Keywords = unmarshalKeywords(keywordsStr)
+	m.LastAccessed = nilTimeIfZero(lastAccessed)
+	m.SyncOrigin = syncOrigin.String
+	m.Author = nilIfNull(author)
+	m.RemoteProjectKey = nilIfNull(remoteProjectKey)
+	if metadataStr.Valid {
+		json.Unmarshal([]byte(metadataStr.String), &m.Metadata)
 	}
 	if len(embeddingBlob) > 0 {
 		m.Embedding, _ = blobToFloat32s(embeddingBlob)
@@ -458,7 +593,7 @@ func (s *SQLiteStore) CountWithoutEmbedding(ctx context.Context) (int, error) {
 }
 
 func (s *SQLiteStore) ListWithoutEmbedding(ctx context.Context, limit int) ([]Memory, error) {
-	q := `SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata FROM memories WHERE (embedding IS NULL OR LENGTH(embedding) = 0) AND deleted_at IS NULL ORDER BY created_at ASC`
+	q := `SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata, sync_dirty, sync_origin, author, remote_project_key FROM memories WHERE (embedding IS NULL OR LENGTH(embedding) = 0) AND deleted_at IS NULL ORDER BY created_at ASC`
 	if limit > 0 {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
@@ -495,6 +630,27 @@ func (s *SQLiteStore) Update(ctx context.Context, id string, content string, cat
 	)
 	if err != nil {
 		return fmt.Errorf("update memory %s: %w", id, err)
+	}
+	s.cache.Remove(id)
+	return nil
+}
+
+func (s *SQLiteStore) UpdateMetadata(ctx context.Context, id string, metadata any) error {
+	var metadataJSON any
+	if metadata != nil {
+		b, err := json.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("marshal metadata: %w", err)
+		}
+		metadataJSON = string(b)
+	}
+
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE memories SET metadata = ? WHERE id = ? AND deleted_at IS NULL`,
+		metadataJSON, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update metadata %s: %w", id, err)
 	}
 	s.cache.Remove(id)
 	return nil
@@ -555,13 +711,13 @@ func (s *SQLiteStore) FindByContentHash(ctx context.Context, hash string, projec
 	var row *sql.Row
 	if projectID != nil {
 		row = s.db.QueryRowContext(ctx,
-			`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata
+			`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata, sync_dirty, sync_origin, author, remote_project_key
 			 FROM memories WHERE content_hash = ? AND project_id = ? AND deleted_at IS NULL`,
 			hash, *projectID,
 		)
 	} else {
 		row = s.db.QueryRowContext(ctx,
-			`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata
+			`SELECT id, project_id, category, content, content_hash, keywords, embedding, source, source_id, created_at, updated_at, access_count, last_accessed_at, metadata, sync_dirty, sync_origin, author, remote_project_key
 			 FROM memories WHERE content_hash = ? AND project_id IS NULL AND deleted_at IS NULL`,
 			hash,
 		)

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/jholhewres/anchored/pkg/memory"
 )
@@ -41,11 +42,20 @@ func runPrecompact(args []string) {
 		cwdVal = "."
 	}
 
+	projectID := svc.ResolveProject(cwdVal)
+	expiresAt := time.Now().Add(14 * 24 * time.Hour).Format(time.RFC3339)
+	scope := memory.ScopeProject
+	if projectID == "" {
+		scope = memory.ScopeUser
+	}
+	precompactMeta := memory.PreCompactMetadata(scope, expiresAt)
+
 	m, err := svc.SaveWithOptions(context.Background(), memory.SaveOptions{
-		Content:  text,
-		Category: "",
-		Source:   "precompact",
-		CWD:      cwdVal,
+		Content:   text,
+		Category:  "summary",
+		Source:    "precompact",
+		CWD:       cwdVal,
+		Metadata:  precompactMeta.ToAny(),
 	})
 	if err != nil {
 		slog.Error("failed to save precompact memory", "error", err)

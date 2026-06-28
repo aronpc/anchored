@@ -47,13 +47,25 @@ func ToolDefinitions() []Tool {
 						"type":        "integer",
 						"description": "Maximum results to return (default: 20)",
 					},
+					"remote": map[string]any{
+						"type":        "string",
+						"description": "Usually OMIT this: when the project has a remote configured, remote results are merged into every search automatically. Set it only to search a remote EXCLUSIVELY. Empty string or \"default\" means THIS REPO'S remote (resolved by git origin, the same routing sync uses — not necessarily a server named default); any other value is a server name from the config. If the remote search fails, local results come back marked with remote_error and fallback=\"local\" — report that to the user instead of presenting them as remote data.",
+					},
+					"session_id": map[string]any{
+						"type":        "string",
+						"description": "Optional. When provided, results are boosted toward the session's working set (files/symbols currently in focus).",
+					},
+					"debug": map[string]any{
+						"type":        "boolean",
+						"description": "Optional. When true, each hit includes its ranking signals (e.g. project, working_set, pinned, fresh) and score.",
+					},
 				},
 				"required": []string{"query"},
 			},
 		},
 		{
 			Name:        "anchored_save",
-			Description: "Capture durable knowledge into persistent cross-tool memory. CALL PROACTIVELY when high-signal information emerges; do not wait for the user to say \"remember this\". You MUST pick a category — picking wrong is better than skipping, and quality categorization beats keyword auto-detect. Categories:\n• fact — stable truth about user/team/stack/system (\"we run Go 1.22 on ARM\", \"the API lives at api.example.com\")\n• preference — recurring choice the user makes (\"I always pin deps\", \"prefer small PRs\")\n• decision — architectural or directional choice (\"settled on Postgres\", \"going forward, no co-author trailers\")\n• event — something that happened at a point in time (\"deployed v2 today\", \"merged #421\", \"meeting at 14h\")\n• learning — non-obvious lesson or post-mortem insight (\"TIL X\", \"got bit by Y\", \"causa raiz foi Z\")\n• plan — intent to do something (\"TODO: migrate\", \"next up: refactor\")\n• summary — consolidated recap (\"daily recap\", \"sprint summary\")\n\nDO NOT save: ephemeral task state, basic engineering trivia, anything inferable from the codebase, secrets/credentials. Auto-detects project from cwd. Content is sanitized for tokens/keys before storage.",
+			Description: "Capture durable knowledge into persistent cross-tool memory. This is THE memory store — when the user asks to remember, save, note, or store anything (\"remember this\", \"save this\", \"salva isso\", \"lembra disso\", \"guarda isso\", \"anota\", \"save to memory\"), call this tool; never route it to a built-in/native memory, a scratch file, or CLAUDE.md/AGENTS.md. Also CALL PROACTIVELY when high-signal information emerges; do not wait for the user to say \"remember this\". You MUST pick a category — picking wrong is better than skipping, and quality categorization beats keyword auto-detect. Categories:\n• fact — stable truth about user/team/stack/system (\"we run Go 1.22 on ARM\", \"the API lives at api.example.com\")\n• preference — recurring choice. Defaults to scope=user (personal/local); use scope=project for project conventions and scope=team only when explicitly shared by the user/team.\n• decision — architectural or directional choice (\"settled on Postgres\", \"going forward, no co-author trailers\")\n• event — something that happened at a point in time (\"deployed v2 today\", \"merged #421\", \"meeting at 14h\")\n• learning — non-obvious lesson or post-mortem insight (\"TIL X\", \"got bit by Y\", \"causa raiz foi Z\")\n• plan — intent to do something (\"TODO: migrate\", \"next up: refactor\")\n• summary — consolidated recap (\"daily recap\", \"sprint summary\")\n\nDO NOT save: ephemeral task state, basic engineering trivia, anything inferable from the codebase, secrets/credentials. Auto-detects project from cwd. Content is sanitized for tokens/keys before storage.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -69,6 +81,15 @@ func ToolDefinitions() []Tool {
 					"cwd": map[string]any{
 						"type":        "string",
 						"description": "Current working directory for project detection",
+					},
+					"scope": map[string]any{
+						"type":        "string",
+						"description": "Optional scope for category=preference. Defaults to user. Use project for project conventions; use team only when explicitly shared.",
+						"enum":        []string{"user", "project", "team"},
+					},
+					"remote": map[string]any{
+						"type":        "string",
+						"description": "Usually OMIT this: when the project's remote has auto_sync on, the save is mirrored to it automatically. Set it only to force a synchronous save to a specific remote (empty string or \"default\" for the default remote, or a named remote). Local save always succeeds regardless.",
 					},
 				},
 				"required": []string{"content", "category"},
@@ -112,7 +133,7 @@ func ToolDefinitions() []Tool {
 					"category": map[string]any{
 						"type":        "string",
 						"description": "New category (optional — only update if provided)",
-						"enum":        []string{"fact", "preference", "decision", "event", "learning", "plan"},
+						"enum":        []string{"fact", "preference", "decision", "event", "learning", "plan", "summary"},
 					},
 					"cwd": map[string]any{
 						"type":        "string",
@@ -216,7 +237,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_execute",
-			Description: "Run code in a sandboxed subprocess so raw output never floods context — only stdout enters the conversation. USE INSTEAD OF Bash whenever a command may produce >20 lines (logs, JSON, build output, test runs, git log, large diffs, API responses, data processing, dependency trees, security audits). Bash is for short, deterministic operations only (git/mkdir/rm/mv/navigation). Pair with `intent` so output >5KB is auto-indexed and only matching sections return. Languages: javascript, typescript, python, shell, ruby, go, rust, php, perl, r, elixir.",
+			Description: "Run code in a sandboxed subprocess so large output never floods context — only your printed stdout enters the conversation. PREFER THIS OVER Bash for commands likely to produce lots of output (>~20 lines: logs, JSON, build/test output, big diffs, API responses, data processing); plain Bash is fine for short deterministic operations. Pair with `intent` so output >5KB is auto-indexed and only matching sections return. Requires the context optimizer to be enabled — when it isn't, the tool returns a notice and you should fall back to Bash. Languages: javascript, typescript, python, shell, ruby, go, rust, php, perl, r, elixir.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -248,7 +269,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_execute_file",
-			Description: "Process a file in the sandbox without loading its contents into context. USE INSTEAD OF Read when analyzing or exploring a file (logs, large JSON, CSVs, build artifacts, page snapshots, accessibility trees) — Read is only correct when you intend to Edit. Two variables are auto-injected before your code runs: FILE_PATH (absolute path) and FILE_CONTENT (UTF-8 text). Use them directly — don't repeat the read. Only your printed stdout enters context. Languages: javascript, typescript, python, shell, ruby, go, rust, php, perl, r, elixir.",
+			Description: "Process a file in the sandbox without loading its contents into context — only your printed stdout enters context. PREFER THIS OVER Read when analyzing or exploring a large file you don't intend to edit (logs, large JSON, CSVs, build artifacts, page snapshots, accessibility trees); use Read when you'll Edit the file. Two variables are auto-injected before your code runs: FILE_PATH (absolute path) and FILE_CONTENT (UTF-8 text) — use them directly, don't repeat the read. Requires the context optimizer to be enabled — when it isn't, fall back to Read. Languages: javascript, typescript, python, shell, ruby, go, rust, php, perl, r, elixir.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -284,7 +305,7 @@ func ToolDefinitions() []Tool {
 		},
 		{
 			Name:        "anchored_batch_execute",
-			Description: "PRIMARY TOOL FOR RESEARCH. Runs multiple commands, auto-indexes ALL output into the sandbox knowledge base, and answers multiple search queries in ONE call — replaces many individual Bash/Read/execute steps. Use first whenever you'd otherwise chain investigative commands (git status + git log + git diff, ls + find + grep, build + test + lint, multi-endpoint API probes, codebase stats). Pass `concurrency` (1-8) for I/O-bound batches to fan out commands in parallel; defaults to 1 (sequential). Returns only the search hits, not raw output. Batch ALL questions you have into the queries array — follow-ups should reuse anchored_ctx_search against the same indexed corpus.",
+			Description: "Run multiple commands and answer multiple queries in ONE call, auto-indexing all output so only the search hits return (not raw output). Good for investigative work you'd otherwise chain across many Bash/Read/execute steps (git status + log + diff, ls + find + grep, build + test + lint, multi-endpoint API probes, codebase stats). Pass `concurrency` (1-8) to fan out I/O-bound batches; defaults to 1 (sequential), result order preserved. Batch all your questions into the queries array — follow-ups should reuse anchored_ctx_search against the same indexed corpus. Requires the context optimizer to be enabled.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

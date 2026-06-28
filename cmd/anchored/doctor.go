@@ -15,14 +15,25 @@ import (
 func runDoctor(args []string) {
 	fs := newFlagSet("doctor")
 	configPath := fs.String("config", "", "path to config file")
+	cwd := fs.String("cwd", "", "current working directory (for workspace-scoped probes)")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON ({version, checks:[{name,status,detail,fix_command}]})")
 	fs.Parse(args)
 
-	fmt.Printf("anchored doctor — diagnostics for v%s\n\n", Version)
+	if *cwd == "" {
+		*cwd = "."
+	}
+	doctorChecks = nil // defensive: collector is package-level state
+	doctorJSONMode = *jsonOut
+
+	if !doctorJSONMode {
+		fmt.Printf("anchored doctor — diagnostics for v%s\n\n", Version)
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		printCheck(false, "config loaded", err.Error(), "")
-		os.Exit(1)
+		recordCheck("failed", "config loaded", err.Error(),
+			"fix or remove ~/.anchored/config.yaml (YAML syntax error?)", true)
+		finishDoctor()
 	}
 
 	home, _ := os.UserHomeDir()
@@ -30,10 +41,14 @@ func runDoctor(args []string) {
 	checkBinary(home)
 	checkONNX(cfg.Embedding.ModelDir)
 	checkDatabase(cfg.Memory.DatabasePath, cfg.Embedding.Dimensions)
-	checkMCPRegistration(home)
+	checkMCPRegistration(home, *cwd)
 	checkConfig(home, cfg)
+	checkPluginDrift(cfg)
+	anyReachable := checkRemoteConnectivity(cfg)
+	checkRemoteConfigSanity(cfg)
+	checkProjectIdentity(cfg, *cwd, anyReachable)
 
-	fmt.Println()
+	finishDoctor()
 }
 
 func checkBinary(home string) {
@@ -119,7 +134,8 @@ func checkDatabase(dbPath string, expectedDims int) {
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
-		printCheck(false, "database open", err.Error(), "")
+		recordCheck("failed", "database open", err.Error(),
+			"the database file may be corrupted — back it up and run 'anchored purge --hard' to rebuild", true)
 		return
 	}
 	defer db.Close()
@@ -185,14 +201,21 @@ type mcpProbe struct {
 	hint    string
 }
 
-func checkMCPRegistration(home string) {
-	wsVSCode := filepath.Join(".", ".vscode", "mcp.json")
+func checkMCPRegistration(home string, cwd string) {
+	wsVSCode := filepath.Join(cwd, ".vscode", "mcp.json")
+	wsDevin := filepath.Join(cwd, ".devin", "config.json")
 	probes := []mcpProbe{
 		{"Claude Code", filepath.Join(home, ".claude.json"), "user", "claude mcp add -s user anchored anchored"},
 		{"Cursor", filepath.Join(home, ".cursor", "mcp.json"), "user", "anchored init --tool cursor"},
 		{"OpenCode", filepath.Join(home, ".config", "opencode", "opencode.json"), "user", "anchored init --tool opencode"},
 		{"Gemini CLI", filepath.Join(home, ".gemini", "settings.json"), "user", "anchored init --tool gemini"},
-		{"VS Code Copilot (workspace)", wsVSCode, "workspace", "run from your project root and create .vscode/mcp.json with an 'anchored' entry under mcpServers"},
+		{"Antigravity 2.0", filepath.Join(home, ".gemini", "config", "mcp_config.json"), "user", "anchored init --tool agy"},
+		{"Antigravity CLI (agy)", filepath.Join(home, ".gemini", "antigravity-cli", "mcp_config.json"), "user", "anchored init --tool agy"},
+		{"Windsurf", filepath.Join(home, ".codeium", "windsurf", "mcp_config.json"), "user", "anchored init --tool windsurf"},
+		{"Cline", filepath.Join(home, ".cline", "mcp.json"), "user", "anchored init --tool cline"},
+		{"VS Code Copilot (workspace)", wsVSCode, "workspace", "anchored init --tool vscode"},
+		{"Codex CLI", filepath.Join(home, ".codex", "config.toml"), "user", "anchored init --tool codex"},
+		{"Devin", wsDevin, "project", "anchored init --tool devin"},
 	}
 
 	for _, p := range probes {
@@ -208,7 +231,8 @@ func checkMCPRegistration(home string) {
 			continue
 		}
 
-		if hasAnchoredEntry(data) {
+		isTOML := strings.HasSuffix(p.path, ".toml")
+		if hasAnchoredEntry(data) || hasVSCodeAnchoredEntry(data) || (isTOML && hasCodexAnchoredEntry(data)) {
 			printCheck(true, fmt.Sprintf("MCP registered for %s (%s)", p.tool, p.path), "", "")
 		} else {
 			printCheck(false, fmt.Sprintf("MCP registered for %s", p.tool),
@@ -243,6 +267,23 @@ func hasAnchoredEntry(data []byte) bool {
 	return false
 }
 
+func hasVSCodeAnchoredEntry(data []byte) bool {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	if servers, ok := raw["servers"].(map[string]any); ok {
+		if _, found := servers["anchored"]; found {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCodexAnchoredEntry(data []byte) bool {
+	return strings.Contains(string(data), "[mcp_servers.anchored]")
+}
+
 func checkConfig(home string, cfg interface{}) {
 	configFile := filepath.Join(home, ".anchored", "config.yaml")
 	if _, err := os.Stat(configFile); err == nil {
@@ -260,19 +301,15 @@ func checkConfig(home string, cfg interface{}) {
 	}
 }
 
+// printCheck is the legacy reporting helper; it now feeds the structured
+// collector (recordCheck) so --json sees every finding. Checks reported via
+// this path are never critical (they don't flip the exit code).
 func printCheck(ok bool, label, detail, hint string) {
-	mark := "[ ]"
+	status := "failed"
 	if ok {
-		mark = "[x]"
+		status = "ok"
 	}
-	fmt.Printf("%s %s", mark, label)
-	if detail != "" {
-		fmt.Printf(" — %s", detail)
-	}
-	fmt.Println()
-	if !ok && hint != "" {
-		fmt.Printf("    → %s\n", hint)
-	}
+	recordCheck(status, label, detail, hint, false)
 }
 
 func pathHas(target string) bool {

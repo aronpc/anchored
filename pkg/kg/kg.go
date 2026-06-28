@@ -159,6 +159,42 @@ func (k *KG) Query(ctx context.Context, entityName string, projectID *string) ([
 	return triples, nil
 }
 
+// ListByProject returns every live triple in the given project, ordered by
+// most recent first. Used by remote sync to push the local KG to the server.
+func (k *KG) ListByProject(ctx context.Context, projectID string) ([]Triple, error) {
+	rows, err := k.db.QueryContext(ctx, `
+		SELECT t.id, s.name, p.name, o.name, t.confidence, t.project_id, t.valid_from, t.valid_to
+		FROM kg_triples t
+		JOIN kg_entities s ON t.subject_id = s.id
+		JOIN kg_predicates p ON t.predicate_id = p.id
+		JOIN kg_entities o ON t.object_id = o.id
+		WHERE t.valid_to IS NULL AND t.project_id = ?
+		ORDER BY t.created_at DESC
+	`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list triples by project: %w", err)
+	}
+	defer rows.Close()
+
+	var triples []Triple
+	for rows.Next() {
+		var t Triple
+		var projID sql.NullString
+		var validTo sql.NullTime
+		if err := rows.Scan(&t.ID, &t.Subject, &t.Predicate, &t.Object, &t.Confidence, &projID, &t.ValidFrom, &validTo); err != nil {
+			continue
+		}
+		if projID.Valid {
+			t.ProjectID = &projID.String
+		}
+		if validTo.Valid {
+			t.ValidTo = &validTo.Time
+		}
+		triples = append(triples, t)
+	}
+	return triples, nil
+}
+
 func (k *KG) ensureEntity(ctx context.Context, tx *sql.Tx, name string, projectID *string) (string, error) {
 	var id string
 	err := tx.QueryRowContext(ctx, "SELECT id FROM kg_entities WHERE name = ?", name).Scan(&id)

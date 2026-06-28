@@ -19,12 +19,15 @@ func initSchema() string {
 			last_accessed_at DATETIME,
 			metadata TEXT
 		)`,
+		// unicode61 with diacritic folding (no 'porter': that stemmer is
+		// English-only and mangles the multilingual corpus, e.g. PT/ES terms).
+		// remove_diacritics=2 lets "memoria" match "memória".
 		`CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
 			content,
 			keywords,
 			content='memories',
 			content_rowid='rowid',
-			tokenize='porter unicode61'
+			tokenize='unicode61 remove_diacritics 2'
 		)`,
 		`CREATE TABLE IF NOT EXISTS embedding_cache (
 			text_hash TEXT NOT NULL,
@@ -109,7 +112,7 @@ func initSchema() string {
 		`CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
 			INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.rowid, new.content, new.keywords);
 		END`,
-		`CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE ON memories BEGIN
+		`CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE OF content, keywords ON memories BEGIN
 			INSERT INTO memories_fts(memories_fts, rowid, content, keywords) VALUES('delete', old.rowid, old.content, old.keywords);
 			INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.rowid, new.content, new.keywords);
 		END`,

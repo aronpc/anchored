@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jholhewres/anchored/pkg/memory"
@@ -103,7 +104,9 @@ func (a *DreamAnalyzer) Analyze(ctx context.Context) (*DreamReport, error) {
 		}
 	}
 
-	// Tier 2: Semantic near-dup via vector cosine similarity
+	// Tier 2: Semantic near-dup via vector cosine similarity. The pairs feed
+	// Tier 4's cluster synthesis below.
+	var nearPairs [][2]string
 	if a.vectorCache != nil && a.vectorCache.Len() > 0 {
 		allVecs := a.vectorCache.All()
 
@@ -154,6 +157,7 @@ func (a *DreamAnalyzer) Analyze(ctx context.Context) (*DreamReport, error) {
 					}
 
 					report.NearDupes++
+					nearPairs = append(nearPairs, [2]string{idA, idB})
 					actionID := fmt.Sprintf("dedup-near-%s-%s", idA, idB)
 					report.Actions = append(report.Actions, DreamAction{
 						ID:              actionID,
@@ -166,6 +170,23 @@ func (a *DreamAnalyzer) Analyze(ctx context.Context) (*DreamReport, error) {
 				}
 			}
 		}
+	}
+
+	// Tier 4 (Feature E): cluster synthesis. Connected components of the
+	// near-dup graph with >= clusterMinSize members become one "synthesize"
+	// proposal: a higher-level summary memory that supersedes the raw
+	// members. The proposal stays manual-apply like everything else here.
+	for _, cluster := range clustersFromPairs(nearPairs, clusterMinSize) {
+		leader := cluster[0]
+		members := cluster[1:]
+		report.Actions = append(report.Actions, DreamAction{
+			ID:              fmt.Sprintf("synthesize-%s", leader),
+			MemoryID:        leader,
+			RelatedMemoryID: strings.Join(members, ","),
+			ActionType:      "synthesize",
+			Confidence:      0.9,
+			Reason:          fmt.Sprintf("cluster of %d related memories — consolidate into one summary", len(cluster)),
+		})
 	}
 
 	// Tier 3: Contradiction detection
@@ -278,4 +299,44 @@ func SaveDreamActions(ctx context.Context, db *sql.DB, runID string, actions []D
 		}
 	}
 	return nil
+}
+
+// clusterMinSize is the smallest near-dup connected component worth
+// synthesizing — pairs are already handled by dedup/merge actions.
+const clusterMinSize = 3
+
+// clustersFromPairs groups near-duplicate pairs into connected components
+// (union-find) and returns the components with at least minSize members,
+// each sorted for deterministic leader selection.
+func clustersFromPairs(pairs [][2]string, minSize int) [][]string {
+	parent := make(map[string]string)
+	var find func(string) string
+	find = func(x string) string {
+		if parent[x] == "" || parent[x] == x {
+			parent[x] = x
+			return x
+		}
+		root := find(parent[x])
+		parent[x] = root
+		return root
+	}
+	union := func(a, b string) { parent[find(a)] = find(b) }
+
+	for _, p := range pairs {
+		union(p[0], p[1])
+	}
+	groups := make(map[string][]string)
+	for node := range parent {
+		root := find(node)
+		groups[root] = append(groups[root], node)
+	}
+	var out [][]string
+	for _, members := range groups {
+		if len(members) >= minSize {
+			sort.Strings(members)
+			out = append(out, members)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i][0] < out[j][0] })
+	return out
 }

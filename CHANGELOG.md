@@ -4,6 +4,502 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.1] - 2026-06-21
+
+Stops the agent from abandoning anchored when its tools are deferred in the
+harness — the follow-up to v0.9.0's reliable-invocation work.
+
+### Fixed
+
+- **Sandbox redirects guide deferred-tool harnesses** — the optimizer redirects
+  (curl/wget, WebFetch, inline HTTP, build tools) point the agent at
+  `anchored_execute` / `anchored_fetch_and_index`. When those tools are deferred
+  (Claude Code loads anchored_* schemas on demand), a direct call fails as
+  not-found and the agent abandoned anchored entirely, falling back to nothing
+  since the original command was blocked. Each redirect now tells the agent to
+  `ToolSearch`-load the tools first and not to drop the task on a not-found.
+- **Deferred-tool bootstrap in the main routing block** — the `ToolSearch`
+  bootstrap previously lived only in the subagent block. It is now in
+  `AnchoredRoutingBlock` (SessionStart) and, compactly, in
+  `AnchoredMCPInstructions`, so the main agent learns once to load the anchored
+  tools — covering every call site (gate, redirects, secret-block, miss-nudge)
+  systemically. Mirrors context-mode's fix for the same stall (their #724).
+
+## [0.9.0] - 2026-06-20
+
+Makes anchored reliably invoked on every session and prompt — especially in
+Claude Code, which routinely ignored the soft memory-routing injection when
+handed a concrete task. The context gate becomes the floor behavior, the plugin
+self-heals a wedged marketplace mirror, the MCP instructions survive client
+truncation, and the recall push gains real vector recall.
+
+### Changed
+
+- **Context gate is ON by default** — `context_gate` now resolves to `enforce`
+  for every value except an explicit `context_gate: disabled` (the only opt-out).
+  The legacy `off` the previous default serialized into existing configs also
+  resolves to `enforce`, so a version bump alone arms the gate with no config
+  edit. It still fires at most once per session and relents after a few denies,
+  so it can never hard-block work.
+- **Auto-recall defaults to `full`**, and `Defaults()` now enables MMR and
+  temporal decay, so fresh installs get ranked, deduplicated, freshness-aware
+  results out of the box instead of raw BM25 order.
+
+### Added
+
+- **Vector recall in the UserPromptSubmit push** — when keyword (BM25) recall is
+  sparse, anchored seeds from the top hit's precomputed embedding and pulls its
+  nearest neighbours from the vector cache (memory-to-memory expansion, no
+  raw-prompt embedding), bounded by a 100ms budget and fail-open. When keyword
+  recall finds nothing, it injects a directed nudge to call `anchored_search`
+  (the serve-side hybrid search) instead of the generic reminder.
+- **PostToolUse context-gate fallback** — the gate is credited even when the
+  PreToolUse credit is missed (e.g. a stale plugin matcher), so consulting
+  memory always satisfies it.
+
+### Fixed
+
+- **Self-heal a stale marketplace mirror** — a dirty or hand-edited mirror made
+  `git pull --ff-only` fail and permanently pinned the plugin to a stale
+  version. Anchored now hard-resets the managed mirror to its upstream and
+  retries within the same budget, so a binary update heals the plugin install
+  instead of wedging on a leftover local edit.
+- **MCP server instructions survive Claude Code's 2048-char truncation** — the
+  handshake now ships a separate compact `AnchoredMCPInstructions` constant
+  (~1.6KB) that keeps every load-bearing directive; the full rich block still
+  ships verbatim via the (untruncated) SessionStart hook.
+- **Gate deny guides deferred-tool harnesses** — the deny reason now tells the
+  agent to `ToolSearch`-load the anchored tools first when they are deferred,
+  collapsing repeated denies to a single one.
+- **Plugin manifest versions** (`plugin.json`, `marketplace.json`) now track
+  `VERSION`, so drift detection no longer re-syncs the plugin every session.
+
+## [0.8.9] - 2026-06-15
+
+Quiets the MCP server's log output and bounds every tool response that scales
+with stored or executed content, so neither floods the host (Cursor's error
+pane, or Claude Code's on-disk persistence of oversized results).
+
+### Fixed
+
+- **Server no longer spams MCP clients with false `[error]` lines** — the
+  `serve` logger now defaults to WARN instead of INFO. STDIO MCP clients (e.g.
+  Cursor) surface every stderr line as an `[error]`, so routine operational
+  INFO (`vector cache loaded`, `ONNX embedder initialized`, and the recurring
+  eviction-cycle logs that fire every few minutes) was showing up as a steady
+  stream of fake errors in the client's log pane. Warnings and errors still
+  pass through; set `ANCHORED_LOG_LEVEL=debug|info|warn|error` to override when
+  diagnosing the server itself.
+- **Tool responses are now bounded** — `anchored_search`, `anchored_list`, and
+  `anchored_execute`/`execute_file`/`batch_execute` cap their output (per-hit
+  rune cap + whole-response byte budget; head/tail previews for large execution
+  output and echoed stderr). An oversized result used to be persisted to a file
+  by Claude Code, defeating the point of the plugin; over-budget search hits are
+  now counted in an `<omitted>` note instead of silently dropped.
+- **Team memory no longer silently skipped on an omitted `cwd`** — search, save,
+  and `kg_add` resolve an empty `cwd` to the server's working directory (the
+  same convention `save` already used), so the auto remote merge can find the
+  linked project instead of degrading to local-only. An unresolved-but-
+  configured remote now leaves a debug trace.
+- **Hook matchers corrected** — `mcp__` → `mcp__.*` and the `PostToolUse`
+  matcher split so `Write|Edit|Bash` and `mcp__anchored__.*` are matched
+  independently.
+
+### Added
+
+- **`anchored backfill`** — standalone, observable one-shot that embeds every
+  memory still missing a vector (`--batch`, `--pause` to stay gentle on CPU).
+  Idempotent and resumable; does not depend on the MCP server being up.
+- **`anchored_search` `full=true`** — lifts the per-hit preview cap for reading
+  one specific memory in full (pair with a low `max_results`).
+- **`context_gate` plugin option** (off by default) — optional deterministic
+  PreToolUse enforcement that the agent consult anchored memory before its first
+  substantive tool call in a session. Bounded and fail-open: relents after a few
+  denies and never hard-blocks the user.
+
+## [0.8.8] - 2026-06-11
+
+Observability pass over the MCP tools and hooks: failures that used to vanish
+silently now leave a trace, making "why didn't anchored remember/find X?"
+diagnosable.
+
+### Fixed
+
+- **MCP server no longer swallows errors** — `anchored_context` now logs
+  failures from session-activity recording, recent-memory listing, and KG
+  triple listing; `anchored_execute` logs when auto-indexing a large output
+  fails; a skipped remote merge during `anchored_search` is logged at warn
+  (it silently degraded team search to local-only). All paths keep their
+  best-effort behavior — nothing new fails, it just stops failing invisibly.
+- **SessionStart hook logs parse/query failures** — malformed stdin JSON and
+  working-set lookups that error are recorded in the debug log instead of
+  being discarded; the hook remains fail-safe.
+- Removed dead `_ = p.CWD` placeholders in `anchored_forget`/`anchored_update`.
+
+## [0.8.7] - 2026-06-11
+
+Hotfix for v0.8.6: the new PreToolUse routing emitted output Claude Code's hook
+schema rejects, spamming `PreToolUse:Read hook error — (root): Invalid input`
+on nearly every tool call.
+
+### Fixed
+
+- **No more `additionalContext` from PreToolUse** — Claude Code's PreToolUse
+  hook schema accepts only `permissionDecision`, `permissionDecisionReason`, and
+  `updatedInput`; there is no `additionalContext` channel (that field exists
+  only for SessionStart / UserPromptSubmit / PostToolUse). The soft "search
+  memory first" nudges on `Read`/`Grep`/`Glob`/generic `Bash`/external MCP had
+  no valid wire shape and failed validation, so they are removed. That messaging
+  already lives in the SessionStart block, the per-prompt UserPromptSubmit
+  reminder, and the skill — all of which DO support `additionalContext`. The
+  high-value enforcement is unchanged: `WebFetch`/`curl`/`wget`/inline-HTTP/
+  build-tool **deny + redirect**, and `Agent`/`Task` subagent prompt injection.
+- **Passthrough no longer emits `{"decision":"allow"}`** — Claude Code types the
+  top-level `decision` field as `enum("approve","block")`, so `"allow"` is an
+  invalid value that failed validation on every passthrough. The hook now emits
+  an empty object `{}` (a valid no-op) instead. This was a latent bug that only
+  surfaced once v0.8.6 widened the PreToolUse matchers to `Read`/`Grep`/`Bash`.
+
+## [0.8.6] - 2026-06-11
+
+The model now reaches for memory before it reaches for files. Anchored gains a
+PreToolUse routing layer — the same enforcement mechanism context-mode uses —
+so native exploration tools are steered toward Anchored's memory and sandbox
+tools instead of being silently bypassed.
+
+### Added
+
+- **PreToolUse routing (`pkg/hookroute`)** — `Read`/`Grep`/`Glob`/`Bash`/
+  `WebFetch`/`Agent` and external MCP calls are now intercepted at the point of
+  action and steered toward Anchored:
+  - **Memory-first nudges** on codebase search (recursive `grep`/`rg`/`ag`/
+    `find`, `Grep`, `Glob`): "search memory before exploring". Re-fired
+    periodically so they survive context compaction.
+  - **WebFetch → deny + redirect** to `anchored_fetch_and_index` +
+    `anchored_ctx_search` (raw page bytes stay out of context).
+  - **`curl`/`wget` stdout floods, inline HTTP in `-e`/`-c` snippets, and
+    verbose build tools (gradle/maven/sbt) → deny + redirect** to
+    `anchored_execute`. Silent file downloads, quoted text, and structurally
+    bounded probes (`pwd`, `git status`, `--version`, …) pass through untouched.
+  - **Subagent prompt injection** (`Agent`/`Task`) — subagents now receive a
+    compact memory routing block plus a `ToolSearch` bootstrap for the deferred
+    `anchored_*` tools, so work done in subagents uses memory too.
+  - All sandbox redirects are gated on `context_optimizer.enabled` — when the
+    optimizer is off they degrade to a soft nudge instead of denying into a
+    tool that would error.
+- **Skill** — `skills/anchored/SKILL.md` gains a mandatory "memory-first" rule,
+  a decision tree, and an anti-patterns section.
+
+### Changed
+
+- **`context_optimizer.enabled` now defaults to `true`** — the sandbox tools
+  (`anchored_execute*`, `_fetch_and_index`, `_ctx_search`) and the routing
+  redirects that target them only work when the optimizer is on. (Existing
+  configs that set it explicitly are unchanged; flip it manually to opt in.)
+- **PreToolUse hook output migrated to `hookSpecificOutput`** — security blocks
+  (secret-into-memory-file, dangerous sandbox patterns) now emit
+  `permissionDecision: "deny"`, the shape Claude Code reliably honors.
+
+### Fixed
+
+- **Dangerous-pattern check now matches the fully-qualified MCP tool name** —
+  it compared `anchored_execute` but Claude Code sends
+  `mcp__anchored__anchored_execute`; the check now strips to the leaf name so
+  the sandbox security gate actually fires.
+
+## [0.8.5] - 2026-06-10
+
+### Added
+
+- **Personal kanban sync** — every `anchored task` mutation
+  (start/pause/resume/done/cancel/note) mirrors the thread to your server as
+  a card for the dashboard's new "My tasks" board (server v0.5.6+). Best
+  effort by design: no remote, no key or a network failure never fails the
+  local command. **Privacy gate:** the journal (free-form personal notes)
+  is only ever sent to your DEFAULT (personal) server — when cwd routing
+  resolves to a team server, the card syncs as metadata only
+  (key/status/projects) and the command says so.
+
+## [0.8.4] - 2026-06-10
+
+The store stops growing forever: related memories consolidate into summaries
+and never-used ones fade with age.
+
+### Added
+
+- **Cluster synthesis (`anchored dream`)** — connected components of >= 3
+  near-duplicate memories become a "synthesize" proposal. Applying it creates
+  one deterministic summary memory (member IDs recorded in
+  `metadata.consolidated`/`supersedes`) inside a transaction, and DEMOTES the
+  raw members (`low_signal/consolidated`, with `consolidated_into`) — never
+  deletes them. Consolidated members are exempt from the mechanical
+  recuration lift: their demotion is structural, undone only explicitly.
+- **Age decay at search time** — memories never drawn on fade gently with
+  age (x0.85 after 90 days unused, x0.7 after 180), computed during ranking
+  with nothing written back. Any recorded use resets the clock; pinned
+  memories never decay; decay never stacks on an already-demoted memory
+  (the stacked-multiplier lesson from 0.5.8). Explain mode reports a
+  `decayed` signal.
+
+## [0.8.3] - 2026-06-10
+
+Cross-project task threads: a ticket becomes a first-class unit of work that
+follows you across repositories.
+
+### Added
+
+- **Task threads (`anchored task`)** — `start/pause/resume/done/cancel/note/
+  status` manage a ticket-keyed thread (PROJ-123) that records every project
+  and session the task touches plus a short journal. `done` consolidates the
+  thread into a durable summary memory (project names, ref, journal recap);
+  `cancel` closes without consolidating. No interactive prompts — every
+  transition is a command. Local-only (no sync in v1); migration
+  `016_task_threads` is additive and idempotent.
+- **Branch inference** — the SessionStart hook extracts the ticket key from
+  the checked-out branch (`feature/PROJ-123-...`, case-insensitive,
+  `git symbolic-ref` so branches with no commits still resolve) and registers
+  the session on the thread automatically. Done/cancelled threads are never
+  silently reopened by automation; paused threads reactivate on touch.
+- **Cross-repo context injection** — when the same task already touched OTHER
+  projects, the rich SessionStart block gains a compact `<task_thread>` tier:
+  thread status, latest journal notes, and per-project `<also_touched>` lines
+  with the files those sessions worked on. References only — memories keep
+  their own project; the thread just ties the strands together.
+
+## [0.8.2] - 2026-06-10
+
+The usage feedback loop closes: memories that keep getting injected but never
+help are pulled out of rotation automatically, and a single real use brings
+them back.
+
+### Added
+
+- **Used-signal capture** — the Stop hook now checks which injected memories
+  the turn's text actually drew on (deterministic significant-token overlap,
+  no model in the loop) and bumps `used_count`/`last_used_at`. Runs even when
+  the turn produced nothing to auto-save.
+- **Never-used demotion** — the canonical recuration pass demotes memories
+  with `injected_count >= 10` and `used_count == 0` to
+  `low_signal/never_used`. Advisory and reversible: one real use lifts the
+  flag on the next pass. Pinned memories are exempt, and the mechanical
+  quality rule takes priority. `curation_rule` metadata explains which rule
+  set the flag.
+- **Push-path demotion** — the auto-recall hook now excludes `low_signal`
+  memories, so a demotion actually stops the injection (previously only
+  `Service.Search` honored it).
+
+- **Trustworthy explicit-remote search** — when `anchored_search` is asked
+  for a remote exclusively and that search fails, the local results now come
+  back marked with `remote_error="..."` and `fallback="local"` instead of
+  silently impersonating the remote (which led agents to conclude "local and
+  remote are in sync" when the remote was never reached). And the
+  `""`/`"default"` selector now means THIS REPO'S remote — resolved by the
+  same git-origin routing sync uses — not whichever config entry happens to
+  be named "default".
+
+### Changed
+
+- Quality scorer version bumped to 3 — the serve-time worker and
+  `curation reconcile` re-flow the whole corpus once. As part of that pass,
+  `injected_count` accumulated on v0.8.x (before the used-signal existed) is
+  reset, so no memory is demoted for injections it never had a chance to be
+  marked "used" against.
+
+### Fixed
+
+- `curation reconcile` no longer aborts on memories with a NULL `source`
+  column (rows created by raw tooling or older imports).
+
+## [0.8.1] - 2026-06-09
+
+### Added
+
+- **User directives (standing rules)** — `anchored directives add|list|rm`
+  manages short do/don't rules ("never commit without an explicit request").
+  They are first-party instructions, stored as pinned preference memories
+  marked `directive=true`, and the SessionStart hook injects them as the
+  **top tier** of the rich context block — always present, unranked, ahead of
+  identity/decisions — rendered as `<standing_rule scope="user|project">`
+  lines. Global rules load in every project; `--project` binds a rule to the
+  current repo. `rm` accepts a unique ID prefix and only matches
+  directive-marked rows.
+- **Injection tracking (usage-feedback capture)** — when auto-recall injects
+  memories, their IDs are merged into the session working set
+  (`working_sets.memory_ids`) and each memory's metadata gets
+  `injected_count`/`last_injected_at` bumped, on a best-effort 50ms write that
+  can never delay or fail the prompt. This is the data-collection half of the
+  usage feedback loop: a future curation pass can demote
+  always-injected-never-used memories, and "injected × used" becomes
+  measurable.
+
+### Fixed
+
+- `anchored directives rm` accepts flags after the positional ID
+  (`reorderArgsForFlag`), matching the other subcommands.
+
+## [0.8.0] - 2026-06-09
+
+Push-based context injection: the hooks now put relevant memory in front of the
+model (and capture durable knowledge) instead of relying on the model calling
+the memory tools.
+
+> **Note:** after the plugin updates, restart Claude Code so the new `Stop`
+> hook in `hooks.json` is registered.
+
+### Added
+
+- **`pkg/contextbudget`** — deterministic tiered context assembler with a byte
+  ceiling: tiers fill in priority order, items are dropped whole (never split),
+  a higher tier never loses an item to a lower one, and `MinItems` reserves a
+  minimum per tier.
+- **Rich SessionStart context block** — the SessionStart hook now assembles
+  identity, pinned + recent decisions/learnings, the session working set, and
+  recent events into a budgeted `<anchored_context>` block
+  (`plugin.sessionstart_budget_bytes`, default 7000; `0` restores the previous
+  plain format).
+- **Stop hook (`anchored hook stop`)** — extracts durable decision/learning
+  candidates from the turn transcript (PT+EN markers, paragraph fallback for
+  short decisive sentences) and auto-saves them with dedup (content hash +
+  token Jaccard against the 50 most recent memories), capped at 2 saves per
+  turn with a 30-day TTL. Saves are embedder-free (`embedding NULL`; the
+  curation worker embeds asynchronously) so the hook stays well under its
+  500ms budget. Loop-guarded via `stop_hook_active`; disable with
+  `plugin.auto_save_stop: false`.
+- **Recall v2 in UserPromptSubmit** — the auto-recall query is now anchored to
+  the code being discussed: file/symbol anchors extracted from the prompt,
+  session working-set signals (files/symbols/entities), an expanded BM25 query
+  where anchors take precedence (24-token cap), a local re-rank boost with
+  explainability signals (`file_anchor`, `working_set`), and an optional
+  compact `<anchored_kg>` line when an anchor matches a knowledge-graph
+  entity.
+- **Adaptive recall reminder** — a strong one-line nudge when boosted hits are
+  injected ("consult before exploring files"), a short variant when recall is
+  empty (`plugin.adaptive_reminder`).
+- **Eval fixture** — recall fixture now includes a file-path-anchored query.
+
+### Changed
+
+- BM25 recall candidate limit raised from 3 to 5; the existing hook byte
+  budget decides how many survive.
+- `hooks/hooks.json` registers the new `Stop` hook.
+
+## [0.5.8] - 2026-05-28
+
+### Added
+
+- **Versioned quality scorer** — memories now carry a `scorer_version` in metadata. When the scoring formula changes, the worker and the new reconcile command re-flow scores through the whole corpus instead of only touching brand-new memories.
+- **Automatic backlog bootstrap** — on `anchored serve` startup, the curation worker performs a one-time full re-curation of the existing corpus when `scorer_version` lags (guarded by `reconciled_version` in `curation_state`), then settles into incremental passes. Repairs legacy memories with no manual command required.
+- **`anchored curation reconcile`** — re-scores the entire corpus in a single pass and repairs stale `low_signal` flags; records `reconciled_version` so the serve bootstrap does not redundantly re-drain.
+- **Richer `curation status`** — now shows the scorer version, corpus reconcile state, and pending candidate count.
+
+### Changed
+
+- **Curation worker selects by `scorer_version`** (missing or below current) rather than only unscored memories, so an existing corpus is actually re-curated after a scorer change.
+- **Single canonical scoring path** — `RecurateMetadata` is now shared by the save path, the worker, and the CLI, replacing three divergent implementations with different `low_signal` clear thresholds.
+- **`importance` is only initialized, never reduced** — the worker no longer ratchets a deliberately-set importance down toward the mechanical quality score.
+- **MCP routing guidance** — the server instructions and `anchored_save` description now assert anchored as the authoritative memory store and treat an explicit "remember/save" request as an unconditional trigger, so agents stop routing memory to native features or local files.
+
+### Fixed
+
+- **Search demotion no longer stacks** — `low_signal` (×0.03) and the sub-threshold quality band (×0.15) were multiplied together (~0.0045), effectively erasing legitimate hits. They are now mutually exclusive, which unburies the large share of the corpus that older formula versions had over-flagged.
+- **Embeddings persist on save** — the create path assigned the memory ID to a by-value copy, so `embedAsync`/observers ran with an empty ID and the embedding column was never populated. The ID is now assigned before save.
+
+## [0.5.7] - 2026-05-28
+
+### Added
+
+- **Default-on curation worker** — `anchored serve` now starts a safe background curation worker by default. It runs in small incremental passes, processes newest memories first (`updated_at DESC, created_at DESC`), and only refreshes lifecycle metadata (`quality_score`, `importance`, `curation_status`). It never rewrites content, soft-deletes, or hard-deletes memories automatically.
+- **Curation worker controls** — new `anchored curation status`, `anchored curation enable`, and `anchored curation disable` commands. Status is lightweight and reads config/state without booting the full memory service or ONNX/FTS stack.
+- **Curation config block** — new `curation.*` settings: `enabled`, `interval_hours`, `interval_minutes`, `threshold`, and `max_updates_per_run`. `interval_minutes` overrides `interval_hours` when set and enables short-cycle local maintenance.
+- **Curation state table** — migration `012_curation_state` stores worker state such as `last_run_at` so serve-time curation is resumable and does not depend on a long-lived daemon.
+
+### Changed
+
+- Default curation policy is now short and incremental: enabled, `interval_minutes=15`, `threshold=0.55`, and `max_updates_per_run=50`.
+- Curation now distinguishes the always-on safe path from `dream`: curation handles cheap metadata health; dream remains explicit/manual for deduplication, merge/supersede actions, and contradiction review.
+- README rewritten for clearer onboarding, CLI organization, curation/dream explanation, MCP tools, storage, configuration, and development/release flow.
+
+### Verified
+
+- Built a release test binary and ran an end-to-end curation worker pass against an isolated copy of the local database with `interval_minutes=1` and `max_updates_per_run=5`. Logs confirmed two one-minute passes, each scanning/updating 5 memories, and `curation_state.last_run_at` was written.
+- `go test ./pkg/config ./pkg/kg` passes.
+- `go test ./cmd/anchored ./pkg/memory ./pkg/mcp -run '^$'` compiles FTS-dependent packages in this environment.
+
+## [0.5.5] - 2026-05-25
+
+### Added
+
+- **Curation pipeline** — `anchored curation score [--apply] [--threshold 0.55]` computes a heuristic quality score per memory (length, category, signal patterns, project association) and marks low-signal ones with `metadata.curation_status=low_signal`. Pinned memories are always exempt. Dry-run by default; `--apply` persists.
+- **Curation clean** — `anchored curation clean [--hard] [--threshold] [--dry-run] [--yes]` removes low-signal memories. Soft-delete by default (reversible); `--hard` for permanent deletion. Prints a sample of the lowest-quality candidates before applying.
+- **Curation restore** — `anchored curation restore [--latest | --from PATH]` swaps the active DB for a backup from `~/.anchored/data/bkps/`. The current DB is snapshotted before the swap (`anchored.db.bak.pre-restore-<ts>`), so the operation is reversible. Interactive picker when no flag is given.
+- **Per-project remote sync** — `anchored remote sync-per-project [--min-memories N]` groups local memories by `project_id`, creates one remote project per local project, and pushes each subset separately. Preserves project segmentation on `anchored_oss` (devclaw, gatorllm, etc stay distinct on the team server instead of collapsing into one bucket).
+- **Knowledge-graph push** — `sync.Client.PushTriples(projectID, triples)` sends to `POST /v1/projects/{id}/triples` on the OSS server. `kg.KG.ListByProject(projectID)` enumerates live triples for a project. Server-side: idempotent (logical unique on subject+predicate+object+project), supports functional supersession, alias resolution.
+- **Hybrid-search lifecycle demotion** — `applyLifecycleBoost` multiplies score by 0.03 for `curation_status=low_signal` and by 0.15 for `quality_score < RemoteQualityThreshold` (non-pinned). Effectively buries junk from search results without deleting.
+- **Quality-aware sync filter** — `IsRemoteSyncCandidate` and `ClassifyForPreview` block `low_signal` and below-threshold `quality_score` memories. Preview surfaces them as `low_signal` / `low_quality` reasons distinct from the legacy `category_remote_blocked`.
+- **Hardened secret detection** — `pkg/sync.detectSecrets` adds explicit prefix/regex matchers for Stripe (`sk_live_`, `sk_test_`, `rk_live_`), GitHub (`ghp_`, `gho_`, `ghu_`, `ghs_`), Slack (`xoxb-`, `xoxp-`, `hooks.slack.com/services/T…`), AWS access keys (`AKIA[0-9A-Z]{16}`), Google API keys (`AIza[0-9A-Za-z_\-]{35}`), credentialed DB URIs (mongo/postgres/mysql/redis with `user:pass@`), and PEM private keys.
+- **Lifecycle-aware metadata propagation** — `SyncMemory.Metadata` is now sent over the wire; the remote server applies its own quality/lifecycle filter as defense-in-depth.
+
+### Changed
+
+- `RemoteQualityThreshold = 0.55` is now an exported constant shared by client (preview, sync, hybrid-search demotion) and consumed by `anchored_oss` server filter via metadata.
+- `Service.SaveWithOptions` and `Service.Update` automatically apply `ApplyQualityMetadata` so every save/update gets a `quality_score`, `importance`, and (if low) `curation_status`. Previously these were only set by explicit curation runs.
+- `SyncPushRequest.Memories[i].Metadata` is now `any` and propagated end-to-end. The remote can see lifecycle/curation flags it needs to enforce its own filter.
+- `SQLiteStore.UpdateMetadata` added: targeted metadata-only update (does not bump `updated_at`, does not re-index FTS). Used by `curation score --apply` to avoid hammering FTS over 25k rows.
+- `memories_fts_update` trigger now fires only on `UPDATE OF content, keywords` — metadata-only writes no longer rebuild the FTS row.
+
+### Fixed
+
+- Duplicate `switch` block removed from `SQLiteStore.List` (prior accidental copy created at refactor time; behavior unchanged).
+- `Push` short-circuits `event` and `preference` categories before the path/secret pipeline, matching the documented filter precedence and avoiding pointless sanitizer work.
+
+### Internal
+
+- New CLI files: `cmd/anchored/curation.go`, `cmd/anchored/curation_clean.go`, `cmd/anchored/remote_per_project.go`.
+- New driver dep: `modernc.org/sqlite` (used by `remote sync-per-project` to read local project names directly without going through the embedded service).
+- Pre-existing `pkg/memory` test suite still depends on FTS5 in the SQLite driver; those tests remain failing as in v0.5.0 (unrelated to this release; tracked separately).
+
+## [0.5.0] - 2026-05-24
+
+### Added
+
+- **Memory lifecycle v2** — new `MetadataV2` struct with Kind, Scope, MemoryType, Origin, Importance, ContextTier, Pinned, ExpiresAt, Supersedes, Consolidates, Confidence, ContentHash, DreamSource fields. Constructor helpers for semantic, operational, handoff, precompact, bootstrap, and dream metadata. `ParseMetadata`/`ParseMetadataFromJSON` with `Extra` passthrough for unknown keys. `IsExpired`, `IsSemantic`, `IsOperational`, `IsRemoteSyncCandidate` classifiers.
+- **Hybrid search lifecycle boost** — `applyLifecycleBoost` runs before temporal decay so pinned/important items are not penalized before boost. Handles pinned (+1.5×), importance, kind (decision/learning/rule +1.15×, active handoff +1.2×, active precompact +1.1×), semantic (+1.1×), operational expiry, superseded (-0.7×), bootstrap confidence, and context tier (L0 +1.3×, L1 +1.15×). Score clamped at 10.0.
+- **Dream supersede/merge actions** — supersede appends related_memory_id to metadata.supersedes; merge appends to metadata.consolidates and soft-deletes the merged memory. JSON errors are now propagated instead of silently discarded.
+- **Lifecycle-aware sync preview** — `ClassifyForPreview` checks v2 metadata: episodic, precompact, handoff, user-scope, and operational memories are blocked from sync. Semantic project-scoped and dream-derived semantic memories are syncable.
+- **CLI lifecycle commands** — `anchored bootstrap` (extract seeds from README/docs/rules/tree with SHA256 content hash and project-scoped dedup), `anchored handoff` (session handoff with scope and TTL, min 1h), `anchored retention sweep` (archive operational/episodic memories past TTL using proper time.Time comparison and UTC), `anchored precompact` (capture context snapshot with project-resolved scope).
+- **SaveOptions.Metadata** — store and service accept lifecycle metadata through the save pipeline.
+- **Tool support expanded** — `anchored init --tool` now supports 10 tools: Claude Code, Cursor, OpenCode, Gemini CLI, Antigravity (agy), Windsurf, Cline, VS Code Copilot, Codex CLI, and Devin. VS Code Copilot uses `servers` root key with required `type: stdio` field. Codex CLI uses TOML format (`~/.codex/config.toml`). Doctor probes added for all new tools with format-aware detection (JSON, TOML, VS Code `servers` key).
+- **Antigravity 2.0 (agy) support** — `anchored init --tool agy` detects both `~/.gemini/config/mcp_config.json` (Antigravity 2.0 desktop) and `~/.gemini/antigravity-cli/mcp_config.json` (Antigravity CLI). macOS ONNX download path fix included.
+- **Preference scope metadata** (Phase 1) — user/project/team scope metadata on preferences. `anchored save` accepts `--scope`.
+- **Sanitizer custom patterns + remote safety filter** (Phase 2) — regex-based credential redaction with configurable custom patterns. Outbound sync content is scanned for local paths, secrets, and personal preferences.
+- **Stable project identity with RemoteKey** (Phase 3) — git remote URL derived `RemoteKey` (SHA-256) for cross-machine consistency. Project identity survives directory renames.
+- **Sync metadata migration + service observers** (Phase 4) — dirty flags, sync origin, author, remote project key columns and `sync_state` table. `MemoryObserver` interface for save/update/delete side effects.
+- **Memory inspect and export CLI** (Phase 5) — `anchored inspect <id>` for full JSON details, `anchored export` with filters (JSON/JSONL, project, category, source, include-deleted).
+- **Remote config and preview command** (Phase 6) — `anchored remote status` and `anchored remote preview` to classify memories as syncable/blocked/needs-review without network access.
+- **Dream --apply single-action review** (Phase 7) — `anchored dream --apply <action-id>` for individual dream action review and application.
+- **Minimal sync client skeleton** (Phase 8) — bidirectional sync client with push/pull/tombstone support.
+- **Remote save and search** — `anchored save --remote` and `anchored search --remote` with graceful fallback when no remote is configured.
+- **RemoteProjectKey and PreferenceScope** — Memory model extended with `RemoteProjectKey` and `PreferenceScope` fields for sync protocol compatibility.
+- **Remote: paginated memory listing** — `remote` command paginates memory listing and extracts helpers for cleaner code.
+- **Config wizard** — `anchored config wizard` for interactive configuration setup.
+- **Contributing guide** — `CONTRIBUTING.md` with development setup, PR workflow, tool support guide, and coding conventions.
+- **Lifecycle roadmap docs** — `docs/memory-lifecycle-roadmap.md` documents local lifecycle phases 1-8.
+
+### Changed
+
+- Go 1.25 (go.mod, ci.yml, release.yml).
+
+### Fixed
+
+- **Retention sweep** — `createdAt` parsed as `time.Time` with `.Before()` comparison instead of unreliable string comparison. UTC applied.
+- **Precompact scope** — uses `svc.ResolveProject(cwd)` so scope is correctly `ScopeProject` when a project is detected (was hardcoded empty, always `ScopeUser`).
+- **Consolidator JSON errors** — `json.Unmarshal` and `json.Marshal` in supersede/merge return explicit errors instead of silently discarding failures.
+- **Bootstrap dedup** — project-scoped dedup query filters by `content_hash + project_id` instead of global content hash.
+- **Hybrid search order** — `applyLifecycleBoost` now runs before `applyTemporalDecay` so pinned/important items are not decayed before boost is applied.
+- **Handoff TTL validation** — `ttlHours` must be ≥ 1.
+- **Sync: secret detection on path-rewritten content** — safety filter now scans content after project-relative path rewriting, catching secrets in rewritten paths.
+- **Init: include gemini in --tool all** — `gemini` was missing from the `all` tool list.
+
 ## [0.4.10] - 2026-05-11
 
 ### Added

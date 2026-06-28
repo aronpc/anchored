@@ -3,10 +3,12 @@ package memory
 import (
 	"strings"
 	"testing"
+
+	"github.com/jholhewres/anchored/pkg/config"
 )
 
 func TestSanitizer_APIKeys(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	cases := []struct {
 		name  string
 		input string
@@ -32,7 +34,7 @@ func TestSanitizer_APIKeys(t *testing.T) {
 }
 
 func TestSanitizer_Tokens(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	cases := []struct {
 		name  string
 		input string
@@ -53,7 +55,7 @@ func TestSanitizer_Tokens(t *testing.T) {
 }
 
 func TestSanitizer_Passwords(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	got := s.Sanitize(`password = "supersecretpassword123"`)
 	if !strings.Contains(got, "password=[REDACTED]") {
 		t.Errorf("expected password=[REDACTED], got: %s", got)
@@ -66,7 +68,7 @@ func TestSanitizer_Passwords(t *testing.T) {
 }
 
 func TestSanitizer_Secrets(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	got := s.Sanitize(`secret = myverylongsecretvalue`)
 	if !strings.Contains(got, "secret=[REDACTED]") {
 		t.Errorf("expected secret=[REDACTED], got: %s", got)
@@ -79,7 +81,7 @@ func TestSanitizer_Secrets(t *testing.T) {
 }
 
 func TestSanitizer_PrivateKeys(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	key := `-----BEGIN RSA PRIVATE KEY-----
 MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7Lso
 -----END RSA PRIVATE KEY-----`
@@ -93,7 +95,7 @@ MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7Lso
 }
 
 func TestSanitizer_JWT(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	jwt := `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c`
 	got := s.Sanitize(jwt)
 	if !strings.Contains(got, "[REDACTED]") {
@@ -105,7 +107,7 @@ func TestSanitizer_JWT(t *testing.T) {
 }
 
 func TestSanitizer_AWSAccessKey(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	got := s.Sanitize(`aws_access_key_id = AKIAIOSFODNN7EXAMPLE`)
 	if !strings.Contains(got, "[REDACTED]") {
 		t.Errorf("expected [REDACTED] for AWS key, got: %s", got)
@@ -116,7 +118,7 @@ func TestSanitizer_AWSAccessKey(t *testing.T) {
 }
 
 func TestSanitizer_GitHubTokens(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	tokens := []string{
 		"ghp_abcdefghijklmnopqrstuvwxyz1234567890",
 		"gho_abcdefghijklmnopqrstuvwxyz1234567890",
@@ -132,7 +134,7 @@ func TestSanitizer_GitHubTokens(t *testing.T) {
 }
 
 func TestSanitizer_GenericTokenPatterns(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	cases := []struct {
 		name  string
 		input string
@@ -151,7 +153,7 @@ func TestSanitizer_GenericTokenPatterns(t *testing.T) {
 }
 
 func TestSanitizer_ConnectionStrings(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	cases := []struct {
 		name  string
 		input string
@@ -180,7 +182,7 @@ func TestSanitizer_ConnectionStrings(t *testing.T) {
 }
 
 func TestSanitizer_BearerToken(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	got := s.Sanitize(`Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc123defghij`)
 	if !strings.Contains(got, "[REDACTED]") {
 		t.Errorf("expected [REDACTED], got: %s", got)
@@ -191,7 +193,7 @@ func TestSanitizer_BearerToken(t *testing.T) {
 }
 
 func TestSanitizer_SK_PK(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	got := s.Sanitize(`sk=abcdefghijklmnopqrstuvwxyz`)
 	if !strings.Contains(got, "[REDACTED]") {
 		t.Errorf("expected [REDACTED] for sk=, got: %s", got)
@@ -204,7 +206,7 @@ func TestSanitizer_SK_PK(t *testing.T) {
 }
 
 func TestSanitizer_LegitimateContent(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	cases := []struct {
 		name  string
 		input string
@@ -235,7 +237,7 @@ func TestSanitizer_LegitimateContent(t *testing.T) {
 }
 
 func TestSanitizer_Disabled(t *testing.T) {
-	s := NewSanitizer(false)
+	s := NewSanitizer(config.SanitizerConfig{})
 	input := `password = supersecretvalue12345`
 	got := s.Sanitize(input)
 	if got != input {
@@ -244,7 +246,7 @@ func TestSanitizer_Disabled(t *testing.T) {
 }
 
 func TestSanitizer_EmptyAndNil(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 
 	if got := s.Sanitize(""); got != "" {
 		t.Errorf("empty input should stay empty, got: %s", got)
@@ -256,7 +258,7 @@ func TestSanitizer_EmptyAndNil(t *testing.T) {
 }
 
 func TestSanitizer_MultiplePatterns(t *testing.T) {
-	s := NewSanitizer(true)
+	s := NewSanitizer(config.SanitizerConfig{Enabled: true})
 	input := `DB_URL=postgresql://admin:s3cret@db:5432/app
 API_KEY=sk-abcdefghijklmnopqrstuvwxyz12345
 TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456`
@@ -265,5 +267,66 @@ TOKEN=ghp_abcdefghijklmnopqrstuvwxyz123456`
 	redactedCount := strings.Count(got, "[REDACTED]")
 	if redactedCount < 3 {
 		t.Errorf("expected at least 3 redactions, got %d: %s", redactedCount, got)
+	}
+}
+
+func TestSanitizer_CustomPatterns(t *testing.T) {
+	emailPattern := `[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`
+	s := NewSanitizer(config.SanitizerConfig{
+		Enabled:  true,
+		Patterns: []string{emailPattern},
+	})
+
+	got := s.Sanitize("contact user@example.com for details")
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("expected email to be redacted, got: %s", got)
+	}
+	if strings.Contains(got, "user@example.com") {
+		t.Errorf("email should have been redacted, got: %s", got)
+	}
+}
+
+func TestSanitizer_CustomPatternWithDefaults(t *testing.T) {
+	s := NewSanitizer(config.SanitizerConfig{
+		Enabled:  true,
+		Patterns: []string{`MY_CUSTOM_SECRET_\w+`},
+	})
+
+	input := `api_key=sk-abcdefghijklmnopqrstuvwxyz12345 has MY_CUSTOM_SECRET_VALUE inside`
+	got := s.Sanitize(input)
+
+	if strings.Count(got, "[REDACTED]") < 2 {
+		t.Errorf("expected both default and custom patterns to match, got: %s", got)
+	}
+	if strings.Contains(got, "sk-abcdefghijklmnopqrstuvwxyz") {
+		t.Errorf("default pattern should have redacted api_key, got: %s", got)
+	}
+	if strings.Contains(got, "MY_CUSTOM_SECRET_VALUE") {
+		t.Errorf("custom pattern should have matched, got: %s", got)
+	}
+}
+
+func TestSanitizer_InvalidCustomPattern(t *testing.T) {
+	s := NewSanitizer(config.SanitizerConfig{
+		Enabled:  true,
+		Patterns: []string{"[invalid(regex"},
+	})
+
+	got := s.Sanitize("hello world")
+	if got != "hello world" {
+		t.Errorf("invalid pattern should be skipped, got: %s", got)
+	}
+}
+
+func TestSanitizer_DisabledNoCustomPatterns(t *testing.T) {
+	s := NewSanitizer(config.SanitizerConfig{
+		Enabled:  false,
+		Patterns: []string{`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`},
+	})
+
+	input := "user@example.com password = supersecretvalue12345"
+	got := s.Sanitize(input)
+	if got != input {
+		t.Errorf("disabled sanitizer should not apply custom or default patterns, got: %s", got)
 	}
 }

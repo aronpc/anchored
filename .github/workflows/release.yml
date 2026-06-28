@@ -20,12 +20,32 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
 
+      # Linux binaries are compiled with zig cc pinned to glibc 2.31 so they
+      # run on older distros (Ubuntu 20.04 / Debian 11, common under WSL).
+      # Building on ubuntu-latest's native gcc links against its current
+      # glibc and the binary refuses to start there ("GLIBC_2.34 not found").
       - name: Install C cross-compilers
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz -o /tmp/zig.tar.xz
+          sudo tar xJf /tmp/zig.tar.xz -C /opt
+          sudo mv /opt/zig-linux-x86_64-0.13.0 /opt/zig
+          printf '#!/bin/sh\nexec /opt/zig/zig cc -target x86_64-linux-gnu.2.31 "$@"\n' | sudo tee /usr/local/bin/zcc-amd64 >/dev/null
+          printf '#!/bin/sh\nexec /opt/zig/zig cc -target aarch64-linux-gnu.2.31 "$@"\n' | sudo tee /usr/local/bin/zcc-arm64 >/dev/null
+          sudo chmod +x /usr/local/bin/zcc-amd64 /usr/local/bin/zcc-arm64
+
+      - name: Verify glibc baseline of the amd64 binary
+        run: |
+          CGO_ENABLED=1 CC=zcc-amd64 CGO_CFLAGS="-DSQLITE_ENABLE_FTS5" CGO_LDFLAGS="-lm" \
+            go build -o /tmp/anchored-glibc-check ./cmd/anchored
+          MAX=$(objdump -T /tmp/anchored-glibc-check | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+          echo "max glibc symbol: $MAX"
+          case "$MAX" in
+            GLIBC_2.3[2-9]*|GLIBC_2.[4-9]*) echo "binary requires $MAX (> 2.31)"; exit 1 ;;
+          esac
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v7
@@ -49,7 +69,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version: "1.25"
 
       - name: Get version from tag
         id: version

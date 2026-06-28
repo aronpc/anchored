@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
@@ -12,15 +13,57 @@ import (
 )
 
 type Config struct {
-	Memory          MemoryConfig          `yaml:"memory"`
-	Embedding       EmbeddingConfig       `yaml:"embedding"`
-	Search          SearchConfig          `yaml:"search"`
-	Sanitizer       SanitizerConfig       `yaml:"sanitizer"`
-	Indexer         IndexerConfig         `yaml:"indexer"`
-	Dream           DreamConfig           `yaml:"dream"`
+	Memory           MemoryConfig           `yaml:"memory"`
+	Embedding        EmbeddingConfig        `yaml:"embedding"`
+	Search           SearchConfig           `yaml:"search"`
+	Sanitizer        SanitizerConfig        `yaml:"sanitizer"`
+	Indexer          IndexerConfig          `yaml:"indexer"`
+	Curation         CurationConfig         `yaml:"curation"`
+	Dream            DreamConfig            `yaml:"dream"`
 	ContextOptimizer ContextOptimizerConfig `yaml:"context_optimizer"`
-	Debug           DebugConfig           `yaml:"debug"`
-	Plugin          PluginConfig          `yaml:"plugin"`
+	Debug            DebugConfig            `yaml:"debug"`
+	Plugin           PluginConfig           `yaml:"plugin"`
+	Remote           RemoteConfig           `yaml:"remote"`
+	// Remotes maps named remotes. When non-empty, takes precedence over Remote.
+	Remotes map[string]RemoteEntry `yaml:"remotes,omitempty"`
+}
+
+// RemoteConfig controls the remote sync endpoint for team-shared memories.
+// All fields default to zero/off — no network calls happen unless explicitly
+// configured. The preview command is offline-only and uses the filter pipeline
+// without contacting any server.
+type RemoteConfig struct {
+	Enabled   bool     `yaml:"enabled"`
+	ServerURL string   `yaml:"server_url"`
+	APIKey    string   `yaml:"api_key"`
+	Projects  []string `yaml:"projects"`
+	// AutoSync controls whether anchored_save pushes each newly-saved memory
+	// to the remote automatically (local-first: local save always succeeds,
+	// the remote push is best-effort and async). The sync safety filter still
+	// applies, so user-scoped/personal/secret memories never leave the machine.
+	// Defaults to true when a remote is configured; set explicitly to false
+	// to disable.
+	// omitempty keeps an unset value out of the file entirely — marshaling a
+	// nil *bool without it writes a confusing "auto_sync: null" (which still
+	// means enabled, but reads like something is broken).
+	AutoSync *bool `yaml:"auto_sync,omitempty"`
+}
+
+// RemoteEntry is a single named remote server in the remotes map.
+type RemoteEntry struct {
+	Name      string `yaml:"-"`
+	ServerURL string `yaml:"server_url"`
+	APIKey    string `yaml:"api_key"`
+	Default   bool   `yaml:"default,omitempty"`
+	// Paths are glob patterns matched against a project's local path to
+	// route it to this remote (e.g. "/home/me/work/*"). path.Match
+	// semantics: `*` does not cross `/`.
+	Paths []string `yaml:"paths,omitempty"`
+	// Projects are remote project IDs linked to THIS server via
+	// `anchored remote link --remote <name> <id>`. IDs are server-scoped,
+	// so each entry carries its own links.
+	Projects []string `yaml:"projects,omitempty"`
+	AutoSync *bool    `yaml:"auto_sync,omitempty"`
 }
 
 // PluginConfig controls how anchored handles drift between the binary version
@@ -40,6 +83,113 @@ type PluginConfig struct {
 	// CacheDir overrides where Claude Code keeps the installed-plugin cache.
 	// Defaults to ~/.claude/plugins/cache/anchored/anchored.
 	CacheDir string `yaml:"cache_dir"`
+	// AutoRecall controls the UserPromptSubmit auto-recall injection:
+	//   "off"  — inject only the routing reminder (no retrieval)
+	//   "hits" — inject the routing reminder + top relevant memories (default)
+	//   "full" — "hits" plus recent artifacts (test reports, stack traces)
+	// Empty/unknown resolves to "full" — the most complete push within the
+	// hook byte budget, so a version bump alone gives the richest recall.
+	AutoRecall string `yaml:"auto_recall"`
+	// HookBudgetBytes caps the size of the auto-recall context block. Lowest-
+	// relevance hits are dropped to fit rather than truncating mid-content.
+	// Empty/0 resolves to 4800 (~1200 tokens).
+	HookBudgetBytes int `yaml:"hook_budget_bytes"`
+	// SessionStartBudgetBytes caps the rich context block injected by the
+	// SessionStart hook. nil resolves to 7000 (~1750 tokens); an explicit 0
+	// disables the rich block entirely (restores the old plain format).
+	SessionStartBudgetBytes *int `yaml:"sessionstart_budget_bytes"`
+	// AutoSaveStop controls whether the Stop hook extracts and saves durable
+	// candidates at the end of each turn. nil resolves to true.
+	AutoSaveStop *bool `yaml:"auto_save_stop"`
+	// AdaptiveReminder controls whether the UserPromptSubmit hook adjusts
+	// the recall reminder based on the quality of the hits. nil resolves to true.
+	AdaptiveReminder *bool `yaml:"adaptive_reminder"`
+	// ContextGate controls the PreToolUse enforcement that requires the agent
+	// to consult anchored memory before its first substantive tool call in a
+	// session:
+	//   "enforce" — deny the first work tool until the agent calls
+	//               anchored_context/anchored_search, then never again that
+	//               session. Relents after a few denies so it can NEVER
+	//               hard-block the user. This is the default: soft injection
+	//               (SessionStart block, UserPromptSubmit recall) is reliably
+	//               ignored by some agents — Claude Code in particular — when
+	//               handed a concrete task, so the deterministic gate is the
+	//               only channel that makes them actually consult memory.
+	//   "disabled" — the ONLY opt-out: no enforcement (soft recall injection
+	//               only). For users who deliberately don't want the
+	//               one-deny-per-session.
+	// Every other value — empty, "on", "enforce", and the legacy "off" that
+	// the previous default serialized into existing configs — resolves to
+	// "enforce", so a version bump alone forces the gate on without any
+	// config edit.
+	ContextGate string `yaml:"context_gate"`
+}
+
+// AutoRecallMode resolves the configured mode to one of off|hits|full,
+// defaulting to "full" for any empty/unknown value so recall is richest
+// out of the box. An explicit "off" or "hits" still opts down.
+func (p PluginConfig) AutoRecallMode() string {
+	switch p.AutoRecall {
+	case "off", "hits", "full":
+		return p.AutoRecall
+	default:
+		return "full"
+	}
+}
+
+// HookBudget resolves the configured byte budget, defaulting to 4800.
+func (p PluginConfig) HookBudget() int {
+	if p.HookBudgetBytes > 0 {
+		return p.HookBudgetBytes
+	}
+	return 4800
+}
+
+// SessionStartBudget resolves the SessionStart rich-block byte budget.
+// nil → 7000; explicit value (including 0) → that value.
+func (p PluginConfig) SessionStartBudget() int {
+	if p.SessionStartBudgetBytes != nil {
+		return *p.SessionStartBudgetBytes
+	}
+	return 7000
+}
+
+// AutoSaveStopEnabled reports whether the Stop hook should extract and save
+// durable candidates. nil → true.
+func (p PluginConfig) AutoSaveStopEnabled() bool {
+	if p.AutoSaveStop != nil {
+		return *p.AutoSaveStop
+	}
+	return true
+}
+
+// AdaptiveReminderEnabled reports whether the UserPromptSubmit hook should
+// adapt the recall reminder based on hit quality. nil → true.
+func (p PluginConfig) AdaptiveReminderEnabled() bool {
+	if p.AdaptiveReminder != nil {
+		return *p.AdaptiveReminder
+	}
+	return true
+}
+
+// ContextGateMode resolves the configured context-gate mode to one of
+// off|enforce, defaulting to "enforce".
+//
+// The gate is forced ON for every value EXCEPT a deliberate "disabled"
+// opt-out. This is intentional: soft injection is reliably ignored by some
+// agents (Claude Code especially), so the gate is the only channel that makes
+// them consult memory — it must therefore be the floor behavior. Crucially,
+// the legacy literal "off" (the value the previous default serialized into
+// existing config.yaml files) ALSO resolves to "enforce", so users get the
+// gate by simply updating the binary, with no config edit. A user who truly
+// wants the gate off must opt out explicitly with `context_gate: disabled`.
+func (p PluginConfig) ContextGateMode() string {
+	switch p.ContextGate {
+	case "disabled":
+		return "off"
+	default:
+		return "enforce"
+	}
 }
 
 // DebugConfig controls anchored's optional NDJSON event log.
@@ -58,12 +208,12 @@ type DebugConfig struct {
 }
 
 type ContextOptimizerConfig struct {
-	Enabled         bool `yaml:"enabled"`
-	DefaultTTL      int  `yaml:"default_ttl_hours"`
-	LRUCapMB        int  `yaml:"lru_cap_mb"`
-	SandboxTimeout  int  `yaml:"sandbox_timeout_seconds"`
-	MaxOutputKB     int  `yaml:"max_output_kb"`
-	FetchCacheTTL   int  `yaml:"fetch_cache_ttl_hours"`
+	Enabled        bool `yaml:"enabled"`
+	DefaultTTL     int  `yaml:"default_ttl_hours"`
+	LRUCapMB       int  `yaml:"lru_cap_mb"`
+	SandboxTimeout int  `yaml:"sandbox_timeout_seconds"`
+	MaxOutputKB    int  `yaml:"max_output_kb"`
+	FetchCacheTTL  int  `yaml:"fetch_cache_ttl_hours"`
 }
 
 type DreamConfig struct {
@@ -79,6 +229,20 @@ type IndexerConfig struct {
 	Interval string   `yaml:"interval"`
 }
 
+// CurationConfig controls the lightweight serve-time maintenance pass.
+// It is intentionally safe by default: the worker only refreshes lifecycle
+// metadata such as quality_score/importance/curation_status. Destructive
+// cleanup still requires explicit CLI commands.
+type CurationConfig struct {
+	Enabled       bool `yaml:"enabled"`
+	IntervalHours int  `yaml:"interval_hours"`
+	// IntervalMinutes overrides IntervalHours when > 0. Useful for tests and
+	// users who want more aggressive local-only maintenance.
+	IntervalMinutes int     `yaml:"interval_minutes,omitempty"`
+	Threshold       float64 `yaml:"threshold"`
+	MaxUpdates      int     `yaml:"max_updates_per_run"`
+}
+
 type MemoryConfig struct {
 	StorageDir   string `yaml:"storage_dir"`
 	DatabasePath string `yaml:"database_path"`
@@ -90,12 +254,12 @@ type EmbeddingConfig struct {
 	Provider string `yaml:"provider"`
 	// TODO: Model is accepted in config.yaml but the ONNX embedder uses a
 	// hardcoded model name. Connect or remove in a future sprint.
-	Model string `yaml:"model"`
-	ModelDir   string `yaml:"model_dir"`
+	Model    string `yaml:"model"`
+	ModelDir string `yaml:"model_dir"`
 	// TODO: Quantize is accepted in config.yaml but never read by the ONNX
 	// embedder. Connect or remove in a future sprint.
-	Quantize   bool   `yaml:"quantize"`
-	Dimensions int    `yaml:"dimensions"`
+	Quantize   bool `yaml:"quantize"`
+	Dimensions int  `yaml:"dimensions"`
 }
 
 type SearchConfig struct {
@@ -109,7 +273,7 @@ type SearchConfig struct {
 }
 
 type SanitizerConfig struct {
-	Enabled  bool     `yaml:"enabled"`
+	Enabled bool `yaml:"enabled"`
 	// TODO: Patterns is accepted in config.yaml but never read by the Sanitizer
 	// (it uses hardcoded patterns internally). Connect or remove in a future sprint.
 	Patterns []string `yaml:"patterns"`
@@ -132,9 +296,22 @@ func Defaults() *Config {
 			VectorWeight: 0.7,
 			BM25Weight:   0.3,
 			MaxResults:   20,
+			// On by default so fresh installs get ranked, deduplicated,
+			// freshness-aware results out of the box — not raw BM25 order.
+			MMREnabled:                true,
+			MMRLambda:                 0.7,
+			TemporalDecayEnabled:      true,
+			TemporalDecayHalfLifeDays: 30,
 		},
 		Sanitizer: SanitizerConfig{
 			Enabled: false,
+		},
+		Curation: CurationConfig{
+			Enabled:         true,
+			IntervalHours:   24,
+			IntervalMinutes: 15,
+			Threshold:       0.55,
+			MaxUpdates:      50,
 		},
 		Dream: DreamConfig{
 			Aggressiveness:      "moderate",
@@ -143,7 +320,13 @@ func Defaults() *Config {
 			ContradictionAction: "flag",
 		},
 		ContextOptimizer: ContextOptimizerConfig{
-			Enabled:        false,
+			// Enabled by default: the sandbox tools (anchored_execute*,
+			// _fetch_and_index, _ctx_search) and the PreToolUse redirects that
+			// steer toward them only work when the optimizer is on. Shipping it
+			// off made those tools hard-error, training the model to stop
+			// reaching for them. The sandbox is a subprocess with a timeout and
+			// output cap, so on-by-default is low-risk.
+			Enabled:        true,
 			DefaultTTL:     336,
 			LRUCapMB:       50,
 			SandboxTimeout: 30,
@@ -181,6 +364,8 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
 
+	cfg.migrateRemotes()
+
 	return expandPaths(cfg), nil
 }
 
@@ -192,6 +377,78 @@ func expandPaths(cfg *Config) *Config {
 	cfg.Plugin.CacheDir = util.ExpandHome(cfg.Plugin.CacheDir)
 
 	return cfg
+}
+
+func expandHome(path, home string) string {
+	if len(path) >= 2 && path[:2] == "~/" {
+		return filepath.Join(home, path[2:])
+	}
+	return path
+}
+
+func (c *Config) migrateRemotes() {
+	for name, entry := range c.Remotes {
+		entry.Name = name
+		c.Remotes[name] = entry
+	}
+	// Merge the legacy singular `remote:` block into the named map as
+	// "default" so it keeps resolving alongside named entries. Without
+	// this, adding a second (named) server would silently drop the first
+	// from routing. An explicit "default" entry in the map wins.
+	if c.Remote.ServerURL == "" {
+		return
+	}
+	if _, exists := c.Remotes["default"]; exists {
+		return
+	}
+	hasDefault := false
+	for _, entry := range c.Remotes {
+		if entry.Default {
+			hasDefault = true
+			break
+		}
+	}
+	if c.Remotes == nil {
+		c.Remotes = map[string]RemoteEntry{}
+	}
+	c.Remotes["default"] = RemoteEntry{
+		Name:      "default",
+		ServerURL: c.Remote.ServerURL,
+		APIKey:    c.Remote.APIKey,
+		Default:   !hasDefault,
+		Projects:  c.Remote.Projects,
+		AutoSync:  c.Remote.AutoSync,
+	}
+}
+
+func (c *Config) ResolveRemote(projectPath string) *RemoteEntry {
+	for name, entry := range c.Remotes {
+		for _, pattern := range entry.Paths {
+			if globMatch(pattern, projectPath) {
+				entry.Name = name
+				return &entry
+			}
+		}
+	}
+	for name, entry := range c.Remotes {
+		if entry.Default {
+			entry.Name = name
+			return &entry
+		}
+	}
+	return nil
+}
+
+func (e *RemoteEntry) AutoSyncEnabled() bool {
+	if e.AutoSync == nil {
+		return true
+	}
+	return *e.AutoSync
+}
+
+func globMatch(pattern, s string) bool {
+	matched, _ := path.Match(pattern, s)
+	return matched
 }
 
 func EnsureDirs(cfg *Config) error {

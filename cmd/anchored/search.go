@@ -8,7 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/memory"
+	"github.com/jholhewres/anchored/pkg/project"
+	"github.com/jholhewres/anchored/pkg/sync"
 )
 
 func runSearch(args []string) {
@@ -19,11 +22,14 @@ func runSearch(args []string) {
 	global := fs.Bool("global", false, "search across all projects")
 	limit := fs.Int("limit", 10, "max results")
 	configPath := fs.String("config", "", "path to config file")
-	fs.Parse(args)
+	remote := fs.String("remote", "", "search on remote server (name or empty for default)")
+
+	remoteSet := hasExplicitFlag(args, "remote")
+	fs.Parse(reorderArgsForFlag(fs, args))
 
 	query := strings.Join(fs.Args(), " ")
 	if query == "" {
-		fmt.Fprintln(os.Stderr, "Usage: anchored search <query> [--category] [--project] [--cwd] [--global] [--limit]")
+		fmt.Fprintln(os.Stderr, "Usage: anchored search <query> [--category] [--project] [--cwd] [--global] [--limit] [--remote]")
 		os.Exit(1)
 	}
 
@@ -35,6 +41,22 @@ func runSearch(args []string) {
 	defer svc.Close()
 
 	ctx := context.Background()
+
+	if remoteSet {
+		if results, ok := searchRemote(ctx, svc, *configPath, *remote, *project, *cwd, query, *limit); ok {
+			if len(results) == 0 {
+				fmt.Println("No results found on remote.")
+				return
+			}
+			for i, r := range results {
+				fmt.Printf("%d. [%s] %s (id=%s project=%s updated=%s)\n",
+					i+1, r.Category, truncate(r.Content, 120), r.ID, r.ProjectID, r.UpdatedAt)
+			}
+			return
+		}
+		// Remote failed — fall through to local search
+	}
+
 	projectID := *project
 	if projectID == "" && *cwd != "" {
 		projectID = svc.ResolveProject(*cwd)
@@ -42,7 +64,6 @@ func runSearch(args []string) {
 	if projectID != "" {
 		resolved, err := resolveProjectFilter(ctx, svc, projectID)
 		if err != nil {
-			// project not found — search without project filter
 			projectID = ""
 		} else {
 			projectID = resolved
@@ -77,6 +98,72 @@ func runSearch(args []string) {
 		}
 		fmt.Printf("%d. [%s]%s %s (score=%.3f id=%s)\n", i+1, r.Memory.Category, projectLabel, truncate(r.Memory.Content, 120), r.Score, r.Memory.ID)
 	}
+}
+
+func searchRemote(ctx context.Context, svc *memory.Service, configPath, remoteName, projectID, cwd, query string, limit int) ([]sync.RemoteSearchResult, bool) {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "remote search unavailable: %v — falling back to local\n", err)
+		return nil, false
+	}
+
+	var entry *config.RemoteEntry
+	if remoteName != "" && cfg.Remotes != nil {
+		if e, ok := cfg.Remotes[remoteName]; ok {
+			e.Name = remoteName
+			entry = &e
+		}
+	}
+	if entry == nil {
+		rCwd := cwd
+		if rCwd == "" {
+			rCwd, _ = os.Getwd()
+		}
+		entry = cfg.ResolveRemote(rCwd)
+	}
+
+	if entry == nil {
+		fmt.Fprintln(os.Stderr, "no remote configured, falling back to local search")
+		return nil, false
+	}
+
+	if projectID == "" {
+		// Resolve the REMOTE project: the server only knows its own IDs. With
+		// an explicit --remote name, match the repo's git-origin key against
+		// that server only; otherwise probe every configured remote so a
+		// freshly-configured second server works with zero routing setup.
+		rCwd := cwd
+		if rCwd == "" {
+			rCwd, _ = os.Getwd()
+		}
+		originRouted := false
+		if proj, pErr := svc.ResolveProjectInfo(rCwd); pErr == nil && proj != nil && proj.RemoteKey != "" {
+			originRouted = true
+			canonicalKey, legacyKey := project.RemoteKeysFromDir(proj.Path)
+			if remoteName != "" {
+				client := sync.NewClientFromEntry(*entry, "cli")
+				projectID, _ = client.ResolveProjectIDByRemoteKeys(ctx, canonicalKey, legacyKey)
+			} else if target, pid, _ := sync.ResolveProjectAcrossRemotes(ctx, cfg, rCwd, "cli", canonicalKey, legacyKey); target != nil && pid != "" {
+				entry = target
+				projectID = pid
+			}
+		}
+		if projectID == "" && !originRouted && len(entry.Projects) > 0 {
+			projectID = entry.Projects[0]
+		}
+		if projectID == "" {
+			fmt.Fprintln(os.Stderr, "remote search unavailable: no matching remote project for this repo — falling back to local")
+			return nil, false
+		}
+	}
+
+	client := sync.NewClientFromEntry(*entry, "cli")
+	results, err := client.SearchRemote(ctx, projectID, query, limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "remote search unavailable: %v — falling back to local\n", err)
+		return nil, false
+	}
+	return results, true
 }
 
 func resolveProjectFilter(ctx context.Context, svc *memory.Service, spec string) (string, error) {

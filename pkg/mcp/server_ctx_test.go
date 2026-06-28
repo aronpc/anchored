@@ -17,7 +17,8 @@ import (
 
 func newTestServerWithOptimizer(t *testing.T) *Server {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file::memory:?cache=shared&_busy_timeout=5000")
+	dsn := "file:" + t.Name() + "_mcp?mode=memory&cache=private&_busy_timeout=5000"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,6 +30,9 @@ func newTestServerWithOptimizer(t *testing.T) *Server {
 	}
 	if _, err := db.Exec(ctxpkg.MigrationSQL009); err != nil {
 		t.Fatalf("migration 009: %v", err)
+	}
+	if _, err := db.Exec(ctxpkg.MigrationSQL014); err != nil {
+		t.Fatalf("migration 014: %v", err)
 	}
 
 	cfg := config.ContextOptimizerConfig{

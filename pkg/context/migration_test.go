@@ -25,6 +25,9 @@ func applyMigrations(t *testing.T, db *sql.DB) {
 	if _, err := db.Exec(MigrationSQL009); err != nil {
 		t.Fatalf("migration 009: %v", err)
 	}
+	if _, err := db.Exec(MigrationSQL014); err != nil {
+		t.Fatalf("migration 014: %v", err)
+	}
 }
 
 func tableExists(t *testing.T, db *sql.DB, table string) bool {

@@ -13,6 +13,7 @@ type Chunk struct {
 	ContentType string    `json:"content_type,omitempty"`
 	IndexedAt   time.Time `json:"indexed_at"`
 	TTLHours    int       `json:"ttl_hours"`
+	ArtifactID  string    `json:"artifact_id,omitempty"`
 }
 
 type ContentSearchResult struct {

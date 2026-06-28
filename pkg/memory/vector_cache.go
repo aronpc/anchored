@@ -5,14 +5,30 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sort"
 	"sync"
 
 	util "github.com/jholhewres/anchored/pkg/util"
 )
 
+// quantEntry memoizes the quantized form of a stored vector and its L2 norm so
+// per-query scoring skips re-quantization and norm recomputation (both are
+// invariant per stored vector). Computed once on Put/Load.
+type quantEntry struct {
+	q    QuantizedEmbedding
+	norm float64 // sqrt(NormSq) in dequantized space
+}
+
+// ScoredID is one scored cache entry returned by Score.
+type ScoredID struct {
+	ID    string
+	Score float64
+}
+
 // VectorCache is a thread-safe in-memory cache of memory embeddings keyed by memory ID.
 type VectorCache struct {
-	byID   map[string][]float32
+	byID   map[string][]float32  // exact vectors (Get/All contract preserved)
+	quant  map[string]quantEntry // memoized quantized form + norm for scoring
 	mu     sync.RWMutex
 	logger *slog.Logger
 }
@@ -21,8 +37,38 @@ func NewVectorCache(logger *slog.Logger) *VectorCache {
 	logger = util.DefaultLogger(logger)
 	return &VectorCache{
 		byID:   make(map[string][]float32),
+		quant:  make(map[string]quantEntry),
 		logger: logger,
 	}
+}
+
+// makeQuantEntry quantizes a vector once and precomputes its norm.
+func makeQuantEntry(vec []float32) quantEntry {
+	q := QuantizeFloat32(vec)
+	return quantEntry{q: q, norm: math.Sqrt(q.NormSq())}
+}
+
+// Score scans the cache once under a read lock — without copying the map —
+// scoring every entry against the query via the memoized quantized form and
+// norm, and returns the top-k entries scoring above minScore. This replaces a
+// per-query All() copy + re-quantize + re-norm with a single allocation-light
+// pass; scores are bit-identical to QuantizedEmbedding.CosineSimilarity.
+func (c *VectorCache) Score(query []float32, queryNorm, minScore float64, topK int) []ScoredID {
+	c.mu.RLock()
+	scored := make([]ScoredID, 0, len(c.quant))
+	for id, e := range c.quant {
+		s := e.q.CosineWithNorm(query, queryNorm, e.norm)
+		if s > minScore {
+			scored = append(scored, ScoredID{ID: id, Score: s})
+		}
+	}
+	c.mu.RUnlock()
+
+	sort.Slice(scored, func(i, j int) bool { return scored[i].Score > scored[j].Score })
+	if topK > 0 && len(scored) > topK {
+		scored = scored[:topK]
+	}
+	return scored
 }
 
 func (c *VectorCache) Load(db *sql.DB) error {
@@ -47,6 +93,7 @@ func (c *VectorCache) Load(db *sql.DB) error {
 			continue
 		}
 		c.byID[id] = vec
+		c.quant[id] = makeQuantEntry(vec)
 		loaded++
 	}
 	c.mu.Unlock()
@@ -62,14 +109,17 @@ func (c *VectorCache) Load(db *sql.DB) error {
 func (c *VectorCache) Put(id string, embedding []float32) {
 	cp := make([]float32, len(embedding))
 	copy(cp, embedding)
+	e := makeQuantEntry(cp)
 	c.mu.Lock()
 	c.byID[id] = cp
+	c.quant[id] = e
 	c.mu.Unlock()
 }
 
 func (c *VectorCache) Remove(id string) {
 	c.mu.Lock()
 	delete(c.byID, id)
+	delete(c.quant, id)
 	c.mu.Unlock()
 }
 

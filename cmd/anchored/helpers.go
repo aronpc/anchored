@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
@@ -31,6 +32,18 @@ type HookContext struct {
 // openHookContext opens the SQLite DB with WAL+busy_timeout and wires a
 // project detector against it. Caller must Close() when done.
 func openHookContext(configPath string) (*HookContext, error) {
+	return openHookContextMode(configPath, false)
+}
+
+// openHookContextReadOnly opens the DB read-only with a short busy timeout, so
+// a read-path hook (e.g. UserPromptSubmit auto-recall) never contends with the
+// MCP server's writer or blocks the user's prompt. The DB must already exist;
+// callers treat any open failure as "no context" and fall back gracefully.
+func openHookContextReadOnly(configPath string) (*HookContext, error) {
+	return openHookContextMode(configPath, true)
+}
+
+func openHookContextMode(configPath string, readOnly bool) (*HookContext, error) {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
@@ -39,7 +52,15 @@ func openHookContext(configPath string) (*HookContext, error) {
 		return nil, fmt.Errorf("ensure dirs: %w", err)
 	}
 
-	dsn := cfg.Memory.DatabasePath + "?_journal_mode=WAL&_busy_timeout=5000"
+	// busy_timeout is short on the read path so the hook never stalls the
+	// user's prompt; WAL lets readers run concurrently with the MCP writer
+	// without blocking it, so we keep WAL (not mode=ro, which can't reliably
+	// read another process's un-checkpointed WAL frames).
+	busy := "5000"
+	if readOnly {
+		busy = "200"
+	}
+	dsn := cfg.Memory.DatabasePath + "?_journal_mode=WAL&_busy_timeout=" + busy
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -48,6 +69,16 @@ func openHookContext(configPath string) (*HookContext, error) {
 	// are in flight from another `anchored` invocation. Hooks are short-lived
 	// so the cap is harmless.
 	db.SetMaxOpenConns(1)
+
+	if readOnly {
+		// Enforce read-only at the SQLite level on this (single) connection:
+		// query_only rejects any write, giving the genuine no-write guarantee
+		// the auto-recall hook wants while still reading WAL data reliably.
+		if _, err := db.Exec("PRAGMA query_only=ON"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set query_only: %w", err)
+		}
+	}
 
 	return &HookContext{
 		cfg:      cfg,
@@ -91,6 +122,45 @@ func openDebugLogger(configPath string) *debuglog.Logger {
 
 func newFlagSet(name string) *flag.FlagSet {
 	return flag.NewFlagSet(name, flag.ExitOnError)
+}
+
+// reorderArgsForFlag moves all flag arguments before positional arguments.
+// Go's flag.Parse stops at the first non-flag arg, so `cmd "query" --flag`
+// never reaches --flag. This reordering lets flags appear anywhere in the
+// argument list. It inspects the FlagSet to distinguish Bool flags (which
+// don't consume the next arg) from string/int flags (which do).
+func reorderArgsForFlag(fs *flag.FlagSet, args []string) []string {
+	var flagArgs, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			continue
+		}
+		if strings.Contains(a, "=") {
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		f := fs.Lookup(name)
+		_, isBool := f.Value.(boolFlag)
+		if isBool || f == nil {
+			flagArgs = append(flagArgs, a)
+		} else if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			flagArgs = append(flagArgs, a, args[i+1])
+			i++
+		} else {
+			// String/int flag with no explicit value — pass --flag= so
+			// fs.Parse doesn't steal the next arg as the value.
+			flagArgs = append(flagArgs, a+"=")
+		}
+	}
+	return append(flagArgs, positional...)
+}
+
+// boolFlag is implemented by flag.BoolVar values to signal "no value needed".
+type boolFlag interface {
+	IsBoolFlag() bool
 }
 
 func initService(configPath string) (*config.Config, *slog.Logger, *memory.Service, error) {

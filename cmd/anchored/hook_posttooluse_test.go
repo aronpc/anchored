@@ -222,6 +222,81 @@ func TestRecordPostToolUseEvent_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestRecordPostToolUseEvent_FeedsWorkingSet asserts a Write tool call feeds
+// the touched file into the working set via the UpdateWorkingSet dep.
+func TestRecordPostToolUseEvent_FeedsWorkingSet(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(ctxpkg.MigrationSQL); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if _, err := db.Exec(ctxpkg.MigrationSQL009); err != nil {
+		t.Fatalf("migration 009: %v", err)
+	}
+
+	stdin := strings.NewReader(`{
+		"session_id":      "sess-WS",
+		"hook_event_name": "PostToolUse",
+		"cwd":             "/repo",
+		"tool_name":       "Write",
+		"tool_input":      {"file_path": "pkg/sync/client.go", "content": "package sync"},
+		"tool_response":   {"ok": true}
+	}`)
+	var stdout strings.Builder
+
+	var gotSession, gotProject string
+	var gotFiles, gotCommands, gotTests []string
+	deps := PostToolUseDeps{
+		Stdin:          stdin,
+		Stdout:         &stdout,
+		DB:             db,
+		ResolveProject: func(cwd string) string { return "proj-WS" },
+		NewID:          func() string { return "evt-ws" },
+		Logger:         nilDebugLogger(),
+		UpdateWorkingSet: func(sessionID, projectID string, files, commands, tests []string) error {
+			gotSession, gotProject = sessionID, projectID
+			gotFiles, gotCommands, gotTests = files, commands, tests
+			return nil
+		},
+	}
+	recordPostToolUseEvent(deps)
+
+	if gotSession != "sess-WS" || gotProject != "proj-WS" {
+		t.Fatalf("working set wiring: session=%q project=%q", gotSession, gotProject)
+	}
+	if len(gotFiles) != 1 || gotFiles[0] != "pkg/sync/client.go" {
+		t.Fatalf("expected the written file in working set, got %v", gotFiles)
+	}
+	if len(gotCommands) != 0 || len(gotTests) != 0 {
+		t.Fatalf("Write should not produce commands/tests: cmds=%v tests=%v", gotCommands, gotTests)
+	}
+}
+
+func TestWorkingSetDelta(t *testing.T) {
+	cases := []struct {
+		name, tool, input        string
+		wantFiles, wantCmd, wantTest int
+	}{
+		{"write file", "Write", `{"file_path":"a/b.go"}`, 1, 0, 0},
+		{"edit file", "Edit", `{"file_path":"a/b.go"}`, 1, 0, 0},
+		{"bash test", "Bash", `{"command":"go test ./pkg/sync/"}`, 0, 0, 1},
+		{"bash command", "Bash", `{"command":"git status"}`, 0, 1, 0},
+		{"empty input", "Bash", ``, 0, 0, 0},
+		{"unknown tool", "WebSearch", `{"query":"x"}`, 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			files, cmds, tests := workingSetDelta(tc.tool, tc.input)
+			if len(files) != tc.wantFiles || len(cmds) != tc.wantCmd || len(tests) != tc.wantTest {
+				t.Fatalf("delta(%s,%s) = files%v cmds%v tests%v", tc.tool, tc.input, files, cmds, tests)
+			}
+		})
+	}
+}
+
 // TestRecordPostToolUseEvent_MissingSessionID asserts the graceful "no row"
 // path when neither stdin nor flag carry a session_id.
 func TestRecordPostToolUseEvent_MissingSessionID(t *testing.T) {

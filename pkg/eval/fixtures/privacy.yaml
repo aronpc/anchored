@@ -1,0 +1,43 @@
+description: >
+  Content that must never reach a remote. The remote safety filter must block
+  each item, and secrets/local paths must additionally be redacted. A single
+  leak fails the gate. All secrets here are synthetic.
+items:
+  - name: aws_access_key
+    content: "deploy uses access key AKIAIOSFODNN7EXAMPLE for the bucket"
+    must_block: true
+    must_redact: true
+
+  - name: google_api_key
+    content: "frontend embeds AIzaSyA1234567890abcdefghijklmnopqrstuv maps key"
+    must_block: true
+    must_redact: true
+
+  - name: stripe_live_key
+    content: "billing secret sk_live_EXAMPLE_PLACEHOLDER_NOT_A_REAL_KEY must be set"
+    must_block: true
+    must_redact: true
+
+  - name: github_token
+    content: "ci token ghp_0123456789abcdefghijklmnopqrstuvwxyzAB in env"
+    must_block: true
+    must_redact: true
+
+  - name: pem_private_key
+    content: "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBg\n-----END PRIVATE KEY-----"
+    must_block: true
+    must_redact: true
+
+  - name: db_credential_uri
+    content: "connect via postgres://admin:hunter2@db.internal/app for migrations"
+    must_block: true
+    must_redact: true
+
+  - name: local_home_path
+    content: "the config lives at /home/someuser/.anchored/config.yaml on my box"
+    must_block: true
+
+  - name: clean_decision_allowed
+    content: "we chose Postgres for durable team memory storage across the fleet"
+    must_block: false
+    must_redact: false

@@ -1,0 +1,48 @@
+description: >
+  Recall@5 over a small bilingual corpus. Guards the multi-word recall
+  regression: a query of several words must still surface the on-topic memory
+  even when only some terms match (FTS must OR, not AND, the query tokens).
+k: 5
+min_recall: 0.8
+memories:
+  - key: m_pm_overview
+    category: decision
+    content: "the anchored project management system tracks memories, sessions and sync state across tools"
+    keywords: [anchored, project, management, sync]
+  - key: m_postgres
+    category: decision
+    content: "we chose Postgres for durable team memory storage on the server"
+    keywords: [postgres, storage, server]
+  - key: m_fts
+    category: learning
+    content: "FTS5 default operator is AND; free-form prompts must OR their tokens to recall"
+    keywords: [fts5, recall, tokens]
+  - key: m_deploy
+    category: fact
+    content: "the server is deployed with pm2 behind a systemd unit"
+    keywords: [deploy, pm2, systemd, servidor, producao, implantacao]
+  - key: m_hooks_ptbr
+    category: learning
+    content: "os hooks do cliente nunca devem retornar exit diferente de zero, exceto bloqueio de seguranca"
+    keywords: [hooks, seguranca]
+  - key: m_capability
+    category: decision
+    content: "sync capability negotiation keeps old clients byte-identical via opt-in client_capabilities"
+    keywords: [sync, capability, compatibility]
+  - key: m_hybrid_file
+    category: learning
+    content: "hybrid_search.go applies the working set boost after the project boost in the client ranking pipeline"
+    keywords: [hybrid, search, ranking, boost, working, set]
+queries:
+  - query: "anchored management system overview"
+    expect: [m_pm_overview]
+  - query: "durable postgres storage decision"
+    expect: [m_postgres]
+  - query: "why does recall need to OR fts tokens"
+    expect: [m_fts]
+  - query: "como o servidor e implantado em producao"
+    expect: [m_deploy]
+  - query: "client hooks exit code safety"
+    expect: [m_hooks_ptbr]
+  - query: "analisa pkg/memory/hybrid_search.go ranking boost"
+    expect: [m_hybrid_file]

@@ -77,6 +77,49 @@ func Migrate(db *sql.DB) error {
 		`},
 		{Name: "008_content_optimizer", Up: ctxpkg.MigrationSQL},
 		{Name: "009_content_project_id", Up: ctxpkg.MigrationSQL009},
+		{Name: "010_project_remote_key", Up: `
+			ALTER TABLE projects ADD COLUMN remote_key TEXT;
+			CREATE INDEX IF NOT EXISTS idx_projects_remote_key ON projects(remote_key);
+		`},
+		{Name: "011_sync_metadata", Up: `
+			ALTER TABLE memories ADD COLUMN sync_dirty BOOLEAN DEFAULT FALSE;
+			ALTER TABLE memories ADD COLUMN sync_origin TEXT DEFAULT 'local';
+			ALTER TABLE memories ADD COLUMN author TEXT;
+			ALTER TABLE memories ADD COLUMN remote_project_key TEXT;
+			CREATE TABLE IF NOT EXISTS sync_state (
+				project_id TEXT PRIMARY KEY,
+				remote_project_key TEXT,
+				watermark TEXT,
+				last_sync DATETIME,
+				client_id TEXT NOT NULL
+			);
+		`},
+		{Name: "012_curation_state", Up: `
+			CREATE TABLE IF NOT EXISTS curation_state (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL,
+				updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			);
+		`},
+		// Rebuild the FTS index with a multilingual tokenizer. The old
+		// 'porter unicode61' applied English-only stemming to a PT/ES/EN corpus,
+		// degrading lexical recall for non-English memories. Drop + recreate +
+		// repopulate; the existing INSERT/UPDATE/DELETE triggers reference the
+		// table by name and keep working after the rebuild.
+		{Name: "013_fts_multilingual_tokenizer", Up: `
+			DROP TABLE IF EXISTS memories_fts;
+			CREATE VIRTUAL TABLE memories_fts USING fts5(
+				content,
+				keywords,
+				content='memories',
+				content_rowid='rowid',
+				tokenize='unicode61 remove_diacritics 2'
+			);
+			INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+		`},
+		{Name: "014_artifact_store", Up: ctxpkg.MigrationSQL014},
+		{Name: "015_working_sets", Up: ctxpkg.MigrationSQL015},
+		{Name: "016_task_threads", Up: ctxpkg.MigrationSQL016},
 	}
 
 	for _, m := range migrations {
