@@ -5,3 +5,6 @@ bin/
 .omc
 node-compile-cache/
 .claude/settings.local.json
+
+# go test coverage artifacts
+coverage*.out
