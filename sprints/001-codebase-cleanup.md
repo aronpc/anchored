@@ -90,7 +90,7 @@ Time B (bugfixes)       (independente, roda em paralelo com A)
 - [x] Zero duplicação de UUID/hash/similarity/logger-guard
 - [x] Dead code removido (zero funções sem callers)
 - [x] Bug do ExecuteFile timeout corrigido (Time B)
-- [ ] Coverage mínima de 60% nos packages críticos (memory, mcp, kg) — 127+ tests totais
+- [x] Coverage mínima de 60% nos packages críticos (memory, mcp, kg) — 127+ tests totais
 
 ## Notas
 
