@@ -197,3 +197,101 @@ func TestDashboardAPI_SQLHandlers(t *testing.T) {
 		t.Error("health missing db_bytes")
 	}
 }
+
+// TestDashboardAPI_Restore covers the restore write path: soft-delete via the
+// API hides the memory from Service.Get, then restore brings it back. It also
+// pins the idempotency contract (restoring an already-active memory -> 404).
+func TestDashboardAPI_Restore(t *testing.T) {
+	svc := newDashboardTestSvc(t)
+	ctx := context.Background()
+	mem, err := svc.Save(ctx, "decisao: postgres para armazenamento duravel", "decision", "test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := mem.ID
+
+	api := &dashboardAPI{svc: svc, db: svc.StoreDB(), logger: slog.Default()}
+	srv := httptest.NewServer(api.routes())
+	defer srv.Close()
+
+	// soft-delete via the API (Service.SoftForget under the hood)
+	if c := doJSON(t, srv, "DELETE", "/api/memories/"+id, nil); c != http.StatusNoContent {
+		t.Fatalf("delete: %d, want 204", c)
+	}
+	if m, _ := svc.Get(ctx, id); m != nil {
+		t.Fatal("expected memory hidden from Get after soft-delete")
+	}
+
+	// restore via the API (Service.Restore under the hood)
+	if c := doJSON(t, srv, "POST", "/api/memories/"+id+"/restore", nil); c != http.StatusNoContent {
+		t.Fatalf("restore: %d, want 204", c)
+	}
+	m, err := svc.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m == nil {
+		t.Fatal("expected memory to be visible again after restore")
+	}
+	if m.ID != id {
+		t.Errorf("restored id = %s, want %s", m.ID, id)
+	}
+
+	// restoring a memory that isn't deleted -> 404 (no row matches deleted_at IS NOT NULL)
+	if c := doJSON(t, srv, "POST", "/api/memories/"+id+"/restore", nil); c != http.StatusNotFound {
+		t.Errorf("re-restore: %d, want 404", c)
+	}
+}
+
+// TestDashboardGuard covers the local-only security middleware: DNS-rebinding
+// defence (non-loopback Host rejected), CSRF defence (cross-origin write
+// rejected), and the optional bearer token on writes.
+func TestDashboardGuard(t *testing.T) {
+	g := &dashboardGuard{writeToken: "s3cret"}
+	h := g.wrap(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	req := func(method, host, origin string) *http.Request {
+		r := httptest.NewRequest(method, "/api/memories/x", nil)
+		if host != "" {
+			r.Host = host
+		}
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+		}
+		return r
+	}
+	code := func(r *http.Request) int {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	if c := code(req("GET", "evil.example.com", "")); c != http.StatusForbidden {
+		t.Errorf("non-loopback Host: got %d, want 403", c)
+	}
+	if c := code(req("GET", "127.0.0.1:17777", "")); c != http.StatusOK {
+		t.Errorf("loopback GET: got %d, want 200", c)
+	}
+	if c := code(req("DELETE", "127.0.0.1:17777", "https://evil.example.com")); c != http.StatusForbidden {
+		t.Errorf("cross-origin write: got %d, want 403", c)
+	}
+	if c := code(req("DELETE", "127.0.0.1:17777", "")); c != http.StatusUnauthorized {
+		t.Errorf("write without token: got %d, want 401", c)
+	}
+	r := req("DELETE", "127.0.0.1:17777", "")
+	r.Header.Set("Authorization", "Bearer s3cret")
+	if c := code(r); c != http.StatusOK {
+		t.Errorf("write with valid token: got %d, want 200", c)
+	}
+
+	// empty Host (HTTP/1.0 / some clients) must still be allowed locally.
+	// (httptest.NewRequest defaults Host to "example.com", so force the empty
+	// case explicitly rather than going through the helper.)
+	emptyReq := httptest.NewRequest("GET", "/api/memories/x", nil)
+	emptyReq.Host = ""
+	if c := code(emptyReq); c != http.StatusOK {
+		t.Errorf("empty Host GET: got %d, want 200", c)
+	}
+}
