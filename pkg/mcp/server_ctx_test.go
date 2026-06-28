@@ -53,19 +53,6 @@ func newTestServerWithOptimizer(t *testing.T) *Server {
 	return &Server{optimizer: facade}
 }
 
-func callToolJSON(t *testing.T, s *Server, toolName string, args any) string {
-	t.Helper()
-	raw, err := json.Marshal(args)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, err := s.callTool(context.Background(), toolName, raw)
-	if err != nil {
-		t.Fatalf("callTool %s: %v", toolName, err)
-	}
-	return result
-}
-
 func TestCtxTools_OptimizerNil(t *testing.T) {
 	s := &Server{optimizer: nil}
 	for _, name := range []string{
@@ -84,7 +71,7 @@ func TestCtxTools_OptimizerNil(t *testing.T) {
 
 func TestCtxExecute_Echo(t *testing.T) {
 	s := newTestServerWithOptimizer(t)
-	result := callToolJSON(t, s, "anchored_execute", map[string]any{
+	result, _ := callToolJSON(t, s, "anchored_execute", map[string]any{
 		"language": "shell",
 		"code":     "echo hello_test_world",
 	})
@@ -98,7 +85,7 @@ func TestCtxExecute_Echo(t *testing.T) {
 
 func TestCtxExecute_Timeout(t *testing.T) {
 	s := newTestServerWithOptimizer(t)
-	result := callToolJSON(t, s, "anchored_execute", map[string]any{
+	result, _ := callToolJSON(t, s, "anchored_execute", map[string]any{
 		"language": "shell",
 		"code":     "sleep 60",
 		"timeout":  1000,
@@ -111,7 +98,7 @@ func TestCtxExecute_Timeout(t *testing.T) {
 func TestCtxIndexAndSearch(t *testing.T) {
 	s := newTestServerWithOptimizer(t)
 
-	idxResult := callToolJSON(t, s, "anchored_index", map[string]any{
+	idxResult, _ := callToolJSON(t, s, "anchored_index", map[string]any{
 		"content": "# Test Heading\n\nThe quick brown fox jumps over the lazy dog. UniqueTokenAlphaBetaGamma.",
 		"source":  "test-doc",
 	})
@@ -119,7 +106,7 @@ func TestCtxIndexAndSearch(t *testing.T) {
 		t.Errorf("expected indexing confirmation, got: %s", idxResult)
 	}
 
-	searchResult := callToolJSON(t, s, "anchored_ctx_search", map[string]any{
+	searchResult, _ := callToolJSON(t, s, "anchored_ctx_search", map[string]any{
 		"queries": []string{"UniqueTokenAlphaBetaGamma"},
 	})
 	if !strings.Contains(searchResult, "test-doc") {
@@ -129,7 +116,7 @@ func TestCtxIndexAndSearch(t *testing.T) {
 
 func TestCtxSearch_NoResults(t *testing.T) {
 	s := newTestServerWithOptimizer(t)
-	result := callToolJSON(t, s, "anchored_ctx_search", map[string]any{
+	result, _ := callToolJSON(t, s, "anchored_ctx_search", map[string]any{
 		"queries": []string{"NonExistentTokenZzzzzz"},
 	})
 	if !strings.Contains(result, "no results") && !strings.Contains(result, "No results") {
@@ -149,7 +136,7 @@ func TestCtxExecuteFile_Timeout(t *testing.T) {
 	tmpFile.WriteString("test content")
 	tmpFile.Close()
 
-	result := callToolJSON(t, s, "anchored_execute_file", map[string]any{
+	result, _ := callToolJSON(t, s, "anchored_execute_file", map[string]any{
 		"path":     tmpFile.Name(),
 		"language": "shell",
 		"code":     "sleep 60",
