@@ -38,7 +38,18 @@ func newTestServer(t *testing.T) *Server {
 	memSvc.SetKGExtractor(kg.NewPatternExtractor(kgSvc, log))
 	sessMgr := session.NewManager(memSvc.StoreDB(), log)
 
-	return NewServer(memSvc, kgSvc, sessMgr, nil, cfg, "test", log)
+	// Best-effort context optimizer (same pattern as serve.go): if it fails to
+	// initialize in the test environment, the ctx_* tools stay unavailable but
+	// the rest of the server is exercised. On Linux the sandbox compiles, so
+	// this wires the optimizer and covers server_ctx.go wrapper methods.
+	var optimizer OptimizerFacade
+	cfg.ContextOptimizer = config.ContextOptimizerConfig{Enabled: true}
+	if opt, err := NewCtxOptimizer(memSvc.StoreDB(), cfg.ContextOptimizer, log); err == nil {
+		optimizer = opt
+		t.Cleanup(opt.Close)
+	}
+
+	return NewServer(memSvc, kgSvc, sessMgr, optimizer, cfg, "test", log)
 }
 
 type discardWriter struct{}
@@ -205,6 +216,85 @@ func TestServer_ToolContext(t *testing.T) {
 	// Invalid JSON args should fall back to CWD="." rather than erroring.
 	if _, err := callToolJSON(t, s, "anchored_context", map[string]any{}); err != nil {
 		t.Fatalf("context with empty args: %v", err)
+	}
+}
+
+func TestServer_Resources(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	// resources/list returns the static resource definitions.
+	out := s.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"resources/list"}`))
+	if !contains(string(out), "resources") {
+		t.Fatalf("resources/list response missing 'resources': %s", out)
+	}
+
+	// resources/read with bad params -> error response.
+	out = s.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":123}}`))
+	if !contains(string(out), "error") {
+		t.Fatalf("expected error for invalid params: %s", out)
+	}
+
+	// resources/read anchored://memory/stats -> stats payload.
+	out = s.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"anchored://memory/stats"}}`))
+	if !contains(string(out), "Total") {
+		t.Fatalf("stats resource missing 'Total': %s", out)
+	}
+
+	// resources/read anchored://memory/recent -> recent payload (empty DB -> "No memories yet.").
+	out = s.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"anchored://memory/recent"}}`))
+	if !contains(string(out), "memories") && !contains(string(out), "No memories") {
+		t.Fatalf("recent resource unexpected: %s", out)
+	}
+
+	// resources/read anchored://identity -> identity payload (may be empty file, no error path).
+	_ = s.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":5,"method":"resources/read","params":{"uri":"anchored://identity"}}`))
+}
+
+func TestServer_CtxTools(t *testing.T) {
+	s := newTestServer(t)
+	if s.optimizer == nil {
+		t.Skip("context optimizer not available in this environment")
+	}
+
+	// anchored_index via content exercises IndexContent + resetSearchThrottle.
+	if _, err := callToolJSON(t, s, "anchored_index", map[string]any{
+		"content": "func hello() { print('hi') }",
+		"source":  "test",
+	}); err != nil {
+		t.Fatalf("index: %v", err)
+	}
+
+	// anchored_execute runs shell code, exercises Execute + IndexRaw + Search + renderExecOutput.
+	res, err := callToolJSON(t, s, "anchored_execute", map[string]any{
+		"language": "shell",
+		"code":     "echo hello-anchored",
+		"intent":   "smoke test",
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !contains(res, "hello-anchored") {
+		t.Fatalf("execute did not echo output: %s", res)
+	}
+
+	// anchored_ctx_search exercises Search against the indexed content.
+	if _, err := callToolJSON(t, s, "anchored_ctx_search", map[string]any{
+		"queries": []string{"hello"},
+		"limit":   2,
+	}); err != nil {
+		t.Fatalf("ctx_search: %v", err)
+	}
+
+	// anchored_batch_execute exercises ExecuteBatch.
+	if _, err := callToolJSON(t, s, "anchored_batch_execute", map[string]any{
+		"commands": []map[string]any{
+			{"language": "shell", "code": "echo one"},
+			{"language": "shell", "code": "echo two"},
+		},
+		"queries": []string{"one"},
+	}); err != nil {
+		t.Fatalf("batch_execute: %v", err)
 	}
 }
 
