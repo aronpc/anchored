@@ -520,3 +520,54 @@ func TestCallTool_Save_MissingContent(t *testing.T) {
 
 // --- Minimal stubs for testable routing ---
 // (session.Manager is a concrete struct, so nil is used for "disabled" tests.)
+
+func TestSetDebugLogger(t *testing.T) {
+	s := NewServer(nil, nil, nil, nil, nil, "", nil)
+	
+	// Test with nil logger (should not panic)
+	s.SetDebugLogger(nil)
+	if s.dlog != nil {
+		t.Error("expected dlog to be nil after SetDebugLogger(nil)")
+	}
+}
+
+func TestHeadTail(t *testing.T) {
+	tests := []struct {
+		name     string
+		s        string
+		head     int
+		tail     int
+		expected string
+	}{
+		{
+			name:     "short string passes through",
+			s:        "hello",
+			head:     10,
+			tail:     10,
+			expected: "hello",
+		},
+		{
+			name:     "truncates with head and tail",
+			s:        "abcdefghijklmnopqrstuvwxyz",
+			head:     5,
+			tail:     5,
+			expected: "abcde\n[... 16 bytes omitted ...]\nvwxyz",
+		},
+		{
+			name:     "empty string",
+			s:        "",
+			head:     5,
+			tail:     5,
+			expected: "",
+		},
+	}
+	
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := headTail(tt.s, tt.head, tt.tail)
+			if result != tt.expected {
+				t.Errorf("headTail(%q, %d, %d) = %q; want %q", tt.s, tt.head, tt.tail, result, tt.expected)
+			}
+		})
+	}
+}
