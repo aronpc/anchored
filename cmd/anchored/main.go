@@ -73,6 +73,8 @@ func main() {
 		runEval(os.Args[2:])
 	case "backfill":
 		runBackfillEmbeddings(os.Args[2:])
+	case "maintenance":
+		runMaintenance(os.Args[2:])
 	case "--version", "-v":
 		fmt.Printf("anchored %s\n", Version)
 	case "--help", "-h":
@@ -117,6 +119,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored artifact prune     Remove expired artifacts\n")
 	fmt.Fprintf(os.Stderr, "  anchored remote status      Show remote sync config status\n")
 	fmt.Fprintf(os.Stderr, "  anchored remote preview     Preview which memories would sync (offline)\n")
+	fmt.Fprintf(os.Stderr, "  anchored maintenance run    Periodic upkeep: import + dream + curation reconcile\n")
+	fmt.Fprintf(os.Stderr, "  anchored maintenance install  Install upkeep as a systemd --user daily timer\n")
 	fmt.Fprintf(os.Stderr, "  anchored --version          Print version\n")
 	fmt.Fprintf(os.Stderr, "\nImport sources: claude-code devclaw opencode cursor all\n")
 	fmt.Fprintf(os.Stderr, "\nFlags:\n")
