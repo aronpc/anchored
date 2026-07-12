@@ -158,6 +158,18 @@ func (s *svcMockStore) ListWithoutEmbedding(_ context.Context, limit int) ([]Mem
 	return result, nil
 }
 
+func (s *svcMockStore) CountWithoutEmbedding(_ context.Context) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, m := range s.memories {
+		if len(m.Embedding) == 0 {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (s *svcMockStore) FindByContentHash(_ context.Context, hash string, _ *string) (*Memory, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
