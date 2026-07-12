@@ -96,7 +96,12 @@ func TestBuildSessionStartTiers_FailSafeOnEmptyDB(t *testing.T) {
 	db := newSessionStartTestDB(t)
 	hc := &HookContext{db: db}
 
-	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj-none", "")
+	// A fresh temp dir is not a git repo, so currentGitBranch() returns "" and
+	// InferTaskKey yields no key — the task tier stays empty regardless of the
+	// branch the suite runs on. Without this, taskThreadItem would infer a
+	// thread from the real checkout's branch and this "empty DB" assertion
+	// would flake on any feature branch (only main happens to yield no key).
+	tiers := buildSessionStartTiers(context.Background(), hc, "", "proj-none", t.TempDir())
 	if len(tiers) != 5 {
 		t.Fatalf("want 5 tiers (standing_rules first), got %d", len(tiers))
 	}
