@@ -170,6 +170,53 @@ func (s *SQLiteStore) Get(ctx context.Context, id string) (*Memory, error) {
 	return m, nil
 }
 
+// GetPullWatermark returns the stored pull watermark for a local project, or ""
+// on the first pull. The watermark is the server's incremental-pull cursor.
+func (s *SQLiteStore) GetPullWatermark(ctx context.Context, projectID string) (string, error) {
+	var wm sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT watermark FROM sync_state WHERE project_id = ?`, projectID,
+	).Scan(&wm)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", fmt.Errorf("get pull watermark: %w", err)
+	}
+	return wm.String, nil
+}
+
+// SetPullState records the watermark + remote key for a local project after a
+// successful incremental pull, upserting the sync_state row.
+func (s *SQLiteStore) SetPullState(ctx context.Context, projectID, remoteKey, watermark, clientID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO sync_state (project_id, remote_project_key, watermark, last_sync, client_id)
+		 VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
+		 ON CONFLICT(project_id) DO UPDATE SET
+			remote_project_key = excluded.remote_project_key,
+			watermark = excluded.watermark,
+			last_sync = excluded.last_sync,
+			client_id = excluded.client_id`,
+		projectID, remoteKey, watermark, clientID,
+	)
+	if err != nil {
+		return fmt.Errorf("set pull state: %w", err)
+	}
+	return nil
+}
+
+// MarkRemoteOrigin stamps a memory as pulled from the remote server so the sync
+// preview classifies it as already_synced and the push path never re-sends it.
+func (s *SQLiteStore) MarkRemoteOrigin(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE memories SET sync_origin = 'remote', sync_dirty = 0 WHERE id = ?`, id,
+	)
+	if err != nil {
+		return fmt.Errorf("mark remote origin: %w", err)
+	}
+	return nil
+}
+
 // isFTSSyntaxError reports whether err is an FTS5 query-parse failure (as
 // opposed to a real I/O/DB error), so Search can retry with a sanitized query.
 func isFTSSyntaxError(err error) bool {

@@ -169,6 +169,11 @@ func (s *svcMockStore) CountWithoutEmbedding(_ context.Context) (int, error) {
 	}
 	return n, nil
 }
+func (s *svcMockStore) GetPullWatermark(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (s *svcMockStore) SetPullState(_ context.Context, _, _, _, _ string) error { return nil }
+func (s *svcMockStore) MarkRemoteOrigin(_ context.Context, _ string) error      { return nil }
 
 func (s *svcMockStore) FindByContentHash(_ context.Context, hash string, _ *string) (*Memory, error) {
 	s.mu.Lock()

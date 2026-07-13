@@ -48,6 +48,14 @@ func (s *backfillTestStore) CountWithoutEmbedding(ctx context.Context) (int, err
 	return n, nil
 }
 
+func (s *backfillTestStore) GetPullWatermark(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (s *backfillTestStore) SetPullState(_ context.Context, _, _, _, _ string) error {
+	return nil
+}
+func (s *backfillTestStore) MarkRemoteOrigin(_ context.Context, _ string) error { return nil }
+
 func newBackfillStore(n int) *backfillTestStore {
 	mems := make([]Memory, n)
 	for i := 0; i < n; i++ {

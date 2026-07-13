@@ -124,7 +124,11 @@ func (s *Service) SaveWithOptions(ctx context.Context, opts SaveOptions) (*Memor
 	}
 
 	var projectID *string
-	if opts.CWD != "" {
+	if opts.ProjectID != nil {
+		// Explicit override (e.g. remote pull landing a memory in a specific
+		// local project matched by remote_key, regardless of the CWD).
+		projectID = opts.ProjectID
+	} else if opts.CWD != "" {
 		proj, err := s.projDet.Detect(opts.CWD)
 		if err != nil {
 			s.logger.Warn("project detection failed", "error", err)
@@ -444,6 +448,42 @@ func (s *Service) SaveRawNoEmbed(ctx context.Context, content, category, source 
 		SkipEmbed: true,
 	})
 	return err
+}
+
+// MarkRemoteOrigin stamps a memory as pulled from the remote server so the sync
+// preview never re-pushes it. Used by the remote pull path after materializing
+// each pulled memory.
+func (s *Service) MarkRemoteOrigin(ctx context.Context, id string) error {
+	return s.store.MarkRemoteOrigin(ctx, id)
+}
+
+// GetPullWatermark returns the last-pulled watermark for a local project, or ""
+// on the first pull.
+func (s *Service) GetPullWatermark(ctx context.Context, projectID string) (string, error) {
+	return s.store.GetPullWatermark(ctx, projectID)
+}
+
+// SetPullState records the watermark + remote key for a local project after a
+// successful incremental pull.
+func (s *Service) SetPullState(ctx context.Context, projectID, remoteKey, watermark, clientID string) error {
+	return s.store.SetPullState(ctx, projectID, remoteKey, watermark, clientID)
+}
+
+// SaveRemoteMemory materializes a memory that arrived from the remote server:
+// it saves with an explicit project override (no CWD detection) and then marks
+// the resulting row with a remote origin so the push path never re-sends it.
+// Dedup (content_hash + near-duplicate) and embedding run as in a normal save.
+func (s *Service) SaveRemoteMemory(ctx context.Context, opts SaveOptions) (*Memory, error) {
+	m, err := s.SaveWithOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	if m != nil {
+		if err := s.store.MarkRemoteOrigin(ctx, m.ID); err != nil {
+			s.logger.Warn("mark remote origin failed", "id", m.ID, "error", err)
+		}
+	}
+	return m, nil
 }
 
 func (s *Service) embedAsync(id, content string) {

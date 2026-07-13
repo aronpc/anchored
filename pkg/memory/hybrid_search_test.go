@@ -131,6 +131,11 @@ func (s *hybridMockStore) FindByContentHash(ctx context.Context, hash string, pr
 }
 func (s *hybridMockStore) BackfillContentHash(ctx context.Context) (int, error) { return 0, nil }
 func (s *hybridMockStore) VectorCache() *VectorCache                            { return nil }
+func (s *hybridMockStore) GetPullWatermark(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+func (s *hybridMockStore) SetPullState(_ context.Context, _, _, _, _ string) error { return nil }
+func (s *hybridMockStore) MarkRemoteOrigin(_ context.Context, _ string) error      { return nil }
 
 type hybridMockEmbedder struct{}
 

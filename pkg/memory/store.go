@@ -90,6 +90,10 @@ type SaveOptions struct {
 	Source    string
 	SourceID  *string
 	CWD       string
+	// ProjectID, when non-nil, overrides project detection by CWD. Used by the
+	// remote pull path to land a memory in a specific local project (matched by
+	// remote_key) regardless of the working directory.
+	ProjectID *string
 	SkipEmbed bool
 	// PreferenceScope is used only when Category is "preference".
 	// Empty defaults to "user" so inferred preferences remain local/personal by default.
@@ -125,6 +129,16 @@ type Store interface {
 	CountWithoutEmbedding(ctx context.Context) (int, error)
 	FindByContentHash(ctx context.Context, hash string, projectID *string) (*Memory, error)
 	BackfillContentHash(ctx context.Context) (int, error)
+	// GetPullWatermark returns the last-pulled watermark for a local project,
+	// or "" on the first pull. Backed by the sync_state table.
+	GetPullWatermark(ctx context.Context, projectID string) (string, error)
+	// SetPullState records the watermark + remote key for a local project after
+	// a successful incremental pull.
+	SetPullState(ctx context.Context, projectID, remoteKey, watermark, clientID string) error
+	// MarkRemoteOrigin stamps a memory as pulled from the remote server
+	// (sync_origin='remote', sync_dirty=0) so the sync preview classifies it as
+	// already_synced and never re-pushes it — closing the A↔B pull/push loop.
+	MarkRemoteOrigin(ctx context.Context, id string) error
 	DB() *sql.DB
 	VectorCache() *VectorCache
 	Close() error
