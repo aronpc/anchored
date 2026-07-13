@@ -39,6 +39,8 @@ func runRemote(args []string) {
 		runRemoteSync(args[1:])
 	case "sync-per-project":
 		runRemoteSyncPerProject(args[1:])
+	case "pull":
+		runRemotePull(args[1:])
 	default:
 		printRemoteUsage()
 	}
@@ -54,6 +56,7 @@ func printRemoteUsage() {
 	fmt.Fprintln(os.Stderr, "  anchored remote sync [--remote NAME]                Sync the CURRENT repo by its git origin (--dry-run to preview)")
 	fmt.Fprintln(os.Stderr, "  anchored remote sync --all                          Sync every local project, each routed by its own git origin")
 	fmt.Fprintln(os.Stderr, "  anchored remote sync --project-id <id>              Force all current-repo memories into a specific remote project")
+	fmt.Fprintln(os.Stderr, "  anchored remote pull [--all|--project-id <id>]      Pull memories FROM the remote into the local store (--dry-run to preview)")
 }
 
 // runRemoteLink adds a remote project_id to a remote's linked-projects list.
