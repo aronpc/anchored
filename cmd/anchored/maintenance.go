@@ -62,6 +62,7 @@ func printMaintenanceUsage() {
 	fmt.Fprintln(os.Stderr, "  --max-deletions N        max soft-deletions per dream run (default 50)")
 	fmt.Fprintln(os.Stderr, "  --skip-import            skip the import step")
 	fmt.Fprintln(os.Stderr, "  --skip-backfill          skip the backfill step")
+	fmt.Fprintln(os.Stderr, "  --skip-pull              skip the remote pull step")
 	fmt.Fprintln(os.Stderr, "  --skip-dream             skip the dream step")
 	fmt.Fprintln(os.Stderr, "  --skip-curation          skip the curation reconcile step")
 }
@@ -77,6 +78,7 @@ func runMaintenanceRun(args []string) {
 	maxDeletions := fs.Int("max-deletions", 50, "maximum soft-deletions per dream run")
 	skipImport := fs.Bool("skip-import", false, "skip the import step")
 	skipBackfill := fs.Bool("skip-backfill", false, "skip the backfill step")
+	skipPull := fs.Bool("skip-pull", false, "skip the remote pull step")
 	skipDream := fs.Bool("skip-dream", false, "skip the dream step")
 	skipCuration := fs.Bool("skip-curation", false, "skip the curation reconcile step")
 	fs.Parse(args)
@@ -135,7 +137,14 @@ func runMaintenanceRun(args []string) {
 		return maintenanceCmd(exe, *configPath, "backfill", "--max", "2000")
 	})
 
-	// 3. Dream — analyze + apply consolidation. --dry-run=false forces apply
+	// 3. Pull — materialize memories other machines pushed to the server so the
+	// local store is a replica before consolidation runs. Repo-scoped by git
+	// origin; a missing remote or network error does not abort upkeep.
+	runStep("pull", *skipPull, func() *exec.Cmd {
+		return maintenanceCmd(exe, *configPath, "remote", "pull", "--all")
+	})
+
+	// 4. Dream — analyze + apply consolidation. --dry-run=false forces apply
 	// (the flag defaults to dry-run=true for interactive safety).
 	runStep("dream", *skipDream, func() *exec.Cmd {
 		cmd := maintenanceCmd(exe, *configPath, "dream",
@@ -146,7 +155,7 @@ func runMaintenanceRun(args []string) {
 		return cmd
 	})
 
-	// 4. Curation — reconcile quality/importance metadata. --yes skips the
+	// 5. Curation — reconcile quality/importance metadata. --yes skips the
 	// interactive confirmation prompt (unsupervised timer context).
 	runStep("curation", *skipCuration, func() *exec.Cmd {
 		return maintenanceCmd(exe, *configPath, "curation", "reconcile", "--yes")

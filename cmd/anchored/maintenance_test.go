@@ -67,6 +67,6 @@ func TestRunMaintenanceRun_AllSkipped(t *testing.T) {
 		}
 	}()
 	runMaintenanceRun([]string{
-		"--skip-import", "--skip-backfill", "--skip-dream", "--skip-curation",
+		"--skip-import", "--skip-backfill", "--skip-pull", "--skip-dream", "--skip-curation",
 	})
 }
