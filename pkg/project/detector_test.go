@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -390,6 +391,15 @@ func openTestDB(t *testing.T) *sql.DB {
 			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 		CREATE INDEX IF NOT EXISTS idx_projects_remote_key ON projects(remote_key);
+		-- Detect ordena os candidatos de uma mesma remote_key pela contagem de
+		-- memorias, entao o schema de teste precisa da tabela: sem ela o helper
+		-- ficava mais pobre que o banco real e escondia o caminho ordenado.
+		CREATE TABLE IF NOT EXISTS memories (
+			id TEXT PRIMARY KEY,
+			project_id TEXT,
+			content TEXT
+		);
+		CREATE INDEX IF NOT EXISTS idx_memories_project ON memories(project_id);
 	`)
 	if err != nil {
 		t.Fatalf("create schema: %v", err)
@@ -723,5 +733,68 @@ func TestDetect_RemotesDiferentesNaoColapsam(t *testing.T) {
 	}
 	if n := contarProjetos(t, db); n != 2 {
 		t.Errorf("%d linhas em projects, esperava 2", n)
+	}
+}
+
+// Bancos anteriores a esta mudanca tem DUPLICATAS sob a mesma remote_key — uma
+// linha por checkout ja visto. Encontrar "uma delas" nao basta: se cair na
+// vazia, o resultado e o proprio sintoma que a mudanca corrige, agora com o
+// nome certo no projeto.
+//
+// Medido no banco real antes deste teste existir: seis linhas para o mesmo
+// repositorio, uma com 40 memorias, uma com 1, e quatro vazias de clones de
+// experimento ja apagados. O LIMIT 1 sem ordem devolveu a de 1.
+func TestDetect_ComDuplicatasEscolheAQueTemAMemoria(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+	const origin = "git@github.com:user/repo.git"
+
+	raiz := t.TempDir()
+	principal := repoComOrigin(t, filepath.Join(raiz, "principal"), origin)
+	rk := DeriveRemoteKeyFromURL(origin)
+	if rk == "" {
+		t.Fatal("remote_key vazia: o cenario nao se monta")
+	}
+
+	// Linhas na ordem que um banco antigo produziria: a vazia PRIMEIRO, para
+	// que um LIMIT 1 sem ordem tenda a escolhe-la.
+	linhas := []struct {
+		id, nome, caminho string
+		memorias          int
+	}{
+		{"p-vazio", "clone-efemero", filepath.Join(raiz, "runs", "arm-a"), 0},
+		{"p-pobre", "outro-checkout", filepath.Join(raiz, "outro"), 1},
+		{"p-rico", "principal", principal, 40},
+	}
+	for _, l := range linhas {
+		if _, err := db.Exec(
+			"INSERT INTO projects (id, name, path, remote_key) VALUES (?, ?, ?, ?)",
+			l.id, l.nome, l.caminho, rk); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < l.memorias; i++ {
+			if _, err := db.Exec(
+				"INSERT INTO memories (id, project_id, content) VALUES (?, ?, ?)",
+				fmt.Sprintf("%s-m%d", l.id, i), l.id, "x"); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	p, err := d.Detect(principal)
+	if err != nil || p == nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if p.ID != "p-rico" {
+		t.Errorf("escolheu %q (%s); esperava p-rico, a linha com as 40 memorias", p.ID, p.Name)
+	}
+
+	// Estavel entre chamadas: escolha arbitraria seria um bug intermitente, do
+	// tipo que so aparece depois de o banco crescer.
+	for i := 0; i < 5; i++ {
+		q, err := d.Detect(principal)
+		if err != nil || q == nil || q.ID != p.ID {
+			t.Fatalf("chamada %d devolveu %v (err=%v), esperava estavel em %q", i, q, err, p.ID)
+		}
 	}
 }

@@ -112,9 +112,25 @@ const colunasProjeto = "SELECT id, name, path, source_tool, COALESCE(remote_key,
 
 // porRemoteKey busca o projeto por chave de origin. Devolve (nil, nil) quando
 // não há linha — ausência não é erro para quem vai criar em seguida.
+//
+// A ordenação NÃO é decoração. Todo banco que existia antes desta mudança tem
+// linhas duplicadas sob a mesma chave, uma por checkout que já foi visto: no
+// banco em que isto foi medido havia seis para o mesmo repositório — a de 40
+// memórias, uma de 1, e quatro vazias de clones de experimento já apagados do
+// disco. Um `LIMIT 1` sem ordem escolhe qualquer uma delas, e escolher a vazia
+// devolve exatamente o sintoma que esta mudança existe para corrigir: o projeto
+// certo, com a memória de outro lugar.
+//
+// Ordena pela linha com MAIS memórias, e desempata pela mais antiga para que a
+// escolha não mude entre chamadas. A subconsulta corre sobre um índice de
+// project_id e só entre as poucas linhas que casam a chave.
 func (d *Detector) porRemoteKey(chave string) (*Project, error) {
 	var p Project
-	err := d.db.QueryRow(colunasProjeto+" WHERE remote_key = ? LIMIT 1", chave).
+	err := d.db.QueryRow(colunasProjeto+`
+		 WHERE remote_key = ?
+		 ORDER BY (SELECT COUNT(*) FROM memories m WHERE m.project_id = projects.id) DESC,
+		          rowid ASC
+		 LIMIT 1`, chave).
 		Scan(&p.ID, &p.Name, &p.Path, &p.SourceTool, &p.RemoteKey)
 	if err == sql.ErrNoRows {
 		return nil, nil
