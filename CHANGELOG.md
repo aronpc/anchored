@@ -24,15 +24,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- **Worktrees started with no memory of their repository** — project identity
-  came from `git rev-parse --show-toplevel`, which in a linked worktree returns
-  the worktree's own path. Since projects are looked up by exact path, every
-  worktree got a project row of its own and therefore an empty memory, while
-  the repository's history stayed under the main checkout. Detection now
-  resolves the shared repository through `--git-common-dir`, so a worktree and
-  its main checkout are one project. Independent clones of the same remote stay
-  separate, which keeps a repository checked out for different operational
-  contexts from having its memory merged.
+- **A checkout started with no memory of its repository** — project identity
+  came from the path, so every checkout of the same repository got a project row
+  of its own and an empty memory, while the history stayed under whichever
+  directory happened to be seen first. A path answers *where is this checkout*,
+  which is a different question from *which project is this*, and the two diverge
+  in three ordinary situations: a linked worktree, a local clone, and a
+  repository that was simply moved or renamed.
+
+  **Identity is now the git origin; the path is a label.** Detection keys on the
+  `remote_key` already derived from `git remote get-url origin` — the same key
+  the server uses to recognise a project across machines, until now applied to
+  one side only. A worktree, a clone and a moved repository all resolve to the
+  one project, and none of them needs a special case. The stored path follows the
+  project when it moves, and stays on the original when a second checkout appears
+  beside it, since that path is what a person recognises.
+
+  A repository with **no origin** has no identity beyond where it sits, and falls
+  back to the path — two such checkouts stay separate, because nothing available
+  says otherwise.
+
+  This **reverses** the note published with the previous fix, which said
+  independent clones of the same remote would stay separate to keep a repository
+  checked out for different operational contexts from having its memory merged.
+  That guarantee was never held by a test — the one that appeared to guard it
+  builds its repositories with `git init` and no remote, so it exercises the
+  no-origin fallback instead. The reversal is deliberate: a checkout of the same
+  repository is the same project, and a framework that clones a repository per
+  experiment arm was starting every arm blind to the memory of the repository it
+  had just cloned.
 
 - **Memories orphaned from the temporal ledger** — the stop hook's lightweight
   insert wrote straight into `memories` without `logical_id` or

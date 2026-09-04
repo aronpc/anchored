@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"log/slog"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -28,6 +29,28 @@ func NewDetector(db *sql.DB) *Detector {
 	return &Detector{db: db}
 }
 
+// Detect resolves cwd to the project it belongs to, creating it on first sight.
+//
+// IDENTITY IS THE GIT ORIGIN, NOT THE PATH. A path answers "where is this
+// checkout" — a different question from "which project is this", and the two
+// diverge in three ordinary situations:
+//
+//	linked worktree   same repository, own path
+//	local clone       same repository, own path AND own .git
+//	moved repository  same checkout, new path
+//
+// Keying on the path made each of those a fresh project row with an empty
+// memory: the bakeoff framework clones a repo per experiment arm, and every arm
+// started blind to the 40 memories of the repo it had just cloned. Keying on
+// the origin answers all three at once, and needs no special case for any.
+//
+// The path is still stored — Resolve hands it back, and it is what a human
+// recognizes — but it is a LABEL that follows the project, not the key that
+// identifies it. When a project is found by origin at a new path, the row moves.
+//
+// A repository with no origin has no identity beyond where it sits, so it falls
+// back to the path. That is the one case where two checkouts of the same work
+// stay separate projects, and there is nothing available to tell us otherwise.
 func (d *Detector) Detect(cwd string) (*Project, error) {
 	gitRoot, err := gitRoot(cwd)
 	if err != nil || gitRoot == "" {
@@ -39,62 +62,143 @@ func (d *Detector) Detect(cwd string) (*Project, error) {
 		return nil, err
 	}
 
-	var existing Project
-	err = d.db.QueryRow(
-		"SELECT id, name, path, source_tool, COALESCE(remote_key, '') FROM projects WHERE path = ?",
-		gitRoot,
-	).Scan(&existing.ID, &existing.Name, &existing.Path, &existing.SourceTool, &existing.RemoteKey)
+	canonical, legacy := RemoteKeysFromDir(gitRoot)
 
-	if err == nil {
-		// Backfill or re-key: when the stored key is missing OR no longer
-		// matches the canonical (v2) key the origin now derives — e.g. a
-		// record keyed with the legacy normalization — update it to the
-		// canonical key so local and server keys converge.
-		rk := deriveRemoteKey(gitRoot)
-		if rk != "" && rk != existing.RemoteKey {
-			if _, uerr := d.db.Exec("UPDATE projects SET remote_key = ? WHERE id = ?", rk, existing.ID); uerr != nil {
-				slog.Debug("remote_key re-key failed; will retry on next detect", "project_id", existing.ID, "error", uerr)
+	if canonical != "" {
+		// Canonical first, legacy second: a row still keyed by the old
+		// normalization has to be FOUND before it can be re-keyed, and probing
+		// both in one statement would leave the choice to the database.
+		for _, chave := range []string{canonical, legacy} {
+			if chave == "" {
+				continue
 			}
-			existing.RemoteKey = rk
+			existing, err := d.porRemoteKey(chave)
+			if err != nil {
+				return nil, err
+			}
+			if existing == nil {
+				continue
+			}
+			d.reconciliar(existing, canonical, gitRoot)
+			return existing, nil
 		}
-		return &existing, nil
-	}
-	if err != sql.ErrNoRows {
-		return nil, err
+		// Registro anterior ao remote_key: existe, foi encontrado por nenhuma
+		// chave, e tem este path. Encontrá-lo aqui é o que faz o backfill —
+		// sem este passo o INSERT abaixo colide no UNIQUE de path, e um banco
+		// que só precisava ganhar a chave passa a recusar o projeto.
+		existing, err := d.porPath(gitRoot)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			d.reconciliar(existing, canonical, gitRoot)
+			return existing, nil
+		}
+		return d.inserir(gitRoot, canonical)
 	}
 
-	name := filepath.Base(gitRoot)
-	id := newID()
-	rk := deriveRemoteKey(gitRoot)
-
-	_, err = d.db.Exec(
-		"INSERT INTO projects (id, name, path, remote_key) VALUES (?, ?, ?, ?)",
-		id, name, gitRoot, rk,
-	)
+	// Sem origin: a identidade é o caminho, e é só isso que existe.
+	existing, err := d.porPath(gitRoot)
 	if err != nil {
 		return nil, err
 	}
-
-	return &Project{ID: id, Name: name, Path: gitRoot, RemoteKey: rk}, nil
+	if existing != nil {
+		return existing, nil
+	}
+	return d.inserir(gitRoot, "")
 }
 
-func (d *Detector) Resolve(id string) (*Project, error) {
+const colunasProjeto = "SELECT id, name, path, source_tool, COALESCE(remote_key, '') FROM projects"
+
+// porRemoteKey busca o projeto por chave de origin. Devolve (nil, nil) quando
+// não há linha — ausência não é erro para quem vai criar em seguida.
+func (d *Detector) porRemoteKey(chave string) (*Project, error) {
 	var p Project
-	err := d.db.QueryRow(
-		"SELECT id, name, path, source_tool, COALESCE(remote_key, '') FROM projects WHERE id = ?",
-		id,
-	).Scan(&p.ID, &p.Name, &p.Path, &p.SourceTool, &p.RemoteKey)
+	err := d.db.QueryRow(colunasProjeto+" WHERE remote_key = ? LIMIT 1", chave).
+		Scan(&p.ID, &p.Name, &p.Path, &p.SourceTool, &p.RemoteKey)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &p, nil
 }
 
-// gitRoot returns the path that identifies the project. A linked worktree has
-// its own working tree but shares the repository, and the shared repository is
-// what carries the project's identity: --show-toplevel would return the
-// worktree, giving it a project row of its own and therefore an empty memory.
-// --git-common-dir resolves to the main repository in both cases.
+func (d *Detector) porPath(caminho string) (*Project, error) {
+	var p Project
+	err := d.db.QueryRow(colunasProjeto+" WHERE path = ?", caminho).
+		Scan(&p.ID, &p.Name, &p.Path, &p.SourceTool, &p.RemoteKey)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
+// reconciliar alinha a linha encontrada com o que o disco diz agora.
+//
+// Duas coisas envelhecem: a chave, quando a linha vem da normalização legada, e
+// o caminho, quando o projeto foi movido — ou quando quem chamou foi um clone
+// efêmero. Ambas são melhor-esforço: falhar em atualizar um RÓTULO não é motivo
+// para negar o projeto a quem já o encontrou.
+//
+// O caminho só avança para um diretório que EXISTE. Sem isso, um clone
+// descartável — a árvore de runs do bakeoff é apagada ao fim — deixaria a linha
+// apontando para um caminho morto, e Resolve devolveria um projeto que não está
+// em lugar nenhum.
+func (d *Detector) reconciliar(p *Project, canonical, gitRoot string) {
+	if canonical != "" && canonical != p.RemoteKey {
+		if _, err := d.db.Exec("UPDATE projects SET remote_key = ? WHERE id = ?", canonical, p.ID); err != nil {
+			slog.Debug("remote_key re-key failed; will retry on next detect", "project_id", p.ID, "error", err)
+		} else {
+			p.RemoteKey = canonical
+		}
+	}
+
+	if gitRoot == p.Path {
+		return
+	}
+	if _, err := os.Stat(p.Path); err == nil {
+		// O caminho guardado ainda existe: quem chamou é um segundo checkout do
+		// mesmo repositório, não uma mudança de lugar. O rótulo fica no
+		// original, que é o que a pessoa reconhece.
+		return
+	}
+	if _, err := os.Stat(gitRoot); err != nil {
+		return
+	}
+	if _, err := d.db.Exec("UPDATE projects SET path = ? WHERE id = ?", gitRoot, p.ID); err != nil {
+		slog.Debug("project path move failed; will retry on next detect", "project_id", p.ID, "error", err)
+		return
+	}
+	p.Path = gitRoot
+}
+
+func (d *Detector) inserir(gitRoot, remoteKey string) (*Project, error) {
+	name := filepath.Base(gitRoot)
+	id := newID()
+	if _, err := d.db.Exec(
+		"INSERT INTO projects (id, name, path, remote_key) VALUES (?, ?, ?, ?)",
+		id, name, gitRoot, remoteKey,
+	); err != nil {
+		return nil, err
+	}
+	return &Project{ID: id, Name: name, Path: gitRoot, RemoteKey: remoteKey}, nil
+}
+
+func (d *Detector) Resolve(id string) (*Project, error) {
+	var p Project
+	err := d.db.QueryRow(colunasProjeto+" WHERE id = ?", id).
+		Scan(&p.ID, &p.Name, &p.Path, &p.SourceTool, &p.RemoteKey)
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
+}
+
 func gitRoot(dir string) (string, error) {
 	if root := gitCommonRoot(dir); root != "" {
 		return root, nil

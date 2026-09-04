@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -464,7 +465,12 @@ func TestDetect_WorktreeSharesMainProject(t *testing.T) {
 // independent clones are not worktrees and must keep their own projects, so a
 // repository checked out for different operational contexts does not get its
 // memory merged.
-func TestDetect_SeparateClonesStaySeparate(t *testing.T) {
+// Repositórios SEM origin ficam separados — é o fallback por caminho, e o
+// único caso em que dois checkouts do mesmo trabalho não podem ser reconhecidos
+// como um. O nome anterior deste teste dizia "clones", mas ele constrói os
+// repositórios com `git init` e nenhum remote: nunca exercitou clone de um
+// mesmo remote, e por isso não prendia a garantia que o CHANGELOG anunciava.
+func TestDetect_ReposSemOriginFicamSeparados(t *testing.T) {
 	db := openTestDB(t)
 	d := NewDetector(db)
 
@@ -483,5 +489,239 @@ func TestDetect_SeparateClonesStaySeparate(t *testing.T) {
 	}
 	if ids[0] == ids[1] {
 		t.Error("independent clones collapsed into one project")
+	}
+}
+
+// repoComOrigin cria um repo git com um commit e o origin pedido.
+func repoComOrigin(t *testing.T, dir, origin string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "init", "-q")
+	runGit(t, dir, "config", "user.email", "t@example.com")
+	runGit(t, dir, "config", "user.name", "t")
+	if origin != "" {
+		runGit(t, dir, "remote", "add", "origin", origin)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, dir, "add", "f.txt")
+	runGit(t, dir, "commit", "-qm", "init")
+	return dir
+}
+
+// Dois clones do mesmo repositório são o MESMO projeto. É o caso que motivou a
+// mudança: o bakeoff faz `git clone --local` por braço de experimento, e cada
+// clone tem .git próprio — logo --git-common-dir aponta para si mesmo e não há
+// nada no git, além do origin, que ligue o clone ao repositório de onde veio.
+// Antes disso cada braço começava cego para as memórias do repo que clonou.
+func TestDetect_ClonesDoMesmoRemoteSaoUmProjeto(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+	const origin = "git@bitbucket.org:newfold/gatorllm.git"
+
+	raiz := t.TempDir()
+	principal := repoComOrigin(t, filepath.Join(raiz, "gatorllm"), origin)
+	// Cópia da árvore INTEIRA, .git incluído: é o que o bakeoff faz quando o
+	// clone falha (ele pede --branch <sha>, que o git recusa). O clone
+	// resultante herda o .git/config do original, logo o MESMO origin — que é
+	// exatamente a informação que liga um ao outro sem envolver caminho.
+	clone := filepath.Join(raiz, "work", "arm-a", "task")
+	if err := os.MkdirAll(filepath.Dir(clone), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("cp", "-a", principal+"/.", clone).CombinedOutput(); err != nil {
+		t.Fatalf("copiando arvore: %v\n%s", err, out)
+	}
+	if got := gitOutputTeste(t, clone, "remote", "get-url", "origin"); got != origin {
+		t.Fatalf("a copia devia herdar o origin: %q", got)
+	}
+
+	p1, err := d.Detect(principal)
+	if err != nil || p1 == nil {
+		t.Fatalf("detect principal: %v", err)
+	}
+	p2, err := d.Detect(clone)
+	if err != nil || p2 == nil {
+		t.Fatalf("detect clone: %v", err)
+	}
+
+	if p1.ID != p2.ID {
+		t.Errorf("clone virou projeto separado: %q vs %q (name %q vs %q)",
+			p1.ID, p2.ID, p1.Name, p2.Name)
+	}
+	// O rótulo fica no original: o clone é efêmero e o path guardado tem de
+	// continuar sendo o que uma pessoa reconhece.
+	if p2.Path != principal {
+		t.Errorf("path migrou para o clone: %q, esperava %q", p2.Path, principal)
+	}
+	if n := contarProjetos(t, db); n != 1 {
+		t.Errorf("%d linhas em projects, esperava 1", n)
+	}
+}
+
+// Repositório MOVIDO continua o mesmo projeto, e a linha acompanha o novo
+// lugar. Com identidade por path, renomear um diretório abandonava o histórico
+// inteiro e criava um projeto vazio no caminho novo.
+func TestDetect_RepositorioMovidoMantemOProjeto(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+
+	raiz := t.TempDir()
+	antes := repoComOrigin(t, filepath.Join(raiz, "antes"), "git@github.com:user/repo.git")
+	p1, err := d.Detect(antes)
+	if err != nil || p1 == nil {
+		t.Fatalf("detect antes: %v", err)
+	}
+
+	depois := filepath.Join(raiz, "depois")
+	if err := os.Rename(antes, depois); err != nil {
+		t.Fatal(err)
+	}
+
+	p2, err := d.Detect(depois)
+	if err != nil || p2 == nil {
+		t.Fatalf("detect depois: %v", err)
+	}
+	if p1.ID != p2.ID {
+		t.Errorf("mover o repo criou projeto novo: %q vs %q", p1.ID, p2.ID)
+	}
+	if p2.Path != depois {
+		t.Errorf("path ficou no lugar antigo: %q, esperava %q", p2.Path, depois)
+	}
+	if n := contarProjetos(t, db); n != 1 {
+		t.Errorf("%d linhas em projects, esperava 1", n)
+	}
+}
+
+// Sem origin não há identidade além do lugar, e dois diretórios seguem
+// separados. É o único caso em que dois checkouts do mesmo trabalho não podem
+// ser reconhecidos como um — e não há nada disponível para dizer o contrário.
+func TestDetect_SemOriginCaiNoPath(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+
+	raiz := t.TempDir()
+	a := repoComOrigin(t, filepath.Join(raiz, "a"), "")
+	b := repoComOrigin(t, filepath.Join(raiz, "b"), "")
+
+	pa, err := d.Detect(a)
+	if err != nil || pa == nil {
+		t.Fatalf("detect a: %v", err)
+	}
+	pb, err := d.Detect(b)
+	if err != nil || pb == nil {
+		t.Fatalf("detect b: %v", err)
+	}
+	if pa.ID == pb.ID {
+		t.Error("repos sem origin colapsaram num projeto")
+	}
+	if pa.RemoteKey != "" || pb.RemoteKey != "" {
+		t.Errorf("remote_key deveria ser vazio: %q e %q", pa.RemoteKey, pb.RemoteKey)
+	}
+}
+
+// Worktree linkado casa pelo ORIGIN, sem depender de --git-common-dir. O caso
+// já era coberto pela resolução de gitRoot; este teste prende o fato de que a
+// identidade por origin o resolve sozinha — se o gitRoot voltar a devolver o
+// path do worktree, o projeto continua um só.
+func TestDetect_WorktreeCasaPeloOrigin(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+
+	raiz := t.TempDir()
+	principal := repoComOrigin(t, filepath.Join(raiz, "repo"), "git@github.com:user/repo.git")
+	p1, err := d.Detect(principal)
+	if err != nil || p1 == nil {
+		t.Fatalf("detect principal: %v", err)
+	}
+
+	wt := filepath.Join(raiz, "wt")
+	runGit(t, principal, "worktree", "add", "-q", "--detach", wt)
+
+	p2, err := d.Detect(wt)
+	if err != nil || p2 == nil {
+		t.Fatalf("detect worktree: %v", err)
+	}
+	if p1.ID != p2.ID {
+		t.Errorf("worktree virou projeto separado: %q vs %q", p1.ID, p2.ID)
+	}
+	if n := contarProjetos(t, db); n != 1 {
+		t.Errorf("%d linhas em projects, esperava 1", n)
+	}
+}
+
+func contarProjetos(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM projects").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func gitOutputTeste(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git %v: %v", args, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// A decisão declarada no CHANGELOG: dois checkouts do mesmo repositório são o
+// mesmo projeto, mesmo em diretórios sem relação nenhuma entre si. Este é o
+// teste que faltava — a versão anterior afirmava o contrário em prosa e não
+// tinha nada que o verificasse.
+func TestDetect_CheckoutsDoMesmoRemoteSaoUmProjeto(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+	const origin = "git@github.com:user/mesmo-repo.git"
+
+	raiz := t.TempDir()
+	a := repoComOrigin(t, filepath.Join(raiz, "checkout-a"), origin)
+	b := repoComOrigin(t, filepath.Join(raiz, "outro", "lugar", "checkout-b"), origin)
+
+	pa, err := d.Detect(a)
+	if err != nil || pa == nil {
+		t.Fatalf("detect a: %v", err)
+	}
+	pb, err := d.Detect(b)
+	if err != nil || pb == nil {
+		t.Fatalf("detect b: %v", err)
+	}
+	if pa.ID != pb.ID {
+		t.Errorf("checkouts do mesmo remote viraram projetos distintos: %q vs %q", pa.ID, pb.ID)
+	}
+	if n := contarProjetos(t, db); n != 1 {
+		t.Errorf("%d linhas em projects, esperava 1", n)
+	}
+}
+
+// Remotes DIFERENTES continuam projetos diferentes: a identidade é o remote, e
+// dois repositórios que não são o mesmo não podem colapsar por acidente de
+// chave vazia ou de normalização.
+func TestDetect_RemotesDiferentesNaoColapsam(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+
+	raiz := t.TempDir()
+	a := repoComOrigin(t, filepath.Join(raiz, "a"), "git@github.com:user/um.git")
+	b := repoComOrigin(t, filepath.Join(raiz, "b"), "git@github.com:user/outro.git")
+
+	pa, _ := d.Detect(a)
+	pb, _ := d.Detect(b)
+	if pa == nil || pb == nil {
+		t.Fatal("detect devolveu nil")
+	}
+	if pa.ID == pb.ID {
+		t.Error("repositorios distintos colapsaram num projeto")
+	}
+	if n := contarProjetos(t, db); n != 2 {
+		t.Errorf("%d linhas em projects, esperava 2", n)
 	}
 }
