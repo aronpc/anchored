@@ -450,7 +450,11 @@ func TestCreateStagingFile_ReplacesAStaleFileRatherThanReusingIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a stale regular file should be replaced: %v", err)
 	}
-	defer f.Close()
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close staging file: %v", err)
+		}
+	})
 
 	fi, err := os.Stat(tmpPath)
 	if err != nil {
@@ -470,7 +474,11 @@ func TestCreateStagingFile_CreatesExecutableAndEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close staging file: %v", err)
+		}
+	})
 	fi, err := os.Stat(tmpPath)
 	if err != nil {
 		t.Fatal(err)

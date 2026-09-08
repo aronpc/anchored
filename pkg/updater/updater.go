@@ -319,22 +319,17 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 			continue
 		}
 		if hdr.Size > maxBinaryBytes {
-			tmp.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("tar entry %q declares %d bytes, over the %d limit", hdr.Name, hdr.Size, maxBinaryBytes)
+			return abortStaging(tmp, tmpPath,
+				fmt.Errorf("tar entry %q declares %d bytes, over the %d limit", hdr.Name, hdr.Size, maxBinaryBytes))
 		}
 		// Rejected rather than truncated: a clipped binary that happened to
 		// match its digest would install and then fail at runtime.
 		n, err := io.CopyN(tmp, tr, maxBinaryBytes+1)
 		if err != nil && !errors.Is(err, io.EOF) {
-			tmp.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("write tmp: %w", err)
+			return abortStaging(tmp, tmpPath, fmt.Errorf("write tmp: %w", err))
 		}
 		if n > maxBinaryBytes {
-			tmp.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("payload exceeds the %d byte limit", maxBinaryBytes)
+			return abortStaging(tmp, tmpPath, fmt.Errorf("payload exceeds the %d byte limit", maxBinaryBytes))
 		}
 		written = true
 		break
@@ -409,6 +404,24 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 	return nil
 }
 
+// abortStaging closes and removes the staging file, folding any cleanup
+// failure into the error being reported. A leaked <bin>.new holds an
+// unverified payload, so a failure to remove it is worth surfacing rather
+// than discarding.
+func abortStaging(tmp *os.File, tmpPath string, cause error) error {
+	var problems []string
+	if err := tmp.Close(); err != nil {
+		problems = append(problems, fmt.Sprintf("close %s: %v", tmpPath, err))
+	}
+	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		problems = append(problems, fmt.Sprintf("remove %s: %v", tmpPath, err))
+	}
+	if len(problems) == 0 {
+		return cause
+	}
+	return fmt.Errorf("%w (cleanup also failed: %s)", cause, strings.Join(problems, "; "))
+}
+
 // createStagingFile opens the file the new binary is written to, refusing to
 // reuse anything already at that path.
 //
@@ -438,11 +451,7 @@ func createStagingFile(tmpPath string) (*os.File, error) {
 		return nil, fmt.Errorf("create %s: %w", tmpPath, err)
 	}
 	if err := tmp.Chmod(0o755); err != nil && !errors.Is(err, errors.ErrUnsupported) {
-		tmp.Close()
-		if rmErr := os.Remove(tmpPath); rmErr != nil {
-			return nil, fmt.Errorf("chmod %s: %w (and it could not be removed: %v)", tmpPath, err, rmErr)
-		}
-		return nil, fmt.Errorf("chmod %s: %w", tmpPath, err)
+		return nil, abortStaging(tmp, tmpPath, fmt.Errorf("chmod %s: %w", tmpPath, err))
 	}
 	return tmp, nil
 }
