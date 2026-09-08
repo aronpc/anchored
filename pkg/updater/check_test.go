@@ -517,3 +517,73 @@ func TestDownloadAndReplace_RejectsAnOversizePayload(t *testing.T) {
 		t.Error(".new leaked after rejection")
 	}
 }
+
+// The old code renamed dst to .prev and then renamed the new binary in,
+// leaving a window with nothing at dst. MCP clients spawn `anchored serve` on
+// demand, so a spawn landing in that window got ENOENT. A hardlink backup
+// keeps dst present throughout.
+func TestDownloadAndReplace_BackupIsAHardlinkSoDstNeverDisappears(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "anchored")
+	if err := os.WriteFile(dst, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldStat, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tarball, sum := makeTarGz(t, []byte("NEW-BINARY"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write(tarball); err != nil {
+			t.Errorf("write tarball: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	if err := downloadAndReplace(context.Background(), srv.URL, dst, sum); err != nil {
+		t.Fatal(err)
+	}
+
+	prevStat, err := os.Stat(dst + ".prev")
+	if err != nil {
+		t.Fatalf("expected a .prev backup: %v", err)
+	}
+	if !os.SameFile(oldStat, prevStat) {
+		t.Error(".prev should be another name for the original inode")
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "NEW-BINARY" {
+		t.Errorf("dst = %q", got)
+	}
+}
+
+// A .prev from an earlier update holds an older binary. A failed install must
+// not promote it — that turns a failure into a silent downgrade.
+func TestDownloadAndReplace_StalePrevIsNotPromotedOnAFreshInstall(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "anchored")
+	// No dst: a fresh install. But a .prev is lying around from before.
+	if err := os.WriteFile(dst+".prev", []byte("ANCIENT"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tarball, _ := makeTarGz(t, []byte("NEW-BINARY"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write(tarball); err != nil {
+			t.Errorf("write tarball: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	// Wrong digest, so the install fails before the swap.
+	err := downloadAndReplace(context.Background(), srv.URL, dst, strings.Repeat("0", 64))
+	if err == nil {
+		t.Fatal("expected the checksum to be rejected")
+	}
+	if _, err := os.Stat(dst); err == nil {
+		t.Error("a failed install must not create dst from a stale .prev")
+	}
+	if got, _ := os.ReadFile(dst + ".prev"); string(got) != "ANCIENT" {
+		t.Errorf(".prev was disturbed: %q", got)
+	}
+}

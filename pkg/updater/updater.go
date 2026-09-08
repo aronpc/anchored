@@ -362,24 +362,48 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 		return fmt.Errorf("checksum mismatch: want %s got %s", wantSum, gotSum)
 	}
 
-	// Two-step swap so a bad new binary can be rolled back to .prev.
-	// On Linux/macOS rename is atomic within the same filesystem, and dst
-	// + ".new" + ".prev" all live in dst's parent dir by construction.
+	// The backup is a hardlink, not a rename: dst keeps existing for the
+	// whole operation, so a client spawning `anchored serve` mid-update never
+	// finds the path missing. That also makes the single rename below a true
+	// atomic swap — dst goes straight from the old inode to the new one.
 	prevPath := dst + ".prev"
-	// Best-effort: only matters when dst already exists (fresh installs
-	// from scratch hit ENOENT, which is fine).
+	backedUp := false
 	if _, statErr := os.Stat(dst); statErr == nil {
-		_ = os.Remove(prevPath) // discard any stale backup from a prior cycle
-		if err := os.Rename(dst, prevPath); err != nil {
-			os.Remove(tmpPath)
+		// A symlink here would be followed by Remove's caller expectations
+		// and could point the "backup" anywhere; refuse instead.
+		if fi, err := os.Lstat(prevPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if rmErr := os.Remove(tmpPath); rmErr != nil {
+				return fmt.Errorf("refusing to install: %s is a symlink (and %s could not be cleaned up: %v)", prevPath, tmpPath, rmErr)
+			}
+			return fmt.Errorf("refusing to install: %s is a symlink", prevPath)
+		}
+		if err := os.Remove(prevPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			if rmErr := os.Remove(tmpPath); rmErr != nil {
+				return fmt.Errorf("clear stale backup %s: %w (and %s could not be cleaned up: %v)", prevPath, err, tmpPath, rmErr)
+			}
+			return fmt.Errorf("clear stale backup %s: %w", prevPath, err)
+		}
+		if err := os.Link(dst, prevPath); err != nil {
+			if rmErr := os.Remove(tmpPath); rmErr != nil {
+				return fmt.Errorf("backup current: %w (and %s could not be cleaned up: %v)", err, tmpPath, rmErr)
+			}
 			return fmt.Errorf("backup current: %w", err)
 		}
+		backedUp = true
 	}
+
 	if err := os.Rename(tmpPath, dst); err != nil {
-		// Recovery: try to put the old binary back so the user isn't left
-		// with no executable at all.
-		_ = os.Rename(prevPath, dst)
-		os.Remove(tmpPath)
+		// Only restore a backup this call actually made. A .prev left by an
+		// earlier cycle holds an older binary, and promoting it here would
+		// turn a failed install into a silent downgrade.
+		if backedUp {
+			if rbErr := os.Rename(prevPath, dst); rbErr != nil {
+				return fmt.Errorf("rename: %w (and the rollback from %s failed: %v — restore it by hand)", err, prevPath, rbErr)
+			}
+		}
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return fmt.Errorf("rename: %w (and %s could not be cleaned up: %v)", err, tmpPath, rmErr)
+		}
 		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
