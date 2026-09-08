@@ -98,20 +98,12 @@ func Run(ctx context.Context, opts Options) {
 		return
 	}
 
-	switch res.Blocked {
-	case BlockEnvDisabled, BlockNoVersion:
-		return
-	case BlockDevBuild:
-		// A dev build installed into the canonical dir is an intentional
-		// local checkout (make sync-bin); self-updating it would silently
-		// revert the developer's working binary back to the release tag.
-		log.Debug("autoupdate: dev build, self-update disabled", "current", res.Current)
-		return
-	case BlockOutsideCanonical:
-		log.Debug("autoupdate: skip, binary outside canonical dir", "path", res.BinPath)
-		return
-	case BlockNotNewer:
-		log.Debug("autoupdate: already on latest", "current", res.Current, "latest", res.Latest)
+	// Allowlist, not a set of early returns: only BlockNone proceeds. An
+	// unrecognized reason still stops here, so a guard added later is not
+	// silently bypassed on the unattended path — the same property
+	// forceOverridable gives the interactive one.
+	if res.Blocked != BlockNone {
+		logBlockedUpdate(log, res)
 		return
 	}
 
@@ -133,6 +125,24 @@ func Run(ctx context.Context, opts Options) {
 	}
 
 	log.Info("autoupdate: installed, restart MCP server to activate", "version", res.Latest, "path", res.BinPath, "backup", res.BinPath+".prev")
+}
+
+func logBlockedUpdate(log *slog.Logger, res Result) {
+	switch res.Blocked {
+	case BlockEnvDisabled, BlockNoVersion:
+		// Deliberately silent: the user asked for no updates.
+	case BlockDevBuild:
+		// A dev build installed into the canonical dir is an intentional
+		// local checkout (make sync-bin); self-updating it would silently
+		// revert the developer's working binary back to the release tag.
+		log.Debug("autoupdate: dev build, self-update disabled", "current", res.Current)
+	case BlockOutsideCanonical:
+		log.Debug("autoupdate: skip, binary outside canonical dir", "path", res.BinPath)
+	case BlockNotNewer:
+		log.Debug("autoupdate: already on latest", "current", res.Current, "latest", res.Latest)
+	default:
+		log.Warn("autoupdate: refused", "reason", res.Blocked)
+	}
 }
 
 type ghRelease struct {
