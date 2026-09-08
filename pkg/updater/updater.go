@@ -20,11 +20,13 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -37,6 +39,13 @@ const (
 	// which are attacker-controlled if the API or a proxy in front of it is.
 	maxReleaseJSON    = 4 << 20
 	maxChecksumsBytes = 1 << 20
+
+	// maxBinaryBytes bounds the extraction. hdr.Size is attacker-supplied and
+	// the digest is not verified until after the payload is on disk, so an
+	// adversary who can tamper with the asset stream but not with
+	// checksums.txt cannot install code — but could fill the disk. A real
+	// release is tens of MB.
+	maxBinaryBytes int64 = 512 << 20
 )
 
 // These are vars rather than consts so tests can point the release lookup at
@@ -44,14 +53,6 @@ const (
 var (
 	releaseAPIURL    = "https://api.github.com/repos/%s/releases/latest"
 	releaseTagAPIURL = "https://api.github.com/repos/%s/releases/tags/%s"
-
-	// maxBinaryBytes bounds the extraction. hdr.Size is attacker-supplied and
-	// the digest is not verified until after the payload is on disk, so an
-	// adversary who can tamper with the asset stream but not with
-	// checksums.txt cannot install code — but could fill the disk. A real
-	// release is tens of MB. A var so a test can lower it instead of
-	// generating half a gigabyte.
-	maxBinaryBytes int64 = 512 << 20
 )
 
 // Options controls a single update attempt.
@@ -145,6 +146,21 @@ func logBlockedUpdate(log *slog.Logger, res Result) {
 	}
 }
 
+// noDowngradeClient refuses a redirect that drops from https to http, which a
+// tampered or proxied release document could otherwise use to move the
+// download to plaintext.
+var noDowngradeClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if len(via) > 0 && via[0].URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("refusing redirect from https to %s", req.URL.Scheme)
+		}
+		return nil
+	},
+}
+
 type ghRelease struct {
 	TagName string `json:"tag_name"`
 	Assets  []struct {
@@ -170,7 +186,7 @@ func fetchRelease(ctx context.Context, repo, tag string) (version string, assetU
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "anchored-updater")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := noDowngradeClient.Do(req)
 	if err != nil {
 		return "", "", "", "", err
 	}
@@ -212,6 +228,9 @@ func fetchRelease(ctx context.Context, repo, tag string) (version string, assetU
 	if assetURL == "" {
 		return "", "", "", "", fmt.Errorf("no asset for %s/%s with version %s", runtime.GOOS, runtime.GOARCH, version)
 	}
+	if err := assertTrustedDownloadURL(assetURL); err != nil {
+		return "", "", "", "", err
+	}
 
 	for _, a := range rel.Assets {
 		if a.Name == "checksums.txt" {
@@ -221,6 +240,9 @@ func fetchRelease(ctx context.Context, repo, tag string) (version string, assetU
 	}
 	if checksumsURL == "" {
 		return "", "", "", "", errors.New("checksums.txt not in release assets")
+	}
+	if err := assertTrustedDownloadURL(checksumsURL); err != nil {
+		return "", "", "", "", err
 	}
 	return version, assetURL, assetName, checksumsURL, nil
 }
@@ -237,7 +259,7 @@ func fetchChecksum(ctx context.Context, url, assetName string) (string, error) {
 	}
 	req.Header.Set("User-Agent", "anchored-updater")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := noDowngradeClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -273,14 +295,22 @@ func fetchChecksum(ctx context.Context, url, assetName string) (string, error) {
 // wantSum, extracts the embedded `anchored` binary, and atomically swaps
 // it into dst while keeping the previous binary at dst+".prev" so a bad
 // update can be rolled back manually with one rename.
+// downloadAndReplace installs the release at url, bounded by maxBinaryBytes.
 func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
+	return downloadAndReplaceLimited(ctx, url, dst, wantSum, maxBinaryBytes)
+}
+
+// downloadAndReplaceLimited takes the ceiling as an argument so a test can
+// exercise the bound without generating half a gigabyte, and so the limit is
+// not mutable package state on a security path.
+func downloadAndReplaceLimited(ctx context.Context, url, dst, wantSum string, maxBytes int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", "anchored-updater")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := noDowngradeClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -304,48 +334,51 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 	defer gz.Close()
 
 	tr := tar.NewReader(gz)
-	tmpPath := dst + ".new"
-	tmp, err := createStagingFile(tmpPath)
+	tmp, err := createStagingFile(filepath.Dir(dst))
 	if err != nil {
 		return err
 	}
+	tmpPath := tmp.Name()
 
 	written := false
+	// Cumulative, and checked before the entry filter: tar.Next must inflate
+	// and discard a skipped entry in full, so a decoy named anything but
+	// "anchored" would otherwise burn CPU and bandwidth unbounded.
+	budget := maxBytes
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			tmp.Close()
-			os.Remove(tmpPath)
-			return fmt.Errorf("tar: %w", err)
+			return abortStaging(tmp, tmpPath, fmt.Errorf("tar: %w", err))
 		}
+		if hdr.Size > budget {
+			return abortStaging(tmp, tmpPath,
+				fmt.Errorf("tar entry %q declares %d bytes, over the remaining %d byte budget", hdr.Name, hdr.Size, budget))
+		}
+		budget -= hdr.Size
 		if hdr.Typeflag != tar.TypeReg || filepath.Base(hdr.Name) != "anchored" {
 			continue
 		}
-		if hdr.Size > maxBinaryBytes {
-			return abortStaging(tmp, tmpPath,
-				fmt.Errorf("tar entry %q declares %d bytes, over the %d limit", hdr.Name, hdr.Size, maxBinaryBytes))
-		}
 		// Rejected rather than truncated: a clipped binary that happened to
 		// match its digest would install and then fail at runtime.
-		n, err := io.CopyN(tmp, tr, maxBinaryBytes+1)
-		if err != nil && !errors.Is(err, io.EOF) {
+		if _, err := io.CopyN(tmp, tr, hdr.Size); err != nil {
 			return abortStaging(tmp, tmpPath, fmt.Errorf("write tmp: %w", err))
-		}
-		if n > maxBinaryBytes {
-			return abortStaging(tmp, tmpPath, fmt.Errorf("payload exceeds the %d byte limit", maxBinaryBytes))
 		}
 		written = true
 		break
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
+		if rmErr := os.Remove(tmpPath); rmErr != nil {
+			return fmt.Errorf("close tmp: %w (and %s could not be removed: %v)", err, tmpPath, rmErr)
+		}
 		return fmt.Errorf("close tmp: %w", err)
 	}
 	if !written {
-		os.Remove(tmpPath)
+		if rmErr := os.Remove(tmpPath); rmErr != nil {
+			return fmt.Errorf("anchored binary not found in tarball (and %s could not be removed: %v)", tmpPath, rmErr)
+		}
 		return errors.New("anchored binary not found in tarball")
 	}
 
@@ -353,13 +386,19 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 	// covers the full tar.gz payload, then compare.
 	// Bounded like the extraction: this writes nowhere, but an endless body
 	// would otherwise burn the whole download timeout for nothing.
-	if _, err := io.CopyN(io.Discard, tee, maxBinaryBytes+1); err != nil && !errors.Is(err, io.EOF) {
-		os.Remove(tmpPath)
+	if _, err := io.CopyN(io.Discard, tee, maxBytes+1); err != nil && !errors.Is(err, io.EOF) {
+		if rmErr := os.Remove(tmpPath); rmErr != nil {
+			return fmt.Errorf("drain body: %w (and %s could not be removed: %v)", err, tmpPath, rmErr)
+		}
 		return fmt.Errorf("drain body: %w", err)
 	}
 	gotSum := hex.EncodeToString(hasher.Sum(nil))
 	if gotSum != strings.ToLower(wantSum) {
-		os.Remove(tmpPath)
+		// A leaked staging file here holds an unverified payload, so a failed
+		// cleanup is reported rather than dropped.
+		if rmErr := os.Remove(tmpPath); rmErr != nil {
+			return fmt.Errorf("checksum mismatch: want %s got %s (and the unverified payload at %s could not be removed: %v)", wantSum, gotSum, tmpPath, rmErr)
+		}
 		return fmt.Errorf("checksum mismatch: want %s got %s", wantSum, gotSum)
 	}
 
@@ -370,21 +409,13 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 	prevPath := dst + ".prev"
 	backedUp := false
 	if _, statErr := os.Stat(dst); statErr == nil {
-		// A symlink here would be followed by Remove's caller expectations
-		// and could point the "backup" anywhere; refuse instead.
-		if fi, err := os.Lstat(prevPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
-			if rmErr := os.Remove(tmpPath); rmErr != nil {
-				return fmt.Errorf("refusing to install: %s is a symlink (and %s could not be cleaned up: %v)", prevPath, tmpPath, rmErr)
-			}
-			return fmt.Errorf("refusing to install: %s is a symlink", prevPath)
-		}
 		if err := os.Remove(prevPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			if rmErr := os.Remove(tmpPath); rmErr != nil {
 				return fmt.Errorf("clear stale backup %s: %w (and %s could not be cleaned up: %v)", prevPath, err, tmpPath, rmErr)
 			}
 			return fmt.Errorf("clear stale backup %s: %w", prevPath, err)
 		}
-		if err := os.Link(dst, prevPath); err != nil {
+		if err := backupCurrent(dst, prevPath); err != nil {
 			if rmErr := os.Remove(tmpPath); rmErr != nil {
 				return fmt.Errorf("backup current: %w (and %s could not be cleaned up: %v)", err, tmpPath, rmErr)
 			}
@@ -410,6 +441,54 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 	return nil
 }
 
+// backupCurrent links dst to prevPath so dst keeps existing for the whole
+// swap — a client spawning `anchored serve` mid-update never finds the path
+// missing, and the following rename is a true atomic replacement.
+//
+// Filesystems without hardlinks (FAT, exFAT, some fuse and overlay mounts)
+// fall back to a rename, which reopens the brief window where dst is absent.
+// A degraded backup beats refusing to update at all, which is what an
+// unconditional Link did.
+func backupCurrent(dst, prevPath string) error {
+	err := os.Link(dst, prevPath)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, errors.ErrUnsupported) && !errors.Is(err, syscall.EXDEV) && !errors.Is(err, syscall.EPERM) {
+		return err
+	}
+	return os.Rename(dst, prevPath)
+}
+
+// assertTrustedDownloadURL rejects a release document that points the download
+// somewhere other than GitHub, or at plaintext HTTP.
+//
+// SECURITY INVARIANT: browser_download_url comes from the release JSON, which
+// is attacker-controlled if the API or a proxy in front of it is, and the
+// digest offers nothing because checksums.txt comes from the same document.
+// Without this, a tampered document could move the fetch to http:// and the
+// transport guarantee the docs claim would not hold. Skipped when the release
+// API itself is not https, which is how tests point at a local server.
+func assertTrustedDownloadURL(raw string) error {
+	// Both seams are consulted: a test may override either endpoint.
+	if !strings.HasPrefix(releaseAPIURL, "https://") || !strings.HasPrefix(releaseTagAPIURL, "https://") {
+		return nil
+	}
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("unparseable download URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("refusing a %s download URL: %s", u.Scheme, raw)
+	}
+	host := u.Hostname()
+	if host != "github.com" && host != "objects.githubusercontent.com" &&
+		!strings.HasSuffix(host, ".githubusercontent.com") {
+		return fmt.Errorf("refusing a download URL outside GitHub: %s", host)
+	}
+	return nil
+}
+
 // abortStaging closes and removes the staging file, folding any cleanup
 // failure into the error being reported: a leaked <bin>.new holds an
 // unverified payload.
@@ -427,36 +506,24 @@ func abortStaging(tmp *os.File, tmpPath string, cause error) error {
 	return fmt.Errorf("%w (cleanup also failed: %s)", cause, strings.Join(problems, "; "))
 }
 
-// createStagingFile opens the file the new binary is written to, refusing to
-// reuse anything already at that path.
+// createStagingFile opens the file the new binary is written to.
 //
 // SECURITY INVARIANT: this file becomes the installed binary via rename, so
-// whoever owns it owns what the machine executes afterwards. O_CREATE alone
-// preserves the owner and mode of an existing file, so a regular file planted
-// here by another user would receive the genuine release bytes and then be
-// renamed into place — still writable by them. O_EXCL refuses that, oNoFollow
-// refuses a symlink, and the mode is set on the descriptor rather than left to
-// umask. A stale file from a crashed run is removed first, but only after
-// Lstat confirms it is not a symlink.
-func createStagingFile(tmpPath string) (*os.File, error) {
-	if fi, err := os.Lstat(tmpPath); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("refusing to install: %s is a symlink", tmpPath)
-		}
-		if !fi.Mode().IsRegular() {
-			return nil, fmt.Errorf("refusing to install: %s is not a regular file", tmpPath)
-		}
-		if err := os.Remove(tmpPath); err != nil {
-			return nil, fmt.Errorf("remove stale %s: %w", tmpPath, err)
-		}
-	}
-
-	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY|oNoFollow, 0o700)
+// whoever owns it owns what the machine executes afterwards. The name is
+// unique per call (CreateTemp opens with O_EXCL), which rules out three
+// things at once: a regular file planted here keeping its owner and mode
+// under O_CREATE, a symlink being written through, and a second updater
+// unlinking this call's inode and having its own partial download published
+// by our rename. Serve starts an updater on every MCP launch, so two clients
+// opening at once is ordinary, not exotic. The mode is set on the descriptor
+// rather than left to umask.
+func createStagingFile(dir string) (*os.File, error) {
+	tmp, err := os.CreateTemp(dir, ".anchored-new-")
 	if err != nil {
-		return nil, fmt.Errorf("create %s: %w", tmpPath, err)
+		return nil, fmt.Errorf("create staging file in %s: %w", dir, err)
 	}
-	if err := tmp.Chmod(0o755); err != nil && !errors.Is(err, errors.ErrUnsupported) {
-		return nil, abortStaging(tmp, tmpPath, fmt.Errorf("chmod %s: %w", tmpPath, err))
+	if err := tmp.Chmod(0o755); err != nil {
+		return nil, abortStaging(tmp, tmp.Name(), fmt.Errorf("chmod %s: %w", tmp.Name(), err))
 	}
 	return tmp, nil
 }

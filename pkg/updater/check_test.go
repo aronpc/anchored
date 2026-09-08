@@ -1,8 +1,12 @@
 package updater
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -410,81 +414,65 @@ func TestCheck_OlderTagIsRefusedAsNotNewer(t *testing.T) {
 }
 
 // The staging file becomes the installed binary via rename, so whoever owns it
-// owns what the machine runs next. These three cases are the ones that made
-// the old O_CREATE|O_TRUNC open a local privilege escalation on any install
-// directory writable by more than one principal.
-func TestCreateStagingFile_RefusesASymlink(t *testing.T) {
+// owns what the machine runs next. A unique name per call is what rules out a
+// planted file keeping its owner, a symlink being written through, and a
+// second updater publishing this call's rename.
+func TestCreateStagingFile_NameIsUniquePerCall(t *testing.T) {
 	dir := t.TempDir()
-	victim := filepath.Join(dir, "victim")
-	if err := os.WriteFile(victim, []byte("ORIGINAL SECRET"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	tmpPath := filepath.Join(dir, "anchored.new")
-	if err := os.Symlink(victim, tmpPath); err != nil {
-		t.Fatal(err)
-	}
 
-	if _, err := createStagingFile(tmpPath); err == nil {
-		t.Fatal("a symlink at the staging path must be refused, not followed")
-	}
-	got, err := os.ReadFile(victim)
+	a, err := createStagingFile(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "ORIGINAL SECRET" {
-		t.Fatalf("wrote through the symlink: victim is now %q", got)
+	defer closeStaging(t, a)
+	b, err := createStagingFile(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeStaging(t, b)
+
+	if a.Name() == b.Name() {
+		t.Fatalf("two concurrent updaters got the same staging path: %s", a.Name())
 	}
 }
 
-// A file planted by another user keeps its owner and mode under O_CREATE, so
-// reusing it would hand them the installed binary. It must be replaced, not
-// written into.
-func TestCreateStagingFile_ReplacesAStaleFileRatherThanReusingIt(t *testing.T) {
+// A pre-existing file at a name the updater might have used is irrelevant now,
+// but the property that matters is that createStagingFile never adopts one.
+func TestCreateStagingFile_NeverAdoptsAnExistingFile(t *testing.T) {
 	dir := t.TempDir()
-	tmpPath := filepath.Join(dir, "anchored.new")
-	if err := os.WriteFile(tmpPath, []byte("PLANTED"), 0o666); err != nil {
+	planted := filepath.Join(dir, "anchored.new")
+	if err := os.WriteFile(planted, []byte("PLANTED"), 0o666); err != nil {
 		t.Fatal(err)
 	}
 
-	f, err := createStagingFile(tmpPath)
+	f, err := createStagingFile(dir)
 	if err != nil {
-		t.Fatalf("a stale regular file should be replaced: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := f.Close(); err != nil {
-			t.Errorf("close staging file: %v", err)
-		}
-	})
+	defer closeStaging(t, f)
 
-	fi, err := os.Stat(tmpPath)
+	if f.Name() == planted {
+		t.Fatal("adopted the planted file")
+	}
+	if got, _ := os.ReadFile(planted); string(got) != "PLANTED" {
+		t.Errorf("the planted file was disturbed: %q", got)
+	}
+	fi, err := os.Stat(f.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if fi.Size() != 0 {
-		t.Errorf("stale content survived: %d bytes", fi.Size())
+		t.Errorf("staging file is not empty: %d bytes", fi.Size())
 	}
 	if perm := fi.Mode().Perm(); perm != 0o755 {
 		t.Errorf("mode = %04o, want 0755 — an inherited 0666 would leave the installed binary writable", perm)
 	}
 }
 
-func TestCreateStagingFile_CreatesExecutableAndEmpty(t *testing.T) {
-	tmpPath := filepath.Join(t.TempDir(), "anchored.new")
-	f, err := createStagingFile(tmpPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := f.Close(); err != nil {
-			t.Errorf("close staging file: %v", err)
-		}
-	})
-	fi, err := os.Stat(tmpPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if perm := fi.Mode().Perm(); perm != 0o755 {
-		t.Errorf("mode = %04o, want 0755", perm)
+func closeStaging(t *testing.T, f *os.File) {
+	t.Helper()
+	if err := f.Close(); err != nil {
+		t.Errorf("close staging file: %v", err)
 	}
 }
 
@@ -493,10 +481,6 @@ func TestCreateStagingFile_CreatesExecutableAndEmpty(t *testing.T) {
 // this, a few-MB gzip of zeroes writes hundreds of GB — and it needs no user
 // present, since serve starts the updater on every MCP launch.
 func TestDownloadAndReplace_RejectsAnOversizePayload(t *testing.T) {
-	orig := maxBinaryBytes
-	maxBinaryBytes = 64
-	t.Cleanup(func() { maxBinaryBytes = orig })
-
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "anchored")
 	if err := os.WriteFile(dst, []byte("OLD"), 0o755); err != nil {
@@ -511,18 +495,61 @@ func TestDownloadAndReplace_RejectsAnOversizePayload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := downloadAndReplace(context.Background(), srv.URL, dst, sum)
+	// The ceiling is injected rather than mutated: it is a security bound, so
+	// production code holds it as a const.
+	err := downloadAndReplaceLimited(context.Background(), srv.URL, dst, sum, 64)
 	if err == nil {
 		t.Fatal("an oversize payload must be rejected")
 	}
-	if !strings.Contains(err.Error(), "limit") {
-		t.Errorf("error should name the limit, got %v", err)
+	if !strings.Contains(err.Error(), "budget") {
+		t.Errorf("error should name the budget, got %v", err)
 	}
 	if got, _ := os.ReadFile(dst); string(got) != "OLD" {
 		t.Errorf("the installed binary was touched: %q", got)
 	}
-	if _, err := os.Stat(dst + ".new"); err == nil {
-		t.Error(".new leaked after rejection")
+	leaked, _ := filepath.Glob(filepath.Join(dir, ".anchored-new-*"))
+	if len(leaked) != 0 {
+		t.Errorf("staging file leaked after rejection: %v", leaked)
+	}
+}
+
+// A decoy entry named anything but "anchored" is still inflated in full by
+// tar.Next, so the budget has to be charged before the name filter.
+func TestDownloadAndReplace_ChargesSkippedEntriesToTheBudget(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "anchored")
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	decoy := bytes.Repeat([]byte{0}, 4096)
+	if err := tw.WriteHeader(&tar.Header{Name: "decoy", Mode: 0o644, Size: int64(len(decoy)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(decoy); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(buf.Bytes())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write(buf.Bytes()); err != nil {
+			t.Errorf("write tarball: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	err := downloadAndReplaceLimited(context.Background(), srv.URL, dst, hex.EncodeToString(sum[:]), 64)
+	if err == nil {
+		t.Fatal("a decoy entry over the budget must be rejected")
+	}
+	if !strings.Contains(err.Error(), "decoy") {
+		t.Errorf("error should name the offending entry, got %v", err)
 	}
 }
 
@@ -650,5 +677,35 @@ func TestCheck_RejectsAHostileTargetBeforeAnyRequest(t *testing.T) {
 	}
 	if requests != 0 {
 		t.Errorf("a rejected target must not reach the network, got %d requests", requests)
+	}
+}
+
+// browser_download_url comes from the release document, so a tampered or
+// proxied response could move the fetch to plaintext. The digest cannot catch
+// it: checksums.txt comes from the same document.
+func TestAssertTrustedDownloadURL(t *testing.T) {
+	origA, origT := releaseAPIURL, releaseTagAPIURL
+	releaseAPIURL = "https://api.github.com/repos/%s/releases/latest"
+	releaseTagAPIURL = "https://api.github.com/repos/%s/releases/tags/%s"
+	t.Cleanup(func() { releaseAPIURL, releaseTagAPIURL = origA, origT })
+
+	for _, ok := range []string{
+		"https://github.com/o/r/releases/download/v1.0.0/a.tar.gz",
+		"https://objects.githubusercontent.com/x",
+		"https://release-assets.githubusercontent.com/y",
+	} {
+		if err := assertTrustedDownloadURL(ok); err != nil {
+			t.Errorf("%s should be accepted: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"http://github.com/o/r/releases/download/v1.0.0/a.tar.gz",
+		"https://evil.example.com/a.tar.gz",
+		"https://github.com.evil.example.com/a.tar.gz",
+		"ftp://github.com/a",
+	} {
+		if err := assertTrustedDownloadURL(bad); err == nil {
+			t.Errorf("%s should be refused", bad)
+		}
 	}
 }
