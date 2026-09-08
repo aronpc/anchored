@@ -69,9 +69,9 @@ First run creates `~/.anchored/` and downloads the local embedding model when ne
 ### Updating
 
 ```bash
-anchored self-update             # install the latest release
+anchored self-update             # install the latest release; exits 0 if already current
 anchored self-update --check     # report only; exits 10 when an update is available
-anchored self-update --version v0.17.0   # pin or roll back to a release
+anchored self-update --version v0.17.0   # pin to a release (a downgrade needs --force)
 ```
 
 The download is verified against the release checksums before anything is
@@ -84,6 +84,11 @@ Automatic background updates apply only to a release binary installed in
 since overwriting it would revert your own work to the release tag. When that
 is what you want, `--force` says so explicitly and asks before replacing it.
 `anchored doctor` reports when a release is available.
+
+Self-update trusts GitHub's release infrastructure. The checksum it verifies
+protects the download from corruption and tampering in transit; it does not
+prove who built the binary. Signing is planned — see
+[docs/release-signing.md](docs/release-signing.md).
 
 ## Setup
 

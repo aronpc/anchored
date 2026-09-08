@@ -24,6 +24,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with no signal at all. `--force` overrides it, asks before replacing a dev
   build (`--yes` to confirm up front), and reaches the plugin too — both halves
   were frozen by the same guard.
+- **`docs/release-signing.md`** — the plan to sign `checksums.txt` with a key
+  compiled into the binary, and an explicit statement of what the current
+  checksum verification does and does not prove. Self-update trusts GitHub's
+  release infrastructure today; the digest protects the transfer, not the
+  artifact.
 - **Release check in `anchored doctor`** — reports when a newer release is
   available and hands over the command. Best-effort: with no network it degrades
   to "not checked" and never fails the run.
