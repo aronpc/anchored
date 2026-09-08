@@ -90,8 +90,7 @@ is what you want, `--force` says so explicitly and asks before replacing it.
 
 Self-update trusts GitHub's release infrastructure. The checksum it verifies
 protects the download from corruption and tampering in transit; it does not
-prove who built the binary. Signing is planned — see
-[docs/release-signing.md](docs/release-signing.md).
+prove who built the binary.
 
 ## Setup
 
