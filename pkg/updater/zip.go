@@ -50,7 +50,9 @@ func installFromZip(body io.Reader, hasher hash.Hash, tmp *os.File, tmpPath, dst
 			return abortStaging(tmp, tmpPath, fmt.Errorf("open zip entry: %w", err))
 		}
 		written, err := io.CopyN(tmp, rc, maxBytes+1)
-		rc.Close()
+		if closeErr := rc.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			return abortStaging(tmp, tmpPath, fmt.Errorf("write tmp: %w", err))
 		}
