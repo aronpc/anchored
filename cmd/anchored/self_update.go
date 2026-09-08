@@ -121,7 +121,7 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	}
 
 	fmt.Print(renderSelfUpdateInstalled(res))
-	fmt.Print(renderPluginSyncOutcome(syncPluginAfterUpdate(*configPath, *noPlugin, *force)))
+	fmt.Print(renderPluginSyncOutcome(syncPluginAfterUpdate(*configPath, res.Latest, *noPlugin, *force)))
 }
 
 // pluginSyncOutcome is the plugin half of an update, reported separately on
@@ -136,7 +136,11 @@ type pluginSyncOutcome struct {
 	Drift              PluginDrift
 }
 
-func syncPluginAfterUpdate(configPath string, noPlugin, force bool) pluginSyncOutcome {
+// syncPluginAfterUpdate takes installedVersion rather than reading the
+// package-level Version: by the time this runs the binary has been replaced,
+// so Version still reports the release this process was compiled as — the OLD
+// one. Drift is measured against what is now on disk.
+func syncPluginAfterUpdate(configPath, installedVersion string, noPlugin, force bool) pluginSyncOutcome {
 	if noPlugin {
 		return pluginSyncOutcome{Skipped: true}
 	}
@@ -155,10 +159,7 @@ func syncPluginAfterUpdate(configPath string, noPlugin, force bool) pluginSyncOu
 		return out
 	}
 
-	drift := detectPluginDrift(cfg, Version)
-	if force {
-		drift = detectPluginDriftForced(cfg)
-	}
+	drift := detectPluginDriftWithForce(cfg, installedVersion, force)
 	out.Drift = applyPluginAutoUpdate(drift)
 	return out
 }

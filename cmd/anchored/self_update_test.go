@@ -395,7 +395,7 @@ func devBuildResult() updater.Result {
 
 // The dev-build guard is what froze the plugin at 0.17.0 while releases moved
 // on. An explicit request has to be able to read the state it hides.
-func TestDetectPluginDriftForced_IgnoresTheDevBuildGuard(t *testing.T) {
+func TestDetectPluginDriftWithForce_IgnoresTheDevBuildGuard(t *testing.T) {
 	cacheDir := t.TempDir()
 	mirrorDir := t.TempDir()
 	seedPluginCache(t, cacheDir, "0.17.0")
@@ -409,18 +409,42 @@ func TestDetectPluginDriftForced_IgnoresTheDevBuildGuard(t *testing.T) {
 		t.Fatalf("guarded detection should still see nothing on a dev build, got %+v", d)
 	}
 
-	f := detectPluginDriftForced(cfg)
+	f := detectPluginDriftWithForce(cfg, "v0.17.0-dev+gabc", true)
 	if f.MirrorVersion != "0.18.0" || f.CacheVersion != "0.17.0" {
 		t.Fatalf("forced detection did not read the versions: %+v", f)
 	}
-	if !f.CacheBehind {
-		t.Error("cache 0.17.0 against mirror 0.18.0 must count as behind")
-	}
 	// On an explicit request the mirror is always worth refreshing: the point
 	// is to fetch the newest plugin, not to infer it from a version stamp
-	// that cannot be compared.
+	// that cannot be compared. MirrorBehind is the field applyPluginAutoUpdate
+	// actually reads — it recomputes CacheBehind itself.
 	if !f.MirrorBehind {
 		t.Error("forced detection should always try to refresh the mirror")
+	}
+}
+
+// The bug this catches: syncPluginAfterUpdate runs AFTER the binary was
+// swapped, so reading the package-level Version yields the release this
+// process was compiled as — the old one. Drift then compares the mirror
+// against the version that no longer exists on disk, finds nothing behind,
+// and prints "already current" while leaving the plugin exactly as stale.
+func TestDetectPluginDrift_MeasuresAgainstTheInstalledVersion(t *testing.T) {
+	cacheDir := t.TempDir()
+	mirrorDir := t.TempDir()
+	seedPluginCache(t, cacheDir, "0.17.0")
+	seedMirrorManifest(t, mirrorDir, "0.17.0")
+
+	cfg := &config.Config{}
+	cfg.Plugin.CacheDir = cacheDir
+	cfg.Plugin.MarketplaceDir = mirrorDir
+
+	// Reading the pre-swap version: mirror 0.17.0 vs binary 0.17.0, nothing
+	// looks behind, so no refresh is attempted.
+	if d := detectPluginDrift(cfg, "0.17.0"); d.MirrorBehind {
+		t.Fatal("precondition: mirror level with the old version should look current")
+	}
+	// Reading what is now on disk: the mirror trails it, so a refresh runs.
+	if d := detectPluginDrift(cfg, "0.18.0"); !d.MirrorBehind {
+		t.Error("mirror 0.17.0 against installed 0.18.0 must trigger a refresh")
 	}
 }
 
@@ -489,7 +513,7 @@ func TestSyncPluginAfterUpdate_MissingMarketplaceIsReportedNotSwallowed(t *testi
 		t.Fatal(err)
 	}
 
-	out := syncPluginAfterUpdate(cfgPath, false, true)
+	out := syncPluginAfterUpdate(cfgPath, "0.18.0", false, true)
 	if !out.MarketplaceMissing {
 		t.Fatalf("missing marketplace not detected: %+v", out)
 	}
@@ -502,7 +526,7 @@ func TestSyncPluginAfterUpdate_MissingMarketplaceIsReportedNotSwallowed(t *testi
 }
 
 func TestSyncPluginAfterUpdate_NoPluginSkipsEverything(t *testing.T) {
-	out := syncPluginAfterUpdate("", true, true)
+	out := syncPluginAfterUpdate("", "0.18.0", true, true)
 	if !out.Skipped {
 		t.Fatal("--no-plugin must skip")
 	}
