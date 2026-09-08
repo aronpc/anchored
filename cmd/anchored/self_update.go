@@ -24,6 +24,10 @@ const exitUpdateAvailable = 10
 const (
 	selfUpdateCheckTimeout = 15 * time.Second
 	selfUpdateApplyTimeout = 3 * time.Minute
+
+	// Shorter than the interactive check: doctor is advisory and already runs
+	// several remote probes, so a slow release lookup should not stall it.
+	doctorReleaseTimeout = 5 * time.Second
 )
 
 func runSelfUpdate(args []string) {
@@ -76,7 +80,7 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 		if *jsonOut {
 			fmt.Println(renderSelfUpdateJSON(res))
 		} else {
-			fmt.Print(renderSelfUpdateCheck(res))
+			fmt.Print(renderSelfUpdateCheck(res, *target))
 		}
 		os.Exit(selfUpdateExitCode(res))
 	}
@@ -95,7 +99,7 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 			if res.Blocked == updater.BlockNotNewer && *target != "" {
 				fmt.Fprint(os.Stderr, renderDowngradeRefusal(res))
 			} else {
-				fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res))
+				fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res, *target))
 			}
 			os.Exit(1)
 		}
@@ -206,6 +210,8 @@ func renderPluginSyncOutcome(o pluginSyncOutcome) string {
 		fmt.Fprintf(&b, "  → could not install the plugin: %s\n    The binary update stands; the plugin is unchanged.\n", d.CacheInstallError)
 	case d.CacheInstalled:
 		fmt.Fprintf(&b, "  → installed plugin %s. Restart Claude Code to load it.\n", formatV(d.CacheVersion))
+	case d.SyncPerformed && d.CacheVersion == "":
+		b.WriteString("  → mirror refreshed; no plugin is installed from it.\n")
 	case d.SyncPerformed:
 		fmt.Fprintf(&b, "  → mirror refreshed; the installed plugin %s is already current.\n", formatV(d.CacheVersion))
 	default:
@@ -219,7 +225,7 @@ func renderPluginSyncOutcome(o pluginSyncOutcome) string {
 // by construction — a doctor that goes red without network is a doctor people
 // stop running.
 func checkReleaseAvailable() {
-	ctx, cancel := context.WithTimeout(context.Background(), selfUpdateCheckTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), doctorReleaseTimeout)
 	defer cancel()
 
 	res, err := updater.Check(ctx, updater.Options{
@@ -242,7 +248,7 @@ func releaseCheckResult(res updater.Result, err error) (status, detail, fix stri
 
 	switch {
 	case res.Blocked == updater.BlockNone && res.Newer:
-		return "failed", fmt.Sprintf("%s is available (installed %s)", formatV(res.Latest), formatV(res.Current)),
+		return "warn", fmt.Sprintf("%s is available (installed %s)", formatV(res.Latest), formatV(res.Current)),
 			"anchored self-update"
 
 	case res.Blocked != updater.BlockNone && res.Newer:
@@ -452,14 +458,18 @@ func renderSelfUpdateJSON(res updater.Result) string {
 
 // renderSelfUpdateCheck renders the human report: versions, the file that
 // would be replaced, and a verdict that always names its own cause.
-func renderSelfUpdateCheck(res updater.Result) string {
+func renderSelfUpdateCheck(res updater.Result, target string) string {
 	var b strings.Builder
 
 	fmt.Fprintf(&b, "installed  %s\n", formatV(res.Current))
-	if res.Latest != "" {
-		fmt.Fprintf(&b, "latest     %s\n", formatV(res.Latest))
-	} else {
+	switch {
+	case res.Latest == "":
 		fmt.Fprintf(&b, "latest     unknown (release not resolved)\n")
+	case target != "":
+		// Calling a pinned version "latest" is simply false.
+		fmt.Fprintf(&b, "target     %s\n", formatV(res.Latest))
+	default:
+		fmt.Fprintf(&b, "latest     %s\n", formatV(res.Latest))
 	}
 	fmt.Fprintf(&b, "binary     %s\n\n", res.BinPath)
 	b.WriteString(selfUpdateVerdict(res))

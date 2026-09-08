@@ -68,7 +68,7 @@ func TestRenderSelfUpdateCheck_ExplainsEveryBlockReason(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.reason), func(t *testing.T) {
-			out := renderSelfUpdateCheck(updater.Result{
+			out := renderSelfUpdateCheckT(updater.Result{
 				Current: "0.17.0-dev+gabc",
 				Latest:  "0.18.0",
 				BinPath: "/home/u/.anchored/bin/anchored",
@@ -84,7 +84,7 @@ func TestRenderSelfUpdateCheck_ExplainsEveryBlockReason(t *testing.T) {
 }
 
 func TestRenderSelfUpdateCheck_ShowsVersionsAndPath(t *testing.T) {
-	out := renderSelfUpdateCheck(updater.Result{
+	out := renderSelfUpdateCheckT(updater.Result{
 		Current: "0.17.0",
 		Latest:  "0.18.0",
 		BinPath: "/home/u/.anchored/bin/anchored",
@@ -98,7 +98,7 @@ func TestRenderSelfUpdateCheck_ShowsVersionsAndPath(t *testing.T) {
 }
 
 func TestRenderSelfUpdateCheck_UnknownLatestWhenUnresolved(t *testing.T) {
-	out := renderSelfUpdateCheck(updater.Result{
+	out := renderSelfUpdateCheckT(updater.Result{
 		Current: "0.17.0",
 		BinPath: "/home/u/.anchored/bin/anchored",
 		Blocked: updater.BlockEnvDisabled,
@@ -617,5 +617,36 @@ func TestRenderDowngradeRefusal_ExplainsItselfAndTheOverride(t *testing.T) {
 	// The old wording claimed the older version was already installed.
 	if strings.Contains(out, "Up to date") {
 		t.Errorf("a requested downgrade is not 'up to date'\n---\n%s", out)
+	}
+}
+
+// renderSelfUpdateCheckT keeps the existing render assertions readable now
+// that the renderer needs to know whether a version was pinned.
+func renderSelfUpdateCheckT(res updater.Result) string {
+	return renderSelfUpdateCheck(res, "")
+}
+
+func TestRenderSelfUpdateCheck_LabelsAPinnedVersionAsTarget(t *testing.T) {
+	out := renderSelfUpdateCheck(updater.Result{
+		Current: "0.18.0", Latest: "0.16.0", BinPath: "/b",
+	}, "v0.16.0")
+	if strings.Contains(out, "latest") {
+		t.Errorf("a pinned version is not 'latest'\n---\n%s", out)
+	}
+	if !strings.Contains(out, "target") {
+		t.Errorf("expected a target label\n---\n%s", out)
+	}
+}
+
+func TestReleaseCheckResult_UsesAStatusDoctorCanRender(t *testing.T) {
+	status, _, _ := releaseCheckResult(updater.Result{
+		Current: "0.17.0", Latest: "0.18.0", Newer: true,
+	}, nil)
+	// recordCheck has no "failed" arm, so that status renders as a blank box.
+	if status == "failed" {
+		t.Error(`"failed" has no render arm in recordCheck; use "warn"`)
+	}
+	if status != "warn" {
+		t.Errorf("status = %q, want warn", status)
 	}
 }
