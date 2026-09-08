@@ -201,6 +201,47 @@ func renderPluginSyncOutcome(o pluginSyncOutcome) string {
 	return b.String()
 }
 
+// checkReleaseAvailable is the doctor's probe: it closes the loop between
+// noticing you are behind and knowing the command that fixes it. Best-effort
+// by construction — a doctor that goes red without network is a doctor people
+// stop running.
+func checkReleaseAvailable() {
+	ctx, cancel := context.WithTimeout(context.Background(), selfUpdateCheckTimeout)
+	defer cancel()
+
+	res, err := updater.Check(ctx, updater.Options{
+		CurrentVersion: selfUpdateCurrentVersion(Version),
+		BinPath:        anchoredBinaryPath(),
+		AlwaysResolve:  true,
+	})
+	status, detail, fix := releaseCheckResult(res, err)
+	recordCheck(status, "release", detail, fix, false)
+}
+
+func releaseCheckResult(res updater.Result, err error) (status, detail, fix string) {
+	if err != nil || res.Latest == "" {
+		reason := "release not checked (offline?)"
+		if err != nil {
+			reason = "release not checked: " + err.Error()
+		}
+		return "skipped", reason, ""
+	}
+
+	switch {
+	case res.Blocked == updater.BlockNone && res.Newer:
+		return "failed", fmt.Sprintf("%s is available (installed %s)", formatV(res.Latest), formatV(res.Current)),
+			"anchored self-update"
+
+	case res.Blocked != updater.BlockNone && res.Newer:
+		// Refused, so nothing is wrong — but the version is worth naming, and
+		// the command that would install it anyway is worth handing over.
+		return "skipped", fmt.Sprintf("%s is available but refused (%s); installed %s",
+				formatV(res.Latest), res.Blocked, formatV(res.Current)),
+			"anchored self-update --force"
+	}
+	return "ok", fmt.Sprintf("up to date (%s)", formatV(res.Latest)), ""
+}
+
 // forceOverridable reports whether --force may install past a refusal. Only
 // the refusals a user can legitimately decide against are listed: an
 // unrecognized reason keeps refusing, so a guard added later is not silently

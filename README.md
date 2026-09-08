@@ -66,6 +66,25 @@ sudo cp bin/anchored /usr/local/bin/
 
 First run creates `~/.anchored/` and downloads the local embedding model when needed (~470 MB).
 
+### Updating
+
+```bash
+anchored self-update             # install the latest release
+anchored self-update --check     # report only; exits 10 when an update is available
+anchored self-update --version v0.17.0   # pin or roll back to a release
+```
+
+The download is verified against the release checksums before anything is
+replaced, and the previous binary is kept at `<bin>.prev`, so one rename undoes
+an update. Restart your MCP clients afterwards — a running server holds the old
+binary until it exits.
+
+Automatic background updates apply only to a release binary installed in
+`~/.anchored/bin`. A binary built from a checkout is deliberately left alone,
+since overwriting it would revert your own work to the release tag. When that
+is what you want, `--force` says so explicitly and asks before replacing it.
+`anchored doctor` reports when a release is available.
+
 ## Setup
 
 ### Claude Code plugin
@@ -296,6 +315,7 @@ anchored                         Start MCP server over STDIO
 anchored serve                   Start MCP server over STDIO
 anchored init [--tool]           Register Anchored with supported tools
 anchored doctor [--cwd]          Diagnose binary, model, DB, and MCP registration
+anchored self-update             Update the BINARY from the latest release
 anchored stats                   Show memory counts and import status
 anchored stats --tokens          Show context tokens injected vs. baseline (7d)
 anchored dashboard [--addr]      Serve the local dashboard UI
@@ -304,7 +324,7 @@ anchored save <content>          Save a memory
 anchored search <query>          Search memories
 anchored list                    List memories
 anchored inspect <id>            Show full JSON metadata
-anchored update <id>             Revise a memory in place
+anchored update <id>             Revise a MEMORY in place (not the binary — see self-update)
 anchored forget <id>             Soft-delete a memory; --hard for permanent delete
 anchored export                  Export memories as JSON/JSONL
 

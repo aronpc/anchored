@@ -59,6 +59,7 @@ func runDoctor(args []string) {
 	checkMaintenanceTimer(home)
 	checkDebugLog(cfg, home)
 	checkPluginDrift(cfg)
+	checkReleaseAvailable()
 	anyReachable := checkRemoteConnectivity(cfg)
 	checkRemoteConfigSanity(cfg)
 	checkProjectIdentity(cfg, *cwd, anyReachable)

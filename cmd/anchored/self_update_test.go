@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -489,5 +490,57 @@ func TestSyncPluginAfterUpdate_NoPluginSkipsEverything(t *testing.T) {
 	}
 	if out.MarketplaceDir != "" {
 		t.Errorf("skipped sync should not resolve paths, got %q", out.MarketplaceDir)
+	}
+}
+
+// The doctor closes the discovery loop: you learn you are behind from the
+// diagnostic you already run, and it hands you the command.
+func TestReleaseCheckResult_ReportsAnAvailableUpdate(t *testing.T) {
+	status, detail, fix := releaseCheckResult(updater.Result{
+		Current: "0.17.0", Latest: "0.18.0", Newer: true,
+	}, nil)
+	if status == "ok" {
+		t.Errorf("an available update should not read as ok, got %q", status)
+	}
+	if !strings.Contains(detail, "0.18.0") {
+		t.Errorf("detail should name the release, got %q", detail)
+	}
+	if !strings.Contains(fix, "self-update") {
+		t.Errorf("fix should hand over the command, got %q", fix)
+	}
+}
+
+func TestReleaseCheckResult_OKWhenCurrent(t *testing.T) {
+	status, _, _ := releaseCheckResult(updater.Result{
+		Current: "0.18.0", Latest: "0.18.0", Blocked: updater.BlockNotNewer,
+	}, nil)
+	if status != "ok" {
+		t.Errorf("status = %q, want ok", status)
+	}
+}
+
+// No network must degrade, never fail: a doctor that goes red on a plane is
+// a doctor people stop running.
+func TestReleaseCheckResult_DegradesWhenUnreachable(t *testing.T) {
+	status, detail, _ := releaseCheckResult(updater.Result{Current: "0.18.0"}, errors.New("dial tcp: no route to host"))
+	if status != "skipped" {
+		t.Errorf("status = %q, want skipped", status)
+	}
+	if !strings.Contains(strings.ToLower(detail), "not checked") {
+		t.Errorf("detail should say it was not checked, got %q", detail)
+	}
+}
+
+// A dev build is not "behind" in a way the doctor should nag about, but it
+// should still say a release exists.
+func TestReleaseCheckResult_MentionsReleaseOnDevBuild(t *testing.T) {
+	status, detail, _ := releaseCheckResult(updater.Result{
+		Current: "0.17.0-dev+gabc", Latest: "0.18.0", Newer: true, Blocked: updater.BlockDevBuild,
+	}, nil)
+	if status == "failed" {
+		t.Error("a dev build is a deliberate state, not a failure")
+	}
+	if !strings.Contains(detail, "0.18.0") {
+		t.Errorf("detail should still name the release, got %q", detail)
 	}
 }
