@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +29,8 @@ func runSelfUpdate(args []string) {
 	fs := newFlagSet("self-update")
 	check := fs.Bool("check", false, "report the available version and exit without writing")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON ({current, latest, bin_path, update_available, blocked})")
+	force := fs.Bool("force", false, "install even when a guard refuses (dev build, non-canonical path, env kill switch, same version)")
+	assumeYes := fs.Bool("yes", false, "skip the confirmation prompt --force asks before overwriting a dev build")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: anchored self-update [--check] [--json]
 
@@ -34,6 +38,8 @@ Updates the anchored binary from the latest official release.
 
   --check   report only; never writes
   --json    machine-readable output
+  --force   install past a refusal you have decided against
+  --yes     skip the confirmation --force asks before replacing a dev build
 
 Exit codes: 0 nothing to do, 10 an update is available, 1 the check failed.
 
@@ -71,8 +77,23 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	// Apply mode. The user asked for an install, so a refusal is a failure
 	// here — unlike --check, where it is just the state of the world.
 	if res.Blocked != updater.BlockNone {
-		fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res))
-		os.Exit(1)
+		if !*force || !forceOverridable(res.Blocked) {
+			fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res))
+			os.Exit(1)
+		}
+		// Replacing a dev build is the one override that destroys work which
+		// exists nowhere else, so it is the one that asks first.
+		if res.Blocked == updater.BlockDevBuild {
+			ok, err := confirmDevBuildOverwrite(res, os.Stdin, os.Stdout, *assumeYes, stdinIsTTY())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "anchored self-update: %v\n", err)
+				os.Exit(1)
+			}
+			if !ok {
+				fmt.Fprintln(os.Stderr, "Aborted. Nothing was written.")
+				os.Exit(1)
+			}
+		}
 	}
 
 	// Checked before downloading: finding out about a read-only target after
@@ -92,6 +113,66 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	}
 
 	fmt.Print(renderSelfUpdateInstalled(res))
+}
+
+// forceOverridable reports whether --force may install past a refusal. Only
+// the refusals a user can legitimately decide against are listed: an
+// unrecognized reason keeps refusing, so a guard added later is not silently
+// bypassed by a flag that predates it.
+func forceOverridable(r updater.BlockReason) bool {
+	switch r {
+	case updater.BlockDevBuild,
+		updater.BlockOutsideCanonical,
+		updater.BlockEnvDisabled,
+		updater.BlockNotNewer,
+		updater.BlockNoVersion:
+		return true
+	default:
+		return false
+	}
+}
+
+// confirmDevBuildOverwrite asks before replacing a local build with a release.
+// With assumeYes it proceeds silently; with no terminal to ask it refuses
+// rather than inferring consent from silence.
+func confirmDevBuildOverwrite(res updater.Result, in io.Reader, out io.Writer, assumeYes, interactive bool) (bool, error) {
+	if assumeYes {
+		return true, nil
+	}
+	if !interactive {
+		return false, fmt.Errorf("replacing the dev build %s needs confirmation, but there is no terminal to ask; re-run with --yes to confirm up front", formatV(res.Current))
+	}
+
+	fmt.Fprintf(out, `This replaces a local dev build with a release binary:
+
+  %s  →  %s
+  %s
+
+The build you have now is kept at %s, so one rename undoes this.
+Anything you have not committed is not in the release.
+
+Continue? [y/N] `, formatV(res.Current), formatV(res.Latest), res.BinPath, res.BinPath+".prev")
+
+	answer, err := bufio.NewReader(in).ReadString('\n')
+	if err != nil && answer == "" {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+// stdinIsTTY reports whether stdin is a terminal. Stat beats a dependency for
+// a single check: a character device is a terminal, a pipe or file is not.
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 // ensureWritable reports whether the binary at path can be replaced. The swap

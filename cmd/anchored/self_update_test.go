@@ -270,3 +270,105 @@ func TestRenderSelfUpdateInstalled(t *testing.T) {
 		t.Errorf("success report does not tell the user to restart\n---\n%s", out)
 	}
 }
+
+// Only the refusals a user can legitimately decide against are overridable.
+// An unrecognized reason must keep refusing, so a future guard is not
+// silently bypassed by a flag that predates it.
+func TestForceOverridable(t *testing.T) {
+	overridable := []updater.BlockReason{
+		updater.BlockDevBuild,
+		updater.BlockOutsideCanonical,
+		updater.BlockEnvDisabled,
+		updater.BlockNotNewer,
+		updater.BlockNoVersion,
+	}
+	for _, r := range overridable {
+		if !forceOverridable(r) {
+			t.Errorf("%q should be overridable by --force", r)
+		}
+	}
+	if forceOverridable(updater.BlockReason("some-future-guard")) {
+		t.Error("an unknown reason must not be overridable")
+	}
+	if forceOverridable(updater.BlockNone) {
+		t.Error("BlockNone is not a refusal")
+	}
+}
+
+func TestConfirmDevBuildOverwrite_ProceedsOnYes(t *testing.T) {
+	var out strings.Builder
+	ok, err := confirmDevBuildOverwrite(devBuildResult(), strings.NewReader("y\n"), &out, false, true)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !ok {
+		t.Fatal("y should proceed")
+	}
+}
+
+func TestConfirmDevBuildOverwrite_DefaultsToNo(t *testing.T) {
+	for _, answer := range []string{"\n", "n\n", "no\n", "whatever\n"} {
+		var out strings.Builder
+		ok, err := confirmDevBuildOverwrite(devBuildResult(), strings.NewReader(answer), &out, false, true)
+		if err != nil {
+			t.Fatalf("answer %q: unexpected err: %v", answer, err)
+		}
+		if ok {
+			t.Errorf("answer %q should not proceed", answer)
+		}
+	}
+}
+
+func TestConfirmDevBuildOverwrite_AssumeYesSkipsThePrompt(t *testing.T) {
+	var out strings.Builder
+	ok, err := confirmDevBuildOverwrite(devBuildResult(), strings.NewReader(""), &out, true, false)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !ok {
+		t.Fatal("--yes should proceed")
+	}
+	if out.Len() != 0 {
+		t.Errorf("--yes should not print a prompt, got %q", out.String())
+	}
+}
+
+// Without a TTY there is nobody to answer, so consent cannot be assumed.
+func TestConfirmDevBuildOverwrite_AbortsWithoutTTY(t *testing.T) {
+	var out strings.Builder
+	ok, err := confirmDevBuildOverwrite(devBuildResult(), strings.NewReader(""), &out, false, false)
+	if ok {
+		t.Fatal("must not proceed without a TTY and without --yes")
+	}
+	if err == nil {
+		t.Fatal("expected an error explaining how to proceed")
+	}
+	if !strings.Contains(err.Error(), "--yes") {
+		t.Errorf("error should point at --yes, got %v", err)
+	}
+}
+
+func TestConfirmDevBuildOverwrite_PromptNamesTheStakes(t *testing.T) {
+	var out strings.Builder
+	if _, err := confirmDevBuildOverwrite(devBuildResult(), strings.NewReader("n\n"), &out, false, true); err != nil {
+		t.Fatal(err)
+	}
+	prompt := out.String()
+	// The user is about to lose a local build; the prompt has to say what is
+	// being replaced, with what, and where the old one goes.
+	for _, want := range []string{"0.17.0-dev+gabc", "0.18.0", ".prev"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing %q\n---\n%s", want, prompt)
+		}
+	}
+}
+
+func devBuildResult() updater.Result {
+	return updater.Result{
+		Current: "0.17.0-dev+gabc",
+		Latest:  "0.18.0",
+		BinPath: "/home/u/.anchored/bin/anchored",
+		Newer:   true,
+		Blocked: updater.BlockDevBuild,
+	}
+}

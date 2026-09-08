@@ -293,3 +293,23 @@ func TestCheck_ExecutableResolutionFailurePropagates(t *testing.T) {
 		t.Fatalf("want ErrResolveExecutable, got %v", err)
 	}
 }
+
+// A binary built without ldflags reports no version. The background path
+// stops there, but an explicit request must still be able to reach the
+// release and install over it.
+func TestCheck_AlwaysResolveWorksWithoutACurrentVersion(t *testing.T) {
+	fakeRelease(t, "0.18.0")
+	res, err := Check(context.Background(), Options{
+		BinPath:       canonicalBin(t),
+		AlwaysResolve: true,
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Blocked != BlockNoVersion {
+		t.Fatalf("Blocked = %q, want %q", res.Blocked, BlockNoVersion)
+	}
+	if res.Latest != "0.18.0" || res.AssetURL == "" {
+		t.Fatalf("release not resolved: %+v", res)
+	}
+}

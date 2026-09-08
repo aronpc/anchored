@@ -85,9 +85,11 @@ func Check(ctx context.Context, opts Options) (Result, error) {
 	if res.Blocked != BlockNone && !opts.AlwaysResolve {
 		return res, nil
 	}
-	if res.Current == "" {
-		// No version to compare against, so resolving a release would only
-		// spend a request to learn nothing actionable.
+	if res.Current == "" && !opts.AlwaysResolve {
+		// Nothing to compare against, so the background path would spend a
+		// request to learn nothing actionable. A caller that asked to always
+		// resolve still gets the release: installing the latest over an
+		// unversioned binary is a legitimate explicit request.
 		return res, nil
 	}
 
