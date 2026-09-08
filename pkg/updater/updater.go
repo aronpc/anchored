@@ -194,6 +194,12 @@ func fetchRelease(ctx context.Context, repo, tag string) (version string, assetU
 	if version == "" {
 		return "", "", "", "", errors.New("empty tag_name in release")
 	}
+	// tag_name comes from the release document, which is attacker-controlled
+	// if the API or a proxy is, and it reaches a copy-pasteable command via
+	// the CLI's refusal messages. GoReleaser only ever publishes versions.
+	if !semverTag.MatchString(version) {
+		return "", "", "", "", fmt.Errorf("release tag_name is not a version: %q", rel.TagName)
+	}
 
 	wantSuffix := fmt.Sprintf("_%s_%s_%s.tar.gz", version, runtime.GOOS, runtime.GOARCH)
 	for _, a := range rel.Assets {
@@ -405,9 +411,8 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 }
 
 // abortStaging closes and removes the staging file, folding any cleanup
-// failure into the error being reported. A leaked <bin>.new holds an
-// unverified payload, so a failure to remove it is worth surfacing rather
-// than discarding.
+// failure into the error being reported: a leaked <bin>.new holds an
+// unverified payload.
 func abortStaging(tmp *os.File, tmpPath string, cause error) error {
 	var problems []string
 	if err := tmp.Close(); err != nil {

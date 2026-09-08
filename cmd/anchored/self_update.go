@@ -59,6 +59,14 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	if err := fs.Parse(args); err != nil {
 		os.Exit(1)
 	}
+	// Validated here, at the boundary where the value is accepted. Relying on
+	// updater.Check to reject it would make the sudo hint's safety depend on
+	// another package's branch structure.
+	if *target != "" && !updater.ValidVersionTag(*target) {
+		fmt.Fprintf(os.Stderr, "anchored self-update: not a version: %q\n", *target)
+		os.Exit(1)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), selfUpdateCheckTimeout)
 	defer cancel()
 
@@ -122,7 +130,7 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	// pulling several MB is pure waste, and the message the user needs is the
 	// same either way.
 	if err := ensureWritable(res.BinPath); err != nil {
-		hint := sudoHint(res.BinPath, selfUpdateFlags(*force, *assumeYes, *noPlugin, *target))
+		hint := sudoHint(res.BinPath, selfUpdateFlags(*force, *assumeYes, *noPlugin, *configPath, *target))
 		fmt.Fprintf(os.Stderr, "anchored self-update: %v\n\nTry: %s\n", err, hint)
 		os.Exit(1)
 	}
@@ -136,7 +144,7 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	}
 
 	fmt.Print(renderSelfUpdateInstalled(res))
-	fmt.Print(renderPluginSyncOutcome(syncPluginAfterUpdate(*configPath, res.Latest, *noPlugin, *force)))
+	fmt.Print(renderPluginSyncOutcome(syncPluginAfterUpdate(*configPath, res, *noPlugin, *force)))
 }
 
 // pluginSyncOutcome is the plugin half of an update, reported separately on
@@ -151,11 +159,12 @@ type pluginSyncOutcome struct {
 	Drift              PluginDrift
 }
 
-// syncPluginAfterUpdate takes installedVersion rather than reading the
+// syncPluginAfterUpdate measures drift against res.Latest, never the
 // package-level Version: by the time this runs the binary has been replaced,
 // so Version still reports the release this process was compiled as — the OLD
-// one. Drift is measured against what is now on disk.
-func syncPluginAfterUpdate(configPath, installedVersion string, noPlugin, force bool) pluginSyncOutcome {
+// one. Taking the Result rather than a string keeps that wiring inside the
+// function a test can pin.
+func syncPluginAfterUpdate(configPath string, res updater.Result, noPlugin, force bool) pluginSyncOutcome {
 	if noPlugin {
 		return pluginSyncOutcome{Skipped: true}
 	}
@@ -174,7 +183,7 @@ func syncPluginAfterUpdate(configPath, installedVersion string, noPlugin, force 
 		return out
 	}
 
-	drift := detectPluginDriftWithForce(cfg, installedVersion, force)
+	drift := detectPluginDriftWithForce(cfg, res.Latest, force)
 	out.Drift = applyPluginAutoUpdate(drift)
 	return out
 }
@@ -358,13 +367,20 @@ func ensureWritable(path string) error {
 // render as two commands, the second running as root. Only the binary path
 // and the flags this command defines can reach it.
 func sudoHint(binPath string, flags []string) string {
-	parts := append([]string{"sudo", binPath, "self-update"}, flags...)
+	parts := append([]string{"sudo", shellQuote(binPath), "self-update"}, flags...)
 	return strings.Join(parts, " ")
+}
+
+// shellQuote makes a value safe to paste into a shell. Paths legitimately
+// contain spaces ("/Users/Jo Smith/..."), and this string is offered for a
+// root shell, so nothing may split or chain.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // selfUpdateFlags reconstructs the flag list for the sudo hint from parsed
 // values, so nothing the user typed is echoed verbatim.
-func selfUpdateFlags(force, assumeYes, noPlugin bool, target string) []string {
+func selfUpdateFlags(force, assumeYes, noPlugin bool, configPath, target string) []string {
 	var out []string
 	if force {
 		out = append(out, "--force")
@@ -375,27 +391,33 @@ func selfUpdateFlags(force, assumeYes, noPlugin bool, target string) []string {
 	if noPlugin {
 		out = append(out, "--no-plugin")
 	}
-	// The value is validated as a version before it can reach the network,
-	// so it is safe to echo; rendering it keeps the hint runnable.
+	if configPath != "" {
+		out = append(out, "--config", shellQuote(configPath))
+	}
+	// Shape-checked by updater.ValidVersionTag before it reaches here.
 	if target != "" {
 		out = append(out, "--version", target)
 	}
 	return out
 }
 
-// renderDowngradeRefusal exists because the generic not-newer verdict reads
-// as "Up to date (v0.16.0)" when the user explicitly asked for v0.16.0 —
-// which sounds like the tool is confused about what is installed.
+// overrideCommand renders the invocation that installs past a refusal,
+// preserving the version the user pinned.
+func overrideCommand(target string) string {
+	return "anchored self-update " + strings.Join(selfUpdateFlags(true, false, false, "", target), " ")
+}
+
+// renderDowngradeRefusal reports a pinned version that is older than the
+// installed one.
 func renderDowngradeRefusal(res updater.Result) string {
 	return fmt.Sprintf(`Refused: %s is not newer than the installed %s.
 Installing it would revert any fix released in between.
-Run `+"`anchored self-update --force --version %s`"+` to do it anyway.
-`, formatV(res.Latest), formatV(res.Current), res.Latest)
+Run `+"`%s`"+` to do it anyway.
+`, formatV(res.Latest), formatV(res.Current), overrideCommand(res.Latest))
 }
 
-// renderSelfUpdateInstalled reports the swap. A downgrade gets its own
-// wording: "Installed v0.16.0 (was v0.18.0)" reads like an update unless the
-// direction is named.
+// renderSelfUpdateInstalled reports the swap, naming the direction: a
+// downgrade and a reinstall are not updates.
 func renderSelfUpdateInstalled(res updater.Result) string {
 	if !res.Newer && res.Latest != res.Current {
 		return fmt.Sprintf(`DOWNGRADED %s → %s
@@ -404,6 +426,14 @@ func renderSelfUpdateInstalled(res updater.Result) string {
 
 Fixes released after %s are no longer present. Restart your MCP clients.
 `, formatV(res.Current), formatV(res.Latest), res.BinPath, res.BinPath+".prev", formatV(res.Latest))
+	}
+	if res.Latest == res.Current {
+		return fmt.Sprintf(`Reinstalled %s
+  binary    %s
+  previous  %s
+
+Restart your MCP clients to pick up the fresh copy.
+`, formatV(res.Latest), res.BinPath, res.BinPath+".prev")
 	}
 	return renderSelfUpdateInstalledForward(res)
 }
@@ -472,11 +502,16 @@ func renderSelfUpdateCheck(res updater.Result, target string) string {
 		fmt.Fprintf(&b, "latest     %s\n", formatV(res.Latest))
 	}
 	fmt.Fprintf(&b, "binary     %s\n\n", res.BinPath)
-	b.WriteString(selfUpdateVerdict(res))
+	b.WriteString(selfUpdateVerdict(res, target))
 	return b.String()
 }
 
-func selfUpdateVerdict(res updater.Result) string {
+func selfUpdateVerdict(res updater.Result, target string) string {
+	// A pinned older version is a downgrade, not "up to date" — the generic
+	// not-newer wording names a version that is not installed.
+	if res.Blocked == updater.BlockNotNewer && target != "" {
+		return renderDowngradeRefusal(res)
+	}
 	switch res.Blocked {
 	case updater.BlockNone:
 		if res.Newer {
@@ -492,20 +527,20 @@ func selfUpdateVerdict(res updater.Result) string {
 		return fmt.Sprintf(`Refused: %s is a local dev build.
 A binary built from a checkout is never overwritten automatically — that
 would revert your own work to the release tag.
-Run `+"`anchored self-update --force`"+` to install %s over it.
-`, formatV(res.Current), formatV(res.Latest))
+Run `+"`%s`"+` to install %s over it.
+`, formatV(res.Current), overrideCommand(target), formatV(res.Latest))
 
 	case updater.BlockOutsideCanonical:
 		return fmt.Sprintf(`Refused: the binary lives outside ~/.anchored/bin.
   %s
 Only the canonical install is updated automatically.
-Run `+"`anchored self-update --force`"+` to update this path anyway.
-`, res.BinPath)
+Run `+"`%s`"+` to update this path anyway.
+`, res.BinPath, overrideCommand(target))
 
 	case updater.BlockEnvDisabled:
-		return `Refused: ANCHORED_NO_AUTOUPDATE=1 disables automatic updates.
-Unset it, or run ` + "`anchored self-update --force`" + ` to override it once.
-`
+		return fmt.Sprintf(`Refused: ANCHORED_NO_AUTOUPDATE=1 disables automatic updates.
+Unset it, or run `+"`%s`"+` to override it once.
+`, overrideCommand(target))
 
 	case updater.BlockNoVersion:
 		return `Refused: this binary reports no version, so there is nothing to

@@ -78,10 +78,7 @@ func detectPluginDrift(cfg *config.Config, binaryVersion string) PluginDrift {
 }
 
 // detectPluginDriftWithForce is detectPluginDrift with the dev-build guard
-// made optional, for a user who asked for the update explicitly. There is one
-// implementation on purpose: an earlier version of this had a separate forced
-// copy whose CacheBehind expression had already drifted from this one within a
-// single branch, while applyPluginAutoUpdate recomputed the field anyway.
+// made optional, for a user who asked for the update explicitly.
 func detectPluginDriftWithForce(cfg *config.Config, binaryVersion string, force bool) PluginDrift {
 	d := PluginDrift{
 		BinaryVersion:  binaryVersion,

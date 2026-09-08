@@ -141,6 +141,13 @@ var osExecutable = os.Executable
 // semverTag constrains what may become a URL path segment.
 var semverTag = regexp.MustCompile(`^v?\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$`)
 
+// ValidVersionTag reports whether s is shaped like a release version. It is
+// exported so a caller can reject a bad value where it is accepted, instead
+// of depending on this package's control flow to reach releaseTag.
+func ValidVersionTag(s string) bool {
+	return semverTag.MatchString(s)
+}
+
 // releaseTag normalizes a user-supplied version into the tag GitHub
 // publishes, so "0.17.0" and "v0.17.0" both resolve. An empty target means
 // the latest release.

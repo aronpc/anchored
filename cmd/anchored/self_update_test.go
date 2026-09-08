@@ -253,8 +253,8 @@ func TestEnsureWritable_LeavesNoProbeBehind(t *testing.T) {
 // rebuilt from parsed flags. Echoing argv would let a version string carry a
 // second command into that paste.
 func TestSudoHint_BuildsFromParsedFlags(t *testing.T) {
-	got := sudoHint("/usr/local/bin/anchored", selfUpdateFlags(true, true, false, ""))
-	want := "sudo /usr/local/bin/anchored self-update --force --yes"
+	got := sudoHint("/usr/local/bin/anchored", selfUpdateFlags(true, true, false, "", ""))
+	want := "sudo '/usr/local/bin/anchored' self-update --force --yes"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -266,8 +266,8 @@ func TestSudoHint_BuildsFromParsedFlags(t *testing.T) {
 // piece that lives here: the hint is assembled from known flags, never from
 // os.Args, so nothing else the user typed can reach it.
 func TestSudoHint_AssemblesOnlyKnownFlags(t *testing.T) {
-	got := sudoHint("/usr/local/bin/anchored", selfUpdateFlags(true, false, true, "v0.17.0"))
-	want := "sudo /usr/local/bin/anchored self-update --force --no-plugin --version v0.17.0"
+	got := sudoHint("/usr/local/bin/anchored", selfUpdateFlags(true, false, true, "", "v0.17.0"))
+	want := "sudo '/usr/local/bin/anchored' self-update --force --no-plugin --version v0.17.0"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -513,7 +513,7 @@ func TestSyncPluginAfterUpdate_MissingMarketplaceIsReportedNotSwallowed(t *testi
 		t.Fatal(err)
 	}
 
-	out := syncPluginAfterUpdate(cfgPath, "0.18.0", false, true)
+	out := syncPluginAfterUpdate(cfgPath, updater.Result{Latest: "0.18.0"}, false, true)
 	if !out.MarketplaceMissing {
 		t.Fatalf("missing marketplace not detected: %+v", out)
 	}
@@ -526,7 +526,7 @@ func TestSyncPluginAfterUpdate_MissingMarketplaceIsReportedNotSwallowed(t *testi
 }
 
 func TestSyncPluginAfterUpdate_NoPluginSkipsEverything(t *testing.T) {
-	out := syncPluginAfterUpdate("", "0.18.0", true, true)
+	out := syncPluginAfterUpdate("", updater.Result{Latest: "0.18.0"}, true, true)
 	if !out.Skipped {
 		t.Fatal("--no-plugin must skip")
 	}
@@ -626,15 +626,37 @@ func renderSelfUpdateCheckT(res updater.Result) string {
 	return renderSelfUpdateCheck(res, "")
 }
 
-func TestRenderSelfUpdateCheck_LabelsAPinnedVersionAsTarget(t *testing.T) {
+// Blocked must be BlockNotNewer here: check.go always sets it when the
+// resolved release is not newer, so a downgrade with BlockNone is a state the
+// code cannot produce — asserting on it hid the bug this now covers.
+func TestRenderSelfUpdateCheck_PinnedDowngradeIsNotReportedAsUpToDate(t *testing.T) {
 	out := renderSelfUpdateCheck(updater.Result{
-		Current: "0.18.0", Latest: "0.16.0", BinPath: "/b",
+		Current: "0.18.0",
+		Latest:  "0.16.0",
+		BinPath: "/b",
+		Blocked: updater.BlockNotNewer,
 	}, "v0.16.0")
-	if strings.Contains(out, "latest") {
-		t.Errorf("a pinned version is not 'latest'\n---\n%s", out)
+
+	if strings.Contains(out, "Up to date") {
+		t.Errorf("a requested downgrade is not 'up to date'\n---\n%s", out)
 	}
 	if !strings.Contains(out, "target") {
-		t.Errorf("expected a target label\n---\n%s", out)
+		t.Errorf("a pinned version must be labelled target, not latest\n---\n%s", out)
+	}
+	if !strings.Contains(out, "--force") {
+		t.Errorf("the refusal must name the override\n---\n%s", out)
+	}
+}
+
+// The override command must carry the flags the user gave. Telling someone who
+// asked for v0.16.0 to run plain --force sends them to the latest release.
+func TestOverrideCommand_PreservesThePinnedVersion(t *testing.T) {
+	got := overrideCommand("v0.16.0")
+	if !strings.Contains(got, "--version v0.16.0") {
+		t.Fatalf("override command dropped the pin: %q", got)
+	}
+	if plain := overrideCommand(""); strings.Contains(plain, "--version") {
+		t.Fatalf("no pin should mean no --version: %q", plain)
 	}
 }
 
@@ -648,5 +670,45 @@ func TestReleaseCheckResult_UsesAStatusDoctorCanRender(t *testing.T) {
 	}
 	if status != "warn" {
 		t.Errorf("status = %q, want warn", status)
+	}
+}
+
+// Pins the call site, not just the helper: reverting to the package-level
+// Version — the original defect — must fail a test. Version is deliberately
+// set to the OLD release here, which is exactly what a running process
+// reports after its own binary has been swapped.
+func TestSyncPluginAfterUpdate_UsesTheResolvedReleaseNotTheCompiledVersion(t *testing.T) {
+	origVersion := Version
+	Version = "0.17.0"
+	t.Cleanup(func() { Version = origVersion })
+
+	dir := t.TempDir()
+	mirrorDir := filepath.Join(dir, "mirror")
+	cacheDir := filepath.Join(dir, "cache")
+	if err := os.MkdirAll(mirrorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedMirrorManifest(t, mirrorDir, "0.17.0")
+	seedPluginCache(t, cacheDir, "0.17.0")
+
+	cfgPath := filepath.Join(dir, "config.yaml")
+	body := "plugin:\n  marketplace_dir: " + mirrorDir + "\n  cache_dir: " + cacheDir + "\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := syncPluginAfterUpdate(cfgPath, updater.Result{Latest: "0.18.0"}, false, false)
+	// Mirror 0.17.0 against the installed 0.18.0 is behind, so a refresh is
+	// attempted. Reading Version ("0.17.0") would find nothing behind.
+	if !out.Drift.MirrorBehind {
+		t.Fatalf("drift was measured against the compiled version, not the installed release: %+v", out.Drift)
+	}
+}
+
+// A path with a space is legitimate and must not split the pasted command.
+func TestSudoHint_QuotesThePath(t *testing.T) {
+	got := sudoHint("/Users/Jo Smith/.anchored/bin/anchored", nil)
+	if !strings.Contains(got, "'/Users/Jo Smith/.anchored/bin/anchored'") {
+		t.Fatalf("path not quoted: %q", got)
 	}
 }
