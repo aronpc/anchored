@@ -6,8 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [0.18.0] - 2026-09-04
-
 ### Added
 
 - **`anchored self-update`** — update the binary from the latest official
@@ -32,6 +30,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Release check in `anchored doctor`** — reports when a newer release is
   available and hands over the command. Best-effort: with no network it degrades
   to "not checked" and never fails the run.
+
+
+## [0.18.0] - 2026-09-04
+
+### Added
 
 - **Contextual remote skills** — when a repo has an active remote, procedural
   work routes through `anchored_skill(action=search, intent=...)` before memory
