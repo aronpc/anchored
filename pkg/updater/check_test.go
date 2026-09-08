@@ -313,3 +313,91 @@ func TestCheck_AlwaysResolveWorksWithoutACurrentVersion(t *testing.T) {
 		t.Fatalf("release not resolved: %+v", res)
 	}
 }
+
+// fakeTagRelease serves releases/tags/{tag} for one known tag and 404s for
+// anything else, so the "tag does not exist" path is exercised for real.
+func fakeTagRelease(t *testing.T, knownTag, version string) {
+	t.Helper()
+	assetName := fmt.Sprintf("anchored_%s_%s_%s.tar.gz", version, runtime.GOOS, runtime.GOARCH)
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	mux.HandleFunc("/tags/", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/"+knownTag) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		payload := map[string]any{
+			"tag_name": knownTag,
+			"assets": []map[string]string{
+				{"name": assetName, "browser_download_url": srv.URL + "/" + assetName},
+				{"name": "checksums.txt", "browser_download_url": srv.URL + "/checksums.txt"},
+			},
+		}
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			t.Errorf("encode release: %v", err)
+		}
+	})
+
+	orig := releaseTagAPIURL
+	releaseTagAPIURL = srv.URL + "/tags/%[2]s?repo=%[1]s"
+	t.Cleanup(func() { releaseTagAPIURL = orig })
+}
+
+func TestCheck_ResolvesAnExplicitTag(t *testing.T) {
+	fakeTagRelease(t, "v0.17.0", "0.17.0")
+	for _, given := range []string{"v0.17.0", "0.17.0"} {
+		res, err := Check(context.Background(), Options{
+			CurrentVersion: "0.16.0",
+			BinPath:        canonicalBin(t),
+			TargetVersion:  given,
+		})
+		if err != nil {
+			t.Fatalf("%s: unexpected err: %v", given, err)
+		}
+		if res.Latest != "0.17.0" {
+			t.Errorf("%s: Latest = %q, want 0.17.0", given, res.Latest)
+		}
+		if res.Blocked != BlockNone {
+			t.Errorf("%s: Blocked = %q, want none", given, res.Blocked)
+		}
+	}
+}
+
+// "no asset for linux/amd64" is what a missing tag used to look like; the
+// error has to name the tag instead.
+func TestCheck_MissingTagNamesTheTag(t *testing.T) {
+	fakeTagRelease(t, "v0.17.0", "0.17.0")
+	_, err := Check(context.Background(), Options{
+		CurrentVersion: "0.16.0",
+		BinPath:        canonicalBin(t),
+		TargetVersion:  "v9.9.9",
+	})
+	if err == nil {
+		t.Fatal("expected an error for a tag that does not exist")
+	}
+	if !strings.Contains(err.Error(), "v9.9.9") {
+		t.Fatalf("error should name the tag, got %v", err)
+	}
+}
+
+// A downgrade lands on not-newer, which is exactly the refusal --force
+// overrides — no separate guard needed.
+func TestCheck_OlderTagIsRefusedAsNotNewer(t *testing.T) {
+	fakeTagRelease(t, "v0.17.0", "0.17.0")
+	res, err := Check(context.Background(), Options{
+		CurrentVersion: "0.18.0",
+		BinPath:        canonicalBin(t),
+		TargetVersion:  "v0.17.0",
+	})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Blocked != BlockNotNewer {
+		t.Fatalf("Blocked = %q, want %q", res.Blocked, BlockNotNewer)
+	}
+	if res.AssetURL == "" {
+		t.Fatal("assets must still resolve so --force can install the downgrade")
+	}
+}

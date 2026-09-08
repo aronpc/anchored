@@ -34,9 +34,12 @@ const (
 	dlTimeout    = 90 * time.Second
 )
 
-// releaseAPIURL is a var rather than a const so tests can point the release
-// lookup at a local server instead of GitHub.
-var releaseAPIURL = "https://api.github.com/repos/%s/releases/latest"
+// These are vars rather than consts so tests can point the release lookup at
+// a local server instead of GitHub.
+var (
+	releaseAPIURL    = "https://api.github.com/repos/%s/releases/latest"
+	releaseTagAPIURL = "https://api.github.com/repos/%s/releases/tags/%s"
+)
 
 // Options controls a single update attempt.
 type Options struct {
@@ -44,6 +47,10 @@ type Options struct {
 	CurrentVersion string // Semver without leading "v".
 	BinPath        string // Path to the binary to replace. Empty resolves via os.Executable.
 	Logger         *slog.Logger
+
+	// TargetVersion pins the update to one published release instead of the
+	// latest. Accepts "v0.17.0" or "0.17.0". Empty means latest.
+	TargetVersion string
 
 	// AlwaysResolve makes Check contact the release API even when a local
 	// guard already refused the update, so an interactive caller can report
@@ -123,12 +130,16 @@ type ghRelease struct {
 	} `json:"assets"`
 }
 
-// fetchLatest returns version, asset URL, asset filename, and the
-// checksums.txt URL from the latest release. The asset filename is needed
+// fetchRelease returns version, asset URL, asset filename, and the
+// checksums.txt URL from a release: the latest one when tag is empty, or that
+// exact tag otherwise. The asset filename is needed
 // later to look up the right line in checksums.txt; the checksum URL is
 // resolved here so we can fail fast if GoReleaser stopped publishing it.
-func fetchLatest(ctx context.Context, repo string) (version string, assetURL string, assetName string, checksumsURL string, err error) {
+func fetchRelease(ctx context.Context, repo, tag string) (version string, assetURL string, assetName string, checksumsURL string, err error) {
 	url := fmt.Sprintf(releaseAPIURL, repo)
+	if tag != "" {
+		url = fmt.Sprintf(releaseTagAPIURL, repo, tag)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", "", "", "", err
@@ -143,6 +154,11 @@ func fetchLatest(ctx context.Context, repo string) (version string, assetURL str
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// A missing tag used to surface downstream as "no asset for
+		// linux/amd64", which blames the platform for a typo in the tag.
+		if tag != "" && resp.StatusCode == http.StatusNotFound {
+			return "", "", "", "", fmt.Errorf("release %s not found in %s", tag, repo)
+		}
 		return "", "", "", "", fmt.Errorf("github releases: HTTP %d", resp.StatusCode)
 	}
 

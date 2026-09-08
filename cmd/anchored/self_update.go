@@ -31,6 +31,7 @@ func runSelfUpdate(args []string) {
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON ({current, latest, bin_path, update_available, blocked})")
 	force := fs.Bool("force", false, "install even when a guard refuses (dev build, non-canonical path, env kill switch, same version)")
 	assumeYes := fs.Bool("yes", false, "skip the confirmation prompt --force asks before overwriting a dev build")
+	target := fs.String("version", "", "install this published version instead of the latest (e.g. v0.17.0); a downgrade needs --force")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: anchored self-update [--check] [--json]
 
@@ -40,6 +41,7 @@ Updates the anchored binary from the latest official release.
   --json    machine-readable output
   --force   install past a refusal you have decided against
   --yes     skip the confirmation --force asks before replacing a dev build
+  --version install a specific published version instead of the latest
 
 Exit codes: 0 nothing to do, 10 an update is available, 1 the check failed.
 
@@ -58,6 +60,7 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	res, err := updater.Check(ctx, updater.Options{
 		CurrentVersion: selfUpdateCurrentVersion(Version),
 		BinPath:        anchoredBinaryPath(),
+		TargetVersion:  *target,
 		AlwaysResolve:  true,
 	})
 	if err != nil {

@@ -98,7 +98,7 @@ func Check(ctx context.Context, opts Options) (Result, error) {
 		repo = defaultRepo
 	}
 
-	latest, assetURL, assetName, checksumsURL, err := fetchLatest(ctx, repo)
+	latest, assetURL, assetName, checksumsURL, err := fetchRelease(ctx, repo, releaseTag(opts.TargetVersion))
 	if err != nil {
 		return res, err
 	}
@@ -139,6 +139,16 @@ func Apply(ctx context.Context, res Result) error {
 // ErrResolveExecutable path, which os.Executable never reaches under
 // `go test`.
 var osExecutable = os.Executable
+
+// releaseTag normalizes a user-supplied version into the tag GitHub
+// publishes, so "0.17.0" and "v0.17.0" both resolve. An empty target means
+// the latest release.
+func releaseTag(target string) string {
+	if target == "" {
+		return ""
+	}
+	return "v" + strings.TrimPrefix(target, "v")
+}
 
 // resolveBinPath returns the running binary, symlink-resolved so a wrapper
 // path doesn't get swapped in place of the real file.
