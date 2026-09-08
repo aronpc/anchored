@@ -213,7 +213,11 @@ func TestEnsureWritable_RejectsReadOnlyParentDir(t *testing.T) {
 	if err := os.Chmod(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	t.Cleanup(func() {
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Errorf("restore dir perms: %v", err)
+		}
+	})
 
 	err := ensureWritable(path)
 	if err == nil {

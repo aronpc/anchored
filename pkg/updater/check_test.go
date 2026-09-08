@@ -26,7 +26,9 @@ func fakeRelease(t *testing.T, version string) (assetName string) {
 	t.Cleanup(srv.Close)
 
 	mux.HandleFunc("/checksums.txt", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%s  %s\n", strings.Repeat("a", 64), assetName)
+		if _, err := fmt.Fprintf(w, "%s  %s\n", strings.Repeat("a", 64), assetName); err != nil {
+			t.Errorf("write checksums: %v", err)
+		}
 	})
 	mux.HandleFunc("/release", func(w http.ResponseWriter, r *http.Request) {
 		payload := map[string]any{
@@ -253,10 +255,14 @@ func TestApply_InstallsVerifiedPayload(t *testing.T) {
 	tarball, sum := makeTarGz(t, []byte("NEW-BINARY"))
 	mux := http.NewServeMux()
 	mux.HandleFunc("/asset.tar.gz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write(tarball)
+		if _, err := w.Write(tarball); err != nil {
+			t.Errorf("write tarball: %v", err)
+		}
 	})
 	mux.HandleFunc("/checksums.txt", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%s  asset.tar.gz\n", sum)
+		if _, err := fmt.Fprintf(w, "%s  asset.tar.gz\n", sum); err != nil {
+			t.Errorf("write checksums: %v", err)
+		}
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()

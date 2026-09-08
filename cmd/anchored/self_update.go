@@ -270,7 +270,7 @@ func confirmDevBuildOverwrite(res updater.Result, in io.Reader, out io.Writer, a
 		return false, fmt.Errorf("replacing the dev build %s needs confirmation, but there is no terminal to ask; re-run with --yes to confirm up front", formatV(res.Current))
 	}
 
-	fmt.Fprintf(out, `This replaces a local dev build with a release binary:
+	if _, err := fmt.Fprintf(out, `This replaces a local dev build with a release binary:
 
   %s  →  %s
   %s
@@ -278,7 +278,11 @@ func confirmDevBuildOverwrite(res updater.Result, in io.Reader, out io.Writer, a
 The build you have now is kept at %s, so one rename undoes this.
 Anything you have not committed is not in the release.
 
-Continue? [y/N] `, formatV(res.Current), formatV(res.Latest), res.BinPath, res.BinPath+".prev")
+Continue? [y/N] `, formatV(res.Current), formatV(res.Latest), res.BinPath, res.BinPath+".prev"); err != nil {
+		// If the question never reached the user, treating silence as an
+		// answer would be worse than refusing outright.
+		return false, fmt.Errorf("could not print the confirmation prompt: %w", err)
+	}
 
 	answer, err := bufio.NewReader(in).ReadString('\n')
 	if err != nil && answer == "" {
@@ -315,7 +319,9 @@ func ensureWritable(path string) error {
 	}
 	name := probe.Name()
 	if err := probe.Close(); err != nil {
-		os.Remove(name)
+		if rmErr := os.Remove(name); rmErr != nil {
+			return fmt.Errorf("cannot write %s: %w (and the probe %s could not be removed: %v)", dir, err, name, rmErr)
+		}
 		return fmt.Errorf("cannot write %s: %w", dir, err)
 	}
 	if err := os.Remove(name); err != nil {
