@@ -81,11 +81,22 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 		os.Exit(selfUpdateExitCode(res))
 	}
 
-	// Apply mode. The user asked for an install, so a refusal is a failure
-	// here — unlike --check, where it is just the state of the world.
+	// Apply mode. A refusal is generally a failure here — the user asked for
+	// an install and did not get one — with one exception: being already on
+	// the requested version is the outcome they wanted, so it exits 0. `anchored
+	// self-update && ...` has to survive being run twice.
+	if res.Blocked == updater.BlockNotNewer && !*force && *target == "" {
+		fmt.Printf("Already on the latest release (%s).\n", formatV(res.Latest))
+		os.Exit(0)
+	}
+
 	if res.Blocked != updater.BlockNone {
 		if !*force || !forceOverridable(res.Blocked) {
-			fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res))
+			if res.Blocked == updater.BlockNotNewer && *target != "" {
+				fmt.Fprint(os.Stderr, renderDowngradeRefusal(res))
+			} else {
+				fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res))
+			}
 			os.Exit(1)
 		}
 		// Replacing a dev build is the one override that destroys work which
@@ -366,7 +377,32 @@ func selfUpdateFlags(force, assumeYes, noPlugin bool, target string) []string {
 	return out
 }
 
+// renderDowngradeRefusal exists because the generic not-newer verdict reads
+// as "Up to date (v0.16.0)" when the user explicitly asked for v0.16.0 —
+// which sounds like the tool is confused about what is installed.
+func renderDowngradeRefusal(res updater.Result) string {
+	return fmt.Sprintf(`Refused: %s is not newer than the installed %s.
+Installing it would revert any fix released in between.
+Run `+"`anchored self-update --force --version %s`"+` to do it anyway.
+`, formatV(res.Latest), formatV(res.Current), res.Latest)
+}
+
+// renderSelfUpdateInstalled reports the swap. A downgrade gets its own
+// wording: "Installed v0.16.0 (was v0.18.0)" reads like an update unless the
+// direction is named.
 func renderSelfUpdateInstalled(res updater.Result) string {
+	if !res.Newer && res.Latest != res.Current {
+		return fmt.Sprintf(`DOWNGRADED %s → %s
+  binary    %s
+  previous  %s
+
+Fixes released after %s are no longer present. Restart your MCP clients.
+`, formatV(res.Current), formatV(res.Latest), res.BinPath, res.BinPath+".prev", formatV(res.Latest))
+	}
+	return renderSelfUpdateInstalledForward(res)
+}
+
+func renderSelfUpdateInstalledForward(res updater.Result) string {
 	return fmt.Sprintf(`Installed %s (was %s)
   binary    %s
   previous  %s

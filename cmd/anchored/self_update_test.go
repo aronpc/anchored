@@ -586,3 +586,36 @@ func TestReleaseCheckResult_MentionsReleaseOnDevBuild(t *testing.T) {
 		t.Errorf("detail should still name the release, got %q", detail)
 	}
 }
+
+// A downgrade must not read as an update. "Installed v0.16.0 (was v0.18.0)"
+// is technically true and completely misleading.
+func TestRenderSelfUpdateInstalled_NamesADowngrade(t *testing.T) {
+	out := renderSelfUpdateInstalled(updater.Result{
+		Current: "0.18.0",
+		Latest:  "0.16.0",
+		BinPath: "/home/u/.anchored/bin/anchored",
+		Newer:   false,
+	})
+	if !strings.Contains(strings.ToUpper(out), "DOWNGRAD") {
+		t.Errorf("a downgrade must say so\n---\n%s", out)
+	}
+	forward := renderSelfUpdateInstalled(updater.Result{
+		Current: "0.17.0", Latest: "0.18.0", BinPath: "/b", Newer: true,
+	})
+	if strings.Contains(strings.ToUpper(forward), "DOWNGRAD") {
+		t.Errorf("a normal update must not\n---\n%s", forward)
+	}
+}
+
+func TestRenderDowngradeRefusal_ExplainsItselfAndTheOverride(t *testing.T) {
+	out := renderDowngradeRefusal(updater.Result{Current: "0.18.0", Latest: "0.16.0"})
+	for _, want := range []string{"0.16.0", "0.18.0", "--force"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("refusal missing %q\n---\n%s", want, out)
+		}
+	}
+	// The old wording claimed the older version was already installed.
+	if strings.Contains(out, "Up to date") {
+		t.Errorf("a requested downgrade is not 'up to date'\n---\n%s", out)
+	}
+}
