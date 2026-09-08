@@ -297,6 +297,25 @@ func applyPluginAutoUpdate(d PluginDrift) PluginDrift {
 	return d
 }
 
+// detectPluginDriftForced reads the plugin state ignoring the dev-build
+// guard, for a user who asked for the update explicitly. It also treats the
+// mirror as always worth refreshing: on an explicit request the goal is to
+// fetch the newest plugin, not to infer from a binary version stamp that
+// cannot be compared in the first place.
+func detectPluginDriftForced(cfg *config.Config) PluginDrift {
+	d := PluginDrift{
+		MarketplaceDir: cfg.Plugin.MarketplaceDir,
+		CacheDir:       cfg.Plugin.CacheDir,
+	}
+	d.MirrorVersion = readMirrorPluginVersion(d.MarketplaceDir)
+	d.CacheVersion = newestInstalledVersion(d.CacheDir)
+	d.MirrorBehind = true
+	d.CacheBehind = d.MirrorVersion == "" || d.CacheVersion == "" ||
+		compareSemver(d.CacheVersion, d.MirrorVersion) < 0
+	d.HasDrift = true
+	return d
+}
+
 // tryAcquireSyncLock is OS-specific:
 //   - plugin_sync_unix.go uses syscall.Flock (Linux + macOS + BSD)
 //   - plugin_sync_windows.go is a permissive noop

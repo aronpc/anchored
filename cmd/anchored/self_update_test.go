@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/updater"
 )
 
@@ -370,5 +371,123 @@ func devBuildResult() updater.Result {
 		BinPath: "/home/u/.anchored/bin/anchored",
 		Newer:   true,
 		Blocked: updater.BlockDevBuild,
+	}
+}
+
+// The dev-build guard is what froze the plugin at 0.17.0 while releases moved
+// on. An explicit request has to be able to read the state it hides.
+func TestDetectPluginDriftForced_IgnoresTheDevBuildGuard(t *testing.T) {
+	cacheDir := t.TempDir()
+	mirrorDir := t.TempDir()
+	seedPluginCache(t, cacheDir, "0.17.0")
+	seedMirrorManifest(t, mirrorDir, "0.18.0")
+
+	cfg := &config.Config{}
+	cfg.Plugin.CacheDir = cacheDir
+	cfg.Plugin.MarketplaceDir = mirrorDir
+
+	if d := detectPluginDrift(cfg, "v0.17.0-dev+gabc"); d.MirrorVersion != "" || d.HasDrift {
+		t.Fatalf("guarded detection should still see nothing on a dev build, got %+v", d)
+	}
+
+	f := detectPluginDriftForced(cfg)
+	if f.MirrorVersion != "0.18.0" || f.CacheVersion != "0.17.0" {
+		t.Fatalf("forced detection did not read the versions: %+v", f)
+	}
+	if !f.CacheBehind {
+		t.Error("cache 0.17.0 against mirror 0.18.0 must count as behind")
+	}
+	// On an explicit request the mirror is always worth refreshing: the point
+	// is to fetch the newest plugin, not to infer it from a version stamp
+	// that cannot be compared.
+	if !f.MirrorBehind {
+		t.Error("forced detection should always try to refresh the mirror")
+	}
+}
+
+func TestRenderPluginSyncOutcome_NamesTheNoOpPath(t *testing.T) {
+	out := renderPluginSyncOutcome(pluginSyncOutcome{
+		MarketplaceDir:     "/home/u/.claude/plugins/marketplaces/anchored",
+		MarketplaceMissing: true,
+	})
+	if !strings.Contains(out, "/home/u/.claude/plugins/marketplaces/anchored") {
+		t.Errorf("outcome must name the path it looked at\n---\n%s", out)
+	}
+	// The config default and this machine's real marketplace root have
+	// differed before; exiting 0 having silently done nothing is the failure
+	// mode worth shouting about.
+	if !strings.Contains(strings.ToLower(out), "not") {
+		t.Errorf("outcome must say plainly that nothing was done\n---\n%s", out)
+	}
+}
+
+func TestRenderPluginSyncOutcome_ReportsAnInstall(t *testing.T) {
+	out := renderPluginSyncOutcome(pluginSyncOutcome{
+		MarketplaceDir: "/m",
+		CacheDir:       "/c",
+		Drift: PluginDrift{
+			MirrorVersion:  "0.18.0",
+			CacheVersion:   "0.18.0",
+			SyncPerformed:  true,
+			CacheInstalled: true,
+		},
+	})
+	if !strings.Contains(out, "0.18.0") {
+		t.Errorf("outcome should name the installed plugin version\n---\n%s", out)
+	}
+}
+
+// A plugin failure must not read as "the update failed" — the binary was
+// already replaced by then.
+func TestRenderPluginSyncOutcome_FailureKeepsTheBinaryUpdate(t *testing.T) {
+	out := renderPluginSyncOutcome(pluginSyncOutcome{
+		MarketplaceDir: "/m",
+		CacheDir:       "/c",
+		Drift:          PluginDrift{MirrorBehind: true, SyncError: "git pull failed: no upstream"},
+	})
+	if !strings.Contains(out, "no upstream") {
+		t.Errorf("outcome should carry the underlying error\n---\n%s", out)
+	}
+	if !strings.Contains(strings.ToLower(out), "binary") {
+		t.Errorf("outcome should say the binary update still stands\n---\n%s", out)
+	}
+}
+
+func TestRenderPluginSyncOutcome_SkippedIsSilent(t *testing.T) {
+	if out := renderPluginSyncOutcome(pluginSyncOutcome{Skipped: true}); out != "" {
+		t.Errorf("--no-plugin should print nothing, got %q", out)
+	}
+}
+
+// Exercises the real function, config load included, for the case the plan
+// flagged as the silent failure: a configured marketplace that is not there.
+func TestSyncPluginAfterUpdate_MissingMarketplaceIsReportedNotSwallowed(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	absent := filepath.Join(dir, "not-a-marketplace")
+	body := "plugin:\n  marketplace_dir: " + absent + "\n  cache_dir: " + filepath.Join(dir, "cache") + "\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out := syncPluginAfterUpdate(cfgPath, false, true)
+	if !out.MarketplaceMissing {
+		t.Fatalf("missing marketplace not detected: %+v", out)
+	}
+	if out.MarketplaceDir != absent {
+		t.Errorf("MarketplaceDir = %q, want %q", out.MarketplaceDir, absent)
+	}
+	if rendered := renderPluginSyncOutcome(out); !strings.Contains(rendered, absent) {
+		t.Errorf("report does not name the missing path\n---\n%s", rendered)
+	}
+}
+
+func TestSyncPluginAfterUpdate_NoPluginSkipsEverything(t *testing.T) {
+	out := syncPluginAfterUpdate("", true, true)
+	if !out.Skipped {
+		t.Fatal("--no-plugin must skip")
+	}
+	if out.MarketplaceDir != "" {
+		t.Errorf("skipped sync should not resolve paths, got %q", out.MarketplaceDir)
 	}
 }

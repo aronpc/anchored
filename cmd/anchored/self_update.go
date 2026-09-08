@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/updater"
 )
 
@@ -27,10 +28,12 @@ const (
 
 func runSelfUpdate(args []string) {
 	fs := newFlagSet("self-update")
+	configPath := fs.String("config", "", "path to config file")
 	check := fs.Bool("check", false, "report the available version and exit without writing")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON ({current, latest, bin_path, update_available, blocked})")
 	force := fs.Bool("force", false, "install even when a guard refuses (dev build, non-canonical path, env kill switch, same version)")
 	assumeYes := fs.Bool("yes", false, "skip the confirmation prompt --force asks before overwriting a dev build")
+	noPlugin := fs.Bool("no-plugin", false, "do not synchronize the Claude Code plugin after updating the binary")
 	target := fs.String("version", "", "install this published version instead of the latest (e.g. v0.17.0); a downgrade needs --force")
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, `Usage: anchored self-update [--check] [--json]
@@ -42,6 +45,7 @@ Updates the anchored binary from the latest official release.
   --force   install past a refusal you have decided against
   --yes     skip the confirmation --force asks before replacing a dev build
   --version install a specific published version instead of the latest
+  --no-plugin  leave the Claude Code plugin alone
 
 Exit codes: 0 nothing to do, 10 an update is available, 1 the check failed.
 
@@ -116,6 +120,85 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	}
 
 	fmt.Print(renderSelfUpdateInstalled(res))
+	fmt.Print(renderPluginSyncOutcome(syncPluginAfterUpdate(*configPath, *noPlugin, *force)))
+}
+
+// pluginSyncOutcome is the plugin half of an update, reported separately on
+// purpose: by the time it runs the binary has already been replaced, so a
+// failure here must not read as "the update failed".
+type pluginSyncOutcome struct {
+	MarketplaceDir     string
+	CacheDir           string
+	MarketplaceMissing bool
+	Skipped            bool
+	ConfigError        string
+	Drift              PluginDrift
+}
+
+func syncPluginAfterUpdate(configPath string, noPlugin, force bool) pluginSyncOutcome {
+	if noPlugin {
+		return pluginSyncOutcome{Skipped: true}
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		return pluginSyncOutcome{ConfigError: err.Error()}
+	}
+
+	out := pluginSyncOutcome{
+		MarketplaceDir: cfg.Plugin.MarketplaceDir,
+		CacheDir:       cfg.Plugin.CacheDir,
+	}
+	if _, err := os.Stat(cfg.Plugin.MarketplaceDir); err != nil {
+		out.MarketplaceMissing = true
+		return out
+	}
+
+	drift := detectPluginDrift(cfg, Version)
+	if force {
+		drift = detectPluginDriftForced(cfg)
+	}
+	out.Drift = applyPluginAutoUpdate(drift)
+	return out
+}
+
+func renderPluginSyncOutcome(o pluginSyncOutcome) string {
+	if o.Skipped {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\nPlugin (Claude Code)\n")
+
+	if o.ConfigError != "" {
+		fmt.Fprintf(&b, "  config could not be read: %s\n  The binary update stands; the plugin was not touched.\n", o.ConfigError)
+		return b.String()
+	}
+
+	fmt.Fprintf(&b, "  marketplace  %s\n  cache        %s\n", o.MarketplaceDir, o.CacheDir)
+
+	// Saying "nothing to do" out loud matters here: the configured default
+	// and a machine's real marketplace root have diverged before, and exiting
+	// zero having silently skipped the plugin is the failure worth naming.
+	if o.MarketplaceMissing {
+		fmt.Fprintf(&b, "  → that marketplace directory does not exist, so nothing was synchronized.\n    Point plugin.marketplace_dir at the mirror you actually use.\n")
+		return b.String()
+	}
+
+	d := o.Drift
+	switch {
+	case d.SyncError != "":
+		fmt.Fprintf(&b, "  → could not refresh the mirror: %s\n    The binary update stands; the plugin is unchanged.\n", d.SyncError)
+	case d.CacheInstallError != "":
+		fmt.Fprintf(&b, "  → could not install the plugin: %s\n    The binary update stands; the plugin is unchanged.\n", d.CacheInstallError)
+	case d.CacheInstalled:
+		fmt.Fprintf(&b, "  → installed plugin %s. Restart Claude Code to load it.\n", formatV(d.CacheVersion))
+	case d.SyncPerformed:
+		fmt.Fprintf(&b, "  → mirror refreshed; the installed plugin %s is already current.\n", formatV(d.CacheVersion))
+	default:
+		b.WriteString("  → already current.\n")
+	}
+	return b.String()
 }
 
 // forceOverridable reports whether --force may install past a refusal. Only
