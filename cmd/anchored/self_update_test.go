@@ -249,11 +249,25 @@ func TestEnsureWritable_LeavesNoProbeBehind(t *testing.T) {
 	}
 }
 
-// The hint has to be the command the user actually typed, or it ages every
-// time a flag is added.
-func TestSudoHint_EchoesTheInvocation(t *testing.T) {
-	got := sudoHint([]string{"/usr/local/bin/anchored", "self-update", "--force"})
-	want := "sudo /usr/local/bin/anchored self-update --force"
+// The hint is printed for the user to paste into a root shell, so it is
+// rebuilt from parsed flags. Echoing argv would let a version string carry a
+// second command into that paste.
+func TestSudoHint_BuildsFromParsedFlags(t *testing.T) {
+	got := sudoHint("/usr/local/bin/anchored", selfUpdateFlags(true, true, false, ""))
+	want := "sudo /usr/local/bin/anchored self-update --force --yes"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// The hint can only ever render a --version value that already passed
+// updater.releaseTag's shape check, because Check rejects a hostile one and
+// the command exits before any writability probe runs. This asserts the
+// piece that lives here: the hint is assembled from known flags, never from
+// os.Args, so nothing else the user typed can reach it.
+func TestSudoHint_AssemblesOnlyKnownFlags(t *testing.T) {
+	got := sudoHint("/usr/local/bin/anchored", selfUpdateFlags(true, false, true, "v0.17.0"))
+	want := "sudo /usr/local/bin/anchored self-update --force --no-plugin --version v0.17.0"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}

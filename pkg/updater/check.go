@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -98,7 +99,12 @@ func Check(ctx context.Context, opts Options) (Result, error) {
 		repo = defaultRepo
 	}
 
-	latest, assetURL, assetName, checksumsURL, err := fetchRelease(ctx, repo, releaseTag(opts.TargetVersion))
+	tag, err := releaseTag(opts.TargetVersion)
+	if err != nil {
+		return res, err
+	}
+
+	latest, assetURL, assetName, checksumsURL, err := fetchRelease(ctx, repo, tag)
 	if err != nil {
 		return res, err
 	}
@@ -140,14 +146,31 @@ func Apply(ctx context.Context, res Result) error {
 // `go test`.
 var osExecutable = os.Executable
 
+// semverTag constrains what may become a URL path segment.
+var semverTag = regexp.MustCompile(`^v?\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$`)
+
 // releaseTag normalizes a user-supplied version into the tag GitHub
 // publishes, so "0.17.0" and "v0.17.0" both resolve. An empty target means
 // the latest release.
-func releaseTag(target string) string {
+//
+// SECURITY INVARIANT: the result is interpolated into the release API path,
+// and Go transmits dot-segments verbatim rather than normalizing them. A
+// value like "../../owner/repo/releases/latest" therefore reaches the server
+// intact, and whether it resolves depends entirely on how that one server
+// normalizes paths — a property this code neither controls nor should rely
+// on. Since the asset and checksums.txt both come from whatever release is
+// resolved, they would agree with each other and the install would succeed.
+// Validating the shape closes it independently of server behaviour: a
+// version that is not a version is a typo or an attack, and neither should
+// reach the network.
+func releaseTag(target string) (string, error) {
 	if target == "" {
-		return ""
+		return "", nil
 	}
-	return "v" + strings.TrimPrefix(target, "v")
+	if !semverTag.MatchString(target) {
+		return "", fmt.Errorf("not a version: %q", target)
+	}
+	return "v" + strings.TrimPrefix(target, "v"), nil
 }
 
 // resolveBinPath returns the running binary, symlink-resolved so a wrapper

