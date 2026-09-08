@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -476,5 +477,43 @@ func TestCreateStagingFile_CreatesExecutableAndEmpty(t *testing.T) {
 	}
 	if perm := fi.Mode().Perm(); perm != 0o755 {
 		t.Errorf("mode = %04o, want 0755", perm)
+	}
+}
+
+// The payload is written to disk BEFORE the digest is checked, so the size an
+// attacker declares in the tar header has to be bounded on its own. Without
+// this, a few-MB gzip of zeroes writes hundreds of GB — and it needs no user
+// present, since serve starts the updater on every MCP launch.
+func TestDownloadAndReplace_RejectsAnOversizePayload(t *testing.T) {
+	orig := maxBinaryBytes
+	maxBinaryBytes = 64
+	t.Cleanup(func() { maxBinaryBytes = orig })
+
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "anchored")
+	if err := os.WriteFile(dst, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	tarball, sum := makeTarGz(t, bytes.Repeat([]byte{0}, 4096))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := w.Write(tarball); err != nil {
+			t.Errorf("write tarball: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	err := downloadAndReplace(context.Background(), srv.URL, dst, sum)
+	if err == nil {
+		t.Fatal("an oversize payload must be rejected")
+	}
+	if !strings.Contains(err.Error(), "limit") {
+		t.Errorf("error should name the limit, got %v", err)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "OLD" {
+		t.Errorf("the installed binary was touched: %q", got)
+	}
+	if _, err := os.Stat(dst + ".new"); err == nil {
+		t.Error(".new leaked after rejection")
 	}
 }

@@ -32,6 +32,11 @@ const (
 	defaultRepo  = "jholhewres/anchored"
 	checkTimeout = 8 * time.Second
 	dlTimeout    = 90 * time.Second
+
+	// maxReleaseJSON and maxChecksumsBytes bound the two response bodies,
+	// which are attacker-controlled if the API or a proxy in front of it is.
+	maxReleaseJSON    = 4 << 20
+	maxChecksumsBytes = 1 << 20
 )
 
 // These are vars rather than consts so tests can point the release lookup at
@@ -39,6 +44,14 @@ const (
 var (
 	releaseAPIURL    = "https://api.github.com/repos/%s/releases/latest"
 	releaseTagAPIURL = "https://api.github.com/repos/%s/releases/tags/%s"
+
+	// maxBinaryBytes bounds the extraction. hdr.Size is attacker-supplied and
+	// the digest is not verified until after the payload is on disk, so an
+	// adversary who can tamper with the asset stream but not with
+	// checksums.txt cannot install code — but could fill the disk. A real
+	// release is tens of MB. A var so a test can lower it instead of
+	// generating half a gigabyte.
+	maxBinaryBytes int64 = 512 << 20
 )
 
 // Options controls a single update attempt.
@@ -163,7 +176,7 @@ func fetchRelease(ctx context.Context, repo, tag string) (version string, assetU
 	}
 
 	var rel ghRelease
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReleaseJSON)).Decode(&rel); err != nil {
 		return "", "", "", "", fmt.Errorf("decode release: %w", err)
 	}
 
@@ -218,7 +231,7 @@ func fetchChecksum(ctx context.Context, url, assetName string) (string, error) {
 		return "", fmt.Errorf("checksums.txt: HTTP %d", resp.StatusCode)
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(io.LimitReader(resp.Body, maxChecksumsBytes))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -295,10 +308,23 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 		if hdr.Typeflag != tar.TypeReg || filepath.Base(hdr.Name) != "anchored" {
 			continue
 		}
-		if _, err := io.Copy(tmp, tr); err != nil {
+		if hdr.Size > maxBinaryBytes {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("tar entry %q declares %d bytes, over the %d limit", hdr.Name, hdr.Size, maxBinaryBytes)
+		}
+		// Rejected rather than truncated: a clipped binary that happened to
+		// match its digest would install and then fail at runtime.
+		n, err := io.CopyN(tmp, tr, maxBinaryBytes+1)
+		if err != nil && !errors.Is(err, io.EOF) {
 			tmp.Close()
 			os.Remove(tmpPath)
 			return fmt.Errorf("write tmp: %w", err)
+		}
+		if n > maxBinaryBytes {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("payload exceeds the %d byte limit", maxBinaryBytes)
 		}
 		written = true
 		break
@@ -314,7 +340,9 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 
 	// Drain any trailing bytes the gzip reader didn't consume so the hash
 	// covers the full tar.gz payload, then compare.
-	if _, err := io.Copy(io.Discard, tee); err != nil {
+	// Bounded like the extraction: this writes nowhere, but an endless body
+	// would otherwise burn the whole download timeout for nothing.
+	if _, err := io.CopyN(io.Discard, tee, maxBinaryBytes+1); err != nil && !errors.Is(err, io.EOF) {
 		os.Remove(tmpPath)
 		return fmt.Errorf("drain body: %w", err)
 	}
