@@ -276,9 +276,9 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 
 	tr := tar.NewReader(gz)
 	tmpPath := dst + ".new"
-	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	tmp, err := createStagingFile(tmpPath)
 	if err != nil {
-		return fmt.Errorf("create tmp: %w", err)
+		return err
 	}
 
 	written := false
@@ -345,6 +345,44 @@ func downloadAndReplace(ctx context.Context, url, dst, wantSum string) error {
 		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
+}
+
+// createStagingFile opens the file the new binary is written to, refusing to
+// reuse anything already at that path.
+//
+// SECURITY INVARIANT: this file becomes the installed binary via rename, so
+// whoever owns it owns what the machine executes afterwards. O_CREATE alone
+// preserves the owner and mode of an existing file, so a regular file planted
+// here by another user would receive the genuine release bytes and then be
+// renamed into place — still writable by them. O_EXCL refuses that, oNoFollow
+// refuses a symlink, and the mode is set on the descriptor rather than left to
+// umask. A stale file from a crashed run is removed first, but only after
+// Lstat confirms it is not a symlink.
+func createStagingFile(tmpPath string) (*os.File, error) {
+	if fi, err := os.Lstat(tmpPath); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("refusing to install: %s is a symlink", tmpPath)
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("refusing to install: %s is not a regular file", tmpPath)
+		}
+		if err := os.Remove(tmpPath); err != nil {
+			return nil, fmt.Errorf("remove stale %s: %w", tmpPath, err)
+		}
+	}
+
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY|oNoFollow, 0o700)
+	if err != nil {
+		return nil, fmt.Errorf("create %s: %w", tmpPath, err)
+	}
+	if err := tmp.Chmod(0o755); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+		tmp.Close()
+		if rmErr := os.Remove(tmpPath); rmErr != nil {
+			return nil, fmt.Errorf("chmod %s: %w (and it could not be removed: %v)", tmpPath, err, rmErr)
+		}
+		return nil, fmt.Errorf("chmod %s: %w", tmpPath, err)
+	}
+	return tmp, nil
 }
 
 // IsDevBuild reports whether v is a local development build: the bare "dev"

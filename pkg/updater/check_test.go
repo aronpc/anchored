@@ -407,3 +407,74 @@ func TestCheck_OlderTagIsRefusedAsNotNewer(t *testing.T) {
 		t.Fatal("assets must still resolve so --force can install the downgrade")
 	}
 }
+
+// The staging file becomes the installed binary via rename, so whoever owns it
+// owns what the machine runs next. These three cases are the ones that made
+// the old O_CREATE|O_TRUNC open a local privilege escalation on any install
+// directory writable by more than one principal.
+func TestCreateStagingFile_RefusesASymlink(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("ORIGINAL SECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tmpPath := filepath.Join(dir, "anchored.new")
+	if err := os.Symlink(victim, tmpPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := createStagingFile(tmpPath); err == nil {
+		t.Fatal("a symlink at the staging path must be refused, not followed")
+	}
+	got, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ORIGINAL SECRET" {
+		t.Fatalf("wrote through the symlink: victim is now %q", got)
+	}
+}
+
+// A file planted by another user keeps its owner and mode under O_CREATE, so
+// reusing it would hand them the installed binary. It must be replaced, not
+// written into.
+func TestCreateStagingFile_ReplacesAStaleFileRatherThanReusingIt(t *testing.T) {
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, "anchored.new")
+	if err := os.WriteFile(tmpPath, []byte("PLANTED"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := createStagingFile(tmpPath)
+	if err != nil {
+		t.Fatalf("a stale regular file should be replaced: %v", err)
+	}
+	defer f.Close()
+
+	fi, err := os.Stat(tmpPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 0 {
+		t.Errorf("stale content survived: %d bytes", fi.Size())
+	}
+	if perm := fi.Mode().Perm(); perm != 0o755 {
+		t.Errorf("mode = %04o, want 0755 — an inherited 0666 would leave the installed binary writable", perm)
+	}
+}
+
+func TestCreateStagingFile_CreatesExecutableAndEmpty(t *testing.T) {
+	tmpPath := filepath.Join(t.TempDir(), "anchored.new")
+	f, err := createStagingFile(tmpPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fi, err := os.Stat(tmpPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o755 {
+		t.Errorf("mode = %04o, want 0755", perm)
+	}
+}
