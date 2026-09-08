@@ -45,7 +45,7 @@ func runSelfUpdate(args []string) {
 Updates the anchored binary from the latest official release.
 
   --check   report only; never writes
-  --json    machine-readable output
+  --json    machine-readable output (works with --check and on apply)
   --force   install past a refusal you have decided against
   --yes     skip the confirmation --force asks before replacing a dev build
   --version install a specific published version instead of the latest
@@ -97,14 +97,34 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	// an install and did not get one — with one exception: being already on
 	// the requested version is the outcome they wanted, so it exits 0. `anchored
 	// self-update && ...` has to survive being run twice.
+	if *jsonOut && *force && !*assumeYes {
+		// The confirmation prompt writes to stdout, which would corrupt the
+		// document. --json is a machine-readable contract, so consent has to
+		// be given up front.
+		fmt.Fprintln(os.Stderr, "anchored self-update: --json with --force needs --yes (the confirmation prompt cannot share stdout)")
+		os.Exit(1)
+	}
+
 	if res.Blocked == updater.BlockNotNewer && !*force && *target == "" {
-		fmt.Printf("Already on the latest release (%s).\n", formatV(res.Latest))
+		if *jsonOut {
+			fmt.Println(renderApplyJSON(applyOutcome{Action: "already_current", Current: res.Current}))
+		} else {
+			fmt.Printf("Already on the latest release (%s).\n", formatV(res.Latest))
+		}
 		os.Exit(0)
 	}
 
 	if res.Blocked != updater.BlockNone {
 		if !*force || !forceOverridable(res.Blocked) {
-			if res.Blocked == updater.BlockNotNewer && *target != "" {
+			if *jsonOut {
+				fmt.Println(renderApplyJSON(applyOutcome{
+					Action:   "refused",
+					Current:  res.Current,
+					Latest:   res.Latest,
+					Blocked:  string(res.Blocked),
+					Override: overrideCommand(*target),
+				}))
+			} else if res.Blocked == updater.BlockNotNewer && *target != "" {
 				fmt.Fprint(os.Stderr, renderDowngradeRefusal(res))
 			} else {
 				fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res, *target))
@@ -143,8 +163,72 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 		os.Exit(1)
 	}
 
+	plugin := syncPluginAfterUpdate(*configPath, res, *noPlugin, *force)
+
+	if *jsonOut {
+		out := applyOutcome{
+			Action:   "installed",
+			Current:  res.Current,
+			Latest:   res.Latest,
+			BinPath:  res.BinPath,
+			Previous: res.BinPath + ".prev",
+		}
+		if !plugin.Skipped {
+			out.Plugin = &pluginJSON{
+				MarketplaceDir: plugin.MarketplaceDir,
+				CacheDir:       plugin.CacheDir,
+				Installed:      plugin.Drift.CacheInstalled,
+				Version:        plugin.Drift.CacheVersion,
+				Error:          firstNonEmpty(plugin.ConfigError, plugin.Drift.SyncError, plugin.Drift.CacheInstallError),
+			}
+			if plugin.MarketplaceMissing {
+				out.Plugin.Error = "marketplace directory does not exist"
+			}
+		}
+		fmt.Println(renderApplyJSON(out))
+		return
+	}
+
 	fmt.Print(renderSelfUpdateInstalled(res))
-	fmt.Print(renderPluginSyncOutcome(syncPluginAfterUpdate(*configPath, res, *noPlugin, *force)))
+	fmt.Print(renderPluginSyncOutcome(plugin))
+}
+
+// applyOutcome is the machine-readable result of an apply. Action is the
+// field a script should branch on: installed, already_current or refused.
+type applyOutcome struct {
+	Action   string      `json:"action"`
+	Current  string      `json:"current,omitempty"`
+	Latest   string      `json:"latest,omitempty"`
+	BinPath  string      `json:"bin_path,omitempty"`
+	Previous string      `json:"previous,omitempty"`
+	Blocked  string      `json:"blocked,omitempty"`
+	Override string      `json:"override,omitempty"`
+	Plugin   *pluginJSON `json:"plugin,omitempty"`
+}
+
+type pluginJSON struct {
+	MarketplaceDir string `json:"marketplace_dir,omitempty"`
+	CacheDir       string `json:"cache_dir,omitempty"`
+	Installed      bool   `json:"installed"`
+	Version        string `json:"version,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+func renderApplyJSON(o applyOutcome) string {
+	out, err := json.Marshal(o)
+	if err != nil {
+		return fmt.Sprintf("{\"error\":%q}", err.Error())
+	}
+	return string(out)
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // pluginSyncOutcome is the plugin half of an update, reported separately on

@@ -72,6 +72,9 @@ First run creates `~/.anchored/` and downloads the local embedding model when ne
 anchored self-update             # install the latest release; exits 0 if already current
 anchored self-update --check     # report only; exits 10 when an update is available
 anchored self-update --version v0.17.0   # pin to a release (a downgrade needs --force)
+anchored self-update --force --yes       # install past a refusal, no prompt
+anchored self-update --json      # machine-readable result; branch on .action
+anchored self-update --no-plugin # leave the Claude Code plugin alone
 ```
 
 The download is verified against the release checksums before anything is

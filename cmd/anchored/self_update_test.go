@@ -712,3 +712,48 @@ func TestSudoHint_QuotesThePath(t *testing.T) {
 		t.Fatalf("path not quoted: %q", got)
 	}
 }
+
+// --json in apply mode used to be ignored silently, which is the worst of the
+// three possible behaviours: the flag is accepted, the contract is not
+// honoured, and nothing says so.
+func TestRenderApplyJSON_BranchableAction(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  applyOutcome
+		want string
+	}{
+		{"installed", applyOutcome{Action: "installed", Current: "0.17.0", Latest: "0.18.0", BinPath: "/b", Previous: "/b.prev"}, "installed"},
+		{"already current", applyOutcome{Action: "already_current", Current: "0.18.0"}, "already_current"},
+		{"refused", applyOutcome{Action: "refused", Blocked: "dev-build", Override: "anchored self-update --force"}, "refused"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got map[string]any
+			if err := json.Unmarshal([]byte(renderApplyJSON(tc.out)), &got); err != nil {
+				t.Fatalf("not valid JSON: %v", err)
+			}
+			if got["action"] != tc.want {
+				t.Errorf("action = %v, want %q", got["action"], tc.want)
+			}
+		})
+	}
+}
+
+// Absent fields must be omitted rather than shipped empty, so a consumer can
+// tell "no plugin was touched" from "the plugin failed".
+func TestRenderApplyJSON_OmitsWhatDidNotHappen(t *testing.T) {
+	raw := renderApplyJSON(applyOutcome{Action: "already_current", Current: "0.18.0"})
+	for _, absent := range []string{"plugin", "blocked", "override", "bin_path"} {
+		if strings.Contains(raw, absent) {
+			t.Errorf("%q should be omitted: %s", absent, raw)
+		}
+	}
+}
+
+func TestFirstNonEmpty(t *testing.T) {
+	if got := firstNonEmpty("", "", "third"); got != "third" {
+		t.Errorf("got %q", got)
+	}
+	if got := firstNonEmpty("", ""); got != "" {
+		t.Errorf("got %q, want empty", got)
+	}
+}
