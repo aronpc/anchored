@@ -30,10 +30,13 @@ import (
 
 const (
 	defaultRepo  = "jholhewres/anchored"
-	apiURL       = "https://api.github.com/repos/%s/releases/latest"
 	checkTimeout = 8 * time.Second
 	dlTimeout    = 90 * time.Second
 )
+
+// releaseAPIURL is a var rather than a const so tests can point the release
+// lookup at a local server instead of GitHub.
+var releaseAPIURL = "https://api.github.com/repos/%s/releases/latest"
 
 // Options controls a single update attempt.
 type Options struct {
@@ -41,97 +44,75 @@ type Options struct {
 	CurrentVersion string // Semver without leading "v".
 	BinPath        string // Path to the binary to replace. Empty resolves via os.Executable.
 	Logger         *slog.Logger
+
+	// AlwaysResolve makes Check contact the release API even when a local
+	// guard already refused the update, so an interactive caller can report
+	// the available version next to the reason it was refused. The
+	// background path leaves it false to keep dev-build startups offline.
+	AlwaysResolve bool
 }
 
 // Run performs a non-blocking self-update. It is safe to invoke from a
-// goroutine: any failure is logged and swallowed.
+// goroutine: any failure is logged and swallowed. Policy lives in Check; Run
+// decides only what to log and when to stop.
 func Run(ctx context.Context, opts Options) {
-	if os.Getenv("ANCHORED_NO_AUTOUPDATE") == "1" {
-		return
-	}
-
 	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
 
-	if opts.CurrentVersion == "" {
-		return
-	}
-
-	if IsDevBuild(opts.CurrentVersion) {
-		// A dev build installed into the canonical dir is an intentional
-		// local checkout (make sync-bin); self-updating it would silently
-		// revert the developer's working binary back to the release tag.
-		log.Debug("autoupdate: dev build, self-update disabled", "current", opts.CurrentVersion)
-		return
-	}
-
-	binPath := opts.BinPath
-	if binPath == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			log.Debug("autoupdate: cannot resolve executable", "error", err)
-			return
-		}
-		binPath, _ = filepath.EvalSymlinks(exe)
-		if binPath == "" {
-			binPath = exe
-		}
-	}
-
-	// Only auto-update binaries installed under ~/.anchored/bin. Dev builds
-	// (running ./bin/anchored from a checkout) must never be overwritten.
-	home, _ := os.UserHomeDir()
-	canonical := filepath.Join(home, ".anchored", "bin")
-	if !strings.HasPrefix(binPath, canonical+string(filepath.Separator)) {
-		log.Debug("autoupdate: skip, binary outside canonical dir", "path", binPath)
-		return
-	}
-
-	repo := opts.Repo
-	if repo == "" {
-		repo = defaultRepo
-	}
-
 	checkCtx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
 
-	latest, asset, assetName, checksums, err := fetchLatest(checkCtx, repo)
+	res, err := Check(checkCtx, opts)
 	if err != nil {
-		// Promoted from Debug → Warn: silent failures here meant users had
-		// no signal when their auto-update was broken (network down, repo
-		// renamed, asset matrix changed, GitHub rate-limit). Background
-		// goroutine, so noise stays minimal — one line per startup at most.
+		if errors.Is(err, ErrResolveExecutable) {
+			log.Debug("autoupdate: cannot resolve executable", "error", err)
+			return
+		}
+		// Warn, not Debug: silent failures here meant users had no signal
+		// when their auto-update was broken (network down, repo renamed,
+		// asset matrix changed, GitHub rate-limit). Background goroutine, so
+		// noise stays minimal — one line per startup at most.
 		log.Warn("autoupdate: check failed", "error", err)
 		return
 	}
 
-	if !isNewer(latest, opts.CurrentVersion) {
-		log.Debug("autoupdate: already on latest", "current", opts.CurrentVersion, "latest", latest)
+	switch res.Blocked {
+	case BlockEnvDisabled, BlockNoVersion:
+		return
+	case BlockDevBuild:
+		// A dev build installed into the canonical dir is an intentional
+		// local checkout (make sync-bin); self-updating it would silently
+		// revert the developer's working binary back to the release tag.
+		log.Debug("autoupdate: dev build, self-update disabled", "current", res.Current)
+		return
+	case BlockOutsideCanonical:
+		log.Debug("autoupdate: skip, binary outside canonical dir", "path", res.BinPath)
+		return
+	case BlockNotNewer:
+		log.Debug("autoupdate: already on latest", "current", res.Current, "latest", res.Latest)
 		return
 	}
 
-	log.Info("autoupdate: new version available", "current", opts.CurrentVersion, "latest", latest)
+	log.Info("autoupdate: new version available", "current", res.Current, "latest", res.Latest)
 
 	dlCtx, dlCancel := context.WithTimeout(ctx, dlTimeout)
 	defer dlCancel()
 
-	wantSum, err := fetchChecksum(dlCtx, checksums, assetName)
-	if err != nil {
-		// Refuse to install without a verified digest. GoReleaser publishes
-		// checksums.txt for every release; if it isn't reachable, treat the
-		// download as untrusted and skip the swap.
-		log.Warn("autoupdate: checksum lookup failed, skipping install", "error", err)
-		return
-	}
-
-	if err := downloadAndReplace(dlCtx, asset, binPath, wantSum); err != nil {
+	if err := Apply(dlCtx, res); err != nil {
+		if errors.Is(err, ErrChecksumLookup) {
+			// Refuse to install without a verified digest. GoReleaser
+			// publishes checksums.txt for every release; if it isn't
+			// reachable, treat the download as untrusted and skip the swap.
+			log.Warn("autoupdate: checksum lookup failed, skipping install", "error", err)
+			return
+		}
 		log.Warn("autoupdate: install failed", "error", err)
 		return
 	}
 
-	log.Info("autoupdate: installed, restart MCP server to activate", "version", latest, "path", binPath, "backup", binPath+".prev")
+	log.Info("autoupdate: installed, restart MCP server to activate", "version", res.Latest, "path", res.BinPath, "backup", res.BinPath+".prev")
 }
 
 type ghRelease struct {
@@ -147,7 +128,7 @@ type ghRelease struct {
 // later to look up the right line in checksums.txt; the checksum URL is
 // resolved here so we can fail fast if GoReleaser stopped publishing it.
 func fetchLatest(ctx context.Context, repo string) (version string, assetURL string, assetName string, checksumsURL string, err error) {
-	url := fmt.Sprintf(apiURL, repo)
+	url := fmt.Sprintf(releaseAPIURL, repo)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", "", "", "", err
@@ -202,7 +183,8 @@ func fetchLatest(ctx context.Context, repo string) (version string, assetURL str
 // fetchChecksum downloads checksums.txt and returns the lowercase hex sha256
 // for assetName. The file is small (one line per asset, ~80 bytes each), so
 // reading it whole is fine. Format follows GoReleaser/sha256sum convention:
-//   <hex digest>  <filename>
+//
+//	<hex digest>  <filename>
 func fetchChecksum(ctx context.Context, url, assetName string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
