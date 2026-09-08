@@ -131,9 +131,12 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 			}
 			os.Exit(1)
 		}
-		// Replacing a dev build is the one override that destroys work which
-		// exists nowhere else, so it is the one that asks first.
-		if res.Blocked == updater.BlockDevBuild {
+		// Keyed on the property, not on which refusal won the race: Check
+		// reports only the first, and the env kill switch is evaluated before
+		// the dev-build guard — so ANCHORED_NO_AUTOUPDATE=1, which is exactly
+		// what someone working from a checkout sets, used to skip the prompt
+		// and overwrite the dev build without asking.
+		if updater.IsDevBuild(res.Current) {
 			ok, err := confirmDevBuildOverwrite(res, os.Stdin, os.Stdout, *assumeYes, stdinIsTTY())
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "anchored self-update: %v\n", err)

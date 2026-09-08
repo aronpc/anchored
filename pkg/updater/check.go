@@ -126,7 +126,7 @@ func Apply(ctx context.Context, res Result) error {
 		return errors.New("updater: result carries no target binary path")
 	}
 
-	sum, err := fetchChecksum(ctx, res.ChecksumsURL, res.AssetName)
+	sum, err := resolveChecksum(ctx, res.ChecksumsURL, res.AssetURL, res.AssetName)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrChecksumLookup, err)
 	}

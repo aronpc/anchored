@@ -709,3 +709,35 @@ func TestAssertTrustedDownloadURL(t *testing.T) {
 		}
 	}
 }
+
+// The windows release publishes a zip, not a tar.gz. A tar-only asset lookup
+// meant self-update reported "no archive for windows/amd64" and stopped.
+func TestFetchRelease_AcceptsAZipAsset(t *testing.T) {
+	assetName := fmt.Sprintf("anchored_0.19.0_%s_%s.zip", runtime.GOOS, runtime.GOARCH)
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	mux.HandleFunc("/release", func(w http.ResponseWriter, r *http.Request) {
+		payload := map[string]any{
+			"tag_name": "v0.19.0",
+			"assets": []map[string]string{
+				{"name": assetName, "browser_download_url": srv.URL + "/" + assetName},
+				{"name": "checksums.txt", "browser_download_url": srv.URL + "/checksums.txt"},
+			},
+		}
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			t.Errorf("encode: %v", err)
+		}
+	})
+	orig := releaseAPIURL
+	releaseAPIURL = srv.URL + "/release?repo=%s"
+	defer func() { releaseAPIURL = orig }()
+
+	_, url, name, _, err := fetchRelease(context.Background(), "o/r", "")
+	if err != nil {
+		t.Fatalf("a zip asset must resolve: %v", err)
+	}
+	if name != assetName || url == "" {
+		t.Fatalf("name=%q url=%q", name, url)
+	}
+}

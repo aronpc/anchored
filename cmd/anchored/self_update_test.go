@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -755,5 +756,34 @@ func TestFirstNonEmpty(t *testing.T) {
 	}
 	if got := firstNonEmpty("", ""); got != "" {
 		t.Errorf("got %q, want empty", got)
+	}
+}
+
+// Check reports only the first refusal and evaluates the env kill switch
+// before the dev-build guard, so keying the prompt on res.Blocked let
+// ANCHORED_NO_AUTOUPDATE=1 — what someone working from a checkout sets —
+// overwrite a dev build with no question asked.
+func TestConfirmationIsKeyedOnTheBuildNotTheRefusal(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	bin := filepath.Join(dir, ".anchored", "bin", "anchored")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("ANCHORED_NO_AUTOUPDATE", "1")
+	res, err := updater.Check(context.Background(), updater.Options{
+		CurrentVersion: "0.17.0-dev+gabc",
+		BinPath:        bin,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Blocked != updater.BlockEnvDisabled {
+		t.Fatalf("precondition: the env guard should win the race, got %q", res.Blocked)
+	}
+	// The old gate compared res.Blocked to BlockDevBuild and so was false here.
+	if !updater.IsDevBuild(res.Current) {
+		t.Fatal("the current version is a dev build and must still be treated as one")
 	}
 }

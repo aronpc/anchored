@@ -7,5 +7,5 @@ bin/
 node-compile-cache/
 .claude/settings.local.json
 
-# Working notes for in-flight tasks; the durable artifact is docs/SPEC.md.
+# Working notes for in-flight tasks; they are not repository artifacts.
 tasks/

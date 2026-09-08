@@ -88,6 +88,11 @@ since overwriting it would revert your own work to the release tag. When that
 is what you want, `--force` says so explicitly and asks before replacing it.
 `anchored doctor` reports when a release is available.
 
+Every published platform is covered: the linux and windows archives are
+digested in `checksums.txt`, and the darwin archives — built on a macOS runner,
+since CGO with FTS5 cannot cross-compile — carry a `.sha256` sidecar that the
+updater falls back to.
+
 Self-update trusts GitHub's release infrastructure. The checksum it verifies
 protects the download from corruption and tampering in transit; it does not
 prove who built the binary.

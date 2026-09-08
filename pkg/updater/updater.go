@@ -217,16 +217,23 @@ func fetchRelease(ctx context.Context, repo, tag string) (version string, assetU
 		return "", "", "", "", fmt.Errorf("release tag_name is not a version: %q", rel.TagName)
 	}
 
-	wantSuffix := fmt.Sprintf("_%s_%s_%s.tar.gz", version, runtime.GOOS, runtime.GOARCH)
-	for _, a := range rel.Assets {
-		if strings.HasSuffix(a.Name, wantSuffix) {
-			assetURL = a.BrowserDownloadURL
-			assetName = a.Name
+	// The release publishes tar.gz for unix and zip for windows, so both are
+	// accepted rather than assuming one format for every platform.
+	for _, ext := range []string{".tar.gz", ".zip"} {
+		want := fmt.Sprintf("_%s_%s_%s%s", version, runtime.GOOS, runtime.GOARCH, ext)
+		for _, a := range rel.Assets {
+			if strings.HasSuffix(a.Name, want) {
+				assetURL = a.BrowserDownloadURL
+				assetName = a.Name
+				break
+			}
+		}
+		if assetURL != "" {
 			break
 		}
 	}
 	if assetURL == "" {
-		return "", "", "", "", fmt.Errorf("no asset for %s/%s with version %s", runtime.GOOS, runtime.GOARCH, version)
+		return "", "", "", "", fmt.Errorf("release %s publishes no archive for %s/%s", version, runtime.GOOS, runtime.GOARCH)
 	}
 	if err := assertTrustedDownloadURL(assetURL); err != nil {
 		return "", "", "", "", err
@@ -245,6 +252,31 @@ func fetchRelease(ctx context.Context, repo, tag string) (version string, assetU
 		return "", "", "", "", err
 	}
 	return version, assetURL, assetName, checksumsURL, nil
+}
+
+// resolveChecksum finds the expected digest for assetName.
+//
+// checksums.txt is produced by GoReleaser and therefore covers only the
+// archives GoReleaser builds. The darwin archives are built by a separate
+// macOS job — CGO with FTS5 cannot cross-compile from the Linux runner — and
+// carry a `<asset>.sha256` sidecar instead. Without the fallback, every
+// update on a Mac resolved an asset and then refused to install it for want
+// of a digest.
+func resolveChecksum(ctx context.Context, checksumsURL, assetURL, assetName string) (string, error) {
+	sum, err := fetchChecksum(ctx, checksumsURL, assetName)
+	if err == nil {
+		return sum, nil
+	}
+
+	sidecarURL := assetURL + ".sha256"
+	if sidecarErr := assertTrustedDownloadURL(sidecarURL); sidecarErr != nil {
+		return "", err
+	}
+	sum, sidecarErr := fetchChecksum(ctx, sidecarURL, assetName)
+	if sidecarErr != nil {
+		return "", fmt.Errorf("%v (and no %s sidecar: %v)", err, filepath.Base(sidecarURL), sidecarErr)
+	}
+	return sum, nil
 }
 
 // fetchChecksum downloads checksums.txt and returns the lowercase hex sha256
@@ -327,18 +359,28 @@ func downloadAndReplaceLimited(ctx context.Context, url, dst, wantSum string, ma
 	hasher := sha256.New()
 	tee := io.TeeReader(resp.Body, hasher)
 
-	gz, err := gzip.NewReader(tee)
-	if err != nil {
-		return fmt.Errorf("gzip: %w", err)
-	}
-	defer gz.Close()
-
-	tr := tar.NewReader(gz)
 	tmp, err := createStagingFile(filepath.Dir(dst))
 	if err != nil {
 		return err
 	}
 	tmpPath := tmp.Name()
+
+	if strings.HasSuffix(url, ".zip") {
+		// A zip reader needs random access, so the archive is staged whole
+		// before extraction — bounded the same way as the tar path.
+		return installFromZip(tee, hasher, tmp, tmpPath, dst, wantSum, maxBytes)
+	}
+
+	gz, err := gzip.NewReader(tee)
+	if err != nil {
+		if abortErr := abortStaging(tmp, tmpPath, fmt.Errorf("gzip: %w", err)); abortErr != nil {
+			return abortErr
+		}
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
 
 	written := false
 	// Cumulative, and checked before the entry filter: tar.Next must inflate
@@ -358,7 +400,7 @@ func downloadAndReplaceLimited(ctx context.Context, url, dst, wantSum string, ma
 				fmt.Errorf("tar entry %q declares %d bytes, over the remaining %d byte budget", hdr.Name, hdr.Size, budget))
 		}
 		budget -= hdr.Size
-		if hdr.Typeflag != tar.TypeReg || filepath.Base(hdr.Name) != "anchored" {
+		if hdr.Typeflag != tar.TypeReg || !isAnchoredBinary(hdr.Name) {
 			continue
 		}
 		// Rejected rather than truncated: a clipped binary that happened to
@@ -402,6 +444,11 @@ func downloadAndReplaceLimited(ctx context.Context, url, dst, wantSum string, ma
 		return fmt.Errorf("checksum mismatch: want %s got %s", wantSum, gotSum)
 	}
 
+	return swapInPlace(tmpPath, dst)
+}
+
+// swapInPlace backs up dst and moves the staged binary over it.
+func swapInPlace(tmpPath, dst string) error {
 	// The backup is a hardlink, not a rename: dst keeps existing for the
 	// whole operation, so a client spawning `anchored serve` mid-update never
 	// finds the path missing. That also makes the single rename below a true
@@ -439,6 +486,13 @@ func downloadAndReplaceLimited(ctx context.Context, url, dst, wantSum string, ma
 		return fmt.Errorf("rename: %w", err)
 	}
 	return nil
+}
+
+// isAnchoredBinary reports whether an archive entry is the binary we install.
+// The windows build ships it as anchored.exe.
+func isAnchoredBinary(name string) bool {
+	base := filepath.Base(name)
+	return base == "anchored" || base == "anchored.exe"
 }
 
 // backupCurrent links dst to prevPath so dst keeps existing for the whole
