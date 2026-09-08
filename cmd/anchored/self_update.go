@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,7 +18,10 @@ import (
 // be installed if applied.
 const exitUpdateAvailable = 10
 
-const selfUpdateCheckTimeout = 15 * time.Second
+const (
+	selfUpdateCheckTimeout = 15 * time.Second
+	selfUpdateApplyTimeout = 3 * time.Minute
+)
 
 func runSelfUpdate(args []string) {
 	fs := newFlagSet("self-update")
@@ -55,19 +59,77 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 		os.Exit(1)
 	}
 
-	if *jsonOut {
-		fmt.Println(renderSelfUpdateJSON(res))
+	if *check {
+		if *jsonOut {
+			fmt.Println(renderSelfUpdateJSON(res))
+		} else {
+			fmt.Print(renderSelfUpdateCheck(res))
+		}
 		os.Exit(selfUpdateExitCode(res))
 	}
 
-	fmt.Print(renderSelfUpdateCheck(res))
-	if !*check {
-		// Same idiom as `anchored migrate`: say plainly that a bare
-		// invocation changed nothing, so nobody walks away believing the
-		// update ran.
-		fmt.Println("\nNothing was written — this command currently only reports.")
+	// Apply mode. The user asked for an install, so a refusal is a failure
+	// here — unlike --check, where it is just the state of the world.
+	if res.Blocked != updater.BlockNone {
+		fmt.Fprint(os.Stderr, renderSelfUpdateCheck(res))
+		os.Exit(1)
 	}
-	os.Exit(selfUpdateExitCode(res))
+
+	// Checked before downloading: finding out about a read-only target after
+	// pulling several MB is pure waste, and the message the user needs is the
+	// same either way.
+	if err := ensureWritable(res.BinPath); err != nil {
+		fmt.Fprintf(os.Stderr, "anchored self-update: %v\n\nTry: %s\n", err, sudoHint(os.Args))
+		os.Exit(1)
+	}
+
+	applyCtx, applyCancel := context.WithTimeout(context.Background(), selfUpdateApplyTimeout)
+	defer applyCancel()
+
+	if err := updater.Apply(applyCtx, res); err != nil {
+		fmt.Fprintf(os.Stderr, "anchored self-update: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Print(renderSelfUpdateInstalled(res))
+}
+
+// ensureWritable reports whether the binary at path can be replaced. The swap
+// renames within the parent directory, so directory write permission is what
+// decides it — a writable file inside a read-only directory cannot be
+// replaced. Probing with a real temp file is the only check that agrees with
+// what rename will do.
+func ensureWritable(path string) error {
+	dir := filepath.Dir(path)
+	probe, err := os.CreateTemp(dir, ".anchored-write-probe-")
+	if err != nil {
+		return fmt.Errorf("cannot write %s: %w", dir, err)
+	}
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		os.Remove(name)
+		return fmt.Errorf("cannot write %s: %w", dir, err)
+	}
+	if err := os.Remove(name); err != nil {
+		return fmt.Errorf("cannot clean up the write probe in %s: %w", dir, err)
+	}
+	return nil
+}
+
+// sudoHint echoes back the invocation the user typed, prefixed with sudo, so
+// the suggestion never drifts out of date as flags are added.
+func sudoHint(argv []string) string {
+	return "sudo " + strings.Join(argv, " ")
+}
+
+func renderSelfUpdateInstalled(res updater.Result) string {
+	return fmt.Sprintf(`Installed %s (was %s)
+  binary    %s
+  previous  %s
+
+Restart your MCP clients (Claude Code, Cursor, ...) to pick up the new
+binary — a running server keeps the old one until it exits.
+`, formatV(res.Latest), formatV(res.Current), res.BinPath, res.BinPath+".prev")
 }
 
 // selfUpdateCurrentVersion strips the leading "v" that ldflags bakes into

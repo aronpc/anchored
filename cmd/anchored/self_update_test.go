@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -183,4 +184,89 @@ func captureUsage(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return string(out)
+}
+
+func TestEnsureWritable_AcceptsWritableTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "anchored")
+	if err := os.WriteFile(path, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureWritable(path); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+// The swap renames within the parent dir, so write permission on the DIR is
+// what actually matters — a writable file inside a read-only dir still fails.
+func TestEnsureWritable_RejectsReadOnlyParentDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "anchored")
+	if err := os.WriteFile(path, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+
+	err := ensureWritable(path)
+	if err == nil {
+		t.Fatal("expected an error for a read-only parent dir")
+	}
+	if !strings.Contains(err.Error(), dir) {
+		t.Errorf("error should name the directory, got %v", err)
+	}
+}
+
+func TestEnsureWritable_ChecksParentWhenFileAbsent(t *testing.T) {
+	dir := t.TempDir()
+	if err := ensureWritable(filepath.Join(dir, "not-there-yet")); err != nil {
+		t.Fatalf("a fresh install into a writable dir must pass, got %v", err)
+	}
+}
+
+func TestEnsureWritable_LeavesNoProbeBehind(t *testing.T) {
+	dir := t.TempDir()
+	if err := ensureWritable(filepath.Join(dir, "anchored")); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("write probe leaked: %v", entries)
+	}
+}
+
+// The hint has to be the command the user actually typed, or it ages every
+// time a flag is added.
+func TestSudoHint_EchoesTheInvocation(t *testing.T) {
+	got := sudoHint([]string{"/usr/local/bin/anchored", "self-update", "--force"})
+	want := "sudo /usr/local/bin/anchored self-update --force"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestRenderSelfUpdateInstalled(t *testing.T) {
+	out := renderSelfUpdateInstalled(updater.Result{
+		Current: "0.17.0",
+		Latest:  "0.18.0",
+		BinPath: "/home/u/.anchored/bin/anchored",
+	})
+	for _, want := range []string{"0.17.0", "0.18.0", "/home/u/.anchored/bin/anchored", ".prev"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("success report missing %q\n---\n%s", want, out)
+		}
+	}
+	// A swapped binary does not reach a running MCP server; saying so is the
+	// difference between "it worked" and "it worked and you must restart".
+	if !strings.Contains(strings.ToLower(out), "restart") {
+		t.Errorf("success report does not tell the user to restart\n---\n%s", out)
+	}
 }
