@@ -1,0 +1,164 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/jholhewres/anchored/pkg/updater"
+)
+
+// exitUpdateAvailable is a distinct exit code so `self-update --check` can be
+// polled from a script: 0 means nothing to do (up to date, or refused and
+// therefore inert), 1 means the check itself failed, 10 means an update would
+// be installed if applied.
+const exitUpdateAvailable = 10
+
+const selfUpdateCheckTimeout = 15 * time.Second
+
+func runSelfUpdate(args []string) {
+	fs := newFlagSet("self-update")
+	check := fs.Bool("check", false, "report the available version and exit without writing")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON ({current, latest, bin_path, update_available, blocked})")
+	fs.Usage = func() {
+		fmt.Fprint(os.Stderr, `Usage: anchored self-update [--check] [--json]
+
+Updates the anchored binary from the latest official release.
+
+  --check   report only; never writes
+  --json    machine-readable output
+
+Exit codes: 0 nothing to do, 10 an update is available, 1 the check failed.
+
+Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
+`)
+	}
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), selfUpdateCheckTimeout)
+	defer cancel()
+
+	// AlwaysResolve so a refused check still reports the release that is
+	// out there — the whole point of the command is that a user who hits a
+	// guard learns both the reason and the version they are missing.
+	res, err := updater.Check(ctx, updater.Options{
+		CurrentVersion: selfUpdateCurrentVersion(Version),
+		BinPath:        anchoredBinaryPath(),
+		AlwaysResolve:  true,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "anchored self-update: %v\n", err)
+		os.Exit(1)
+	}
+
+	if *jsonOut {
+		fmt.Println(renderSelfUpdateJSON(res))
+		os.Exit(selfUpdateExitCode(res))
+	}
+
+	fmt.Print(renderSelfUpdateCheck(res))
+	if !*check {
+		// Same idiom as `anchored migrate`: say plainly that a bare
+		// invocation changed nothing, so nobody walks away believing the
+		// update ran.
+		fmt.Println("\nNothing was written — this command currently only reports.")
+	}
+	os.Exit(selfUpdateExitCode(res))
+}
+
+// selfUpdateCurrentVersion strips the leading "v" that ldflags bakes into
+// Version. The updater compares versions numerically, and Atoi("v0") is 0, so
+// a "v"-prefixed major would silently compare as zero.
+func selfUpdateCurrentVersion(v string) string {
+	return strings.TrimPrefix(v, "v")
+}
+
+// selfUpdateExitCode maps a check onto a shell-usable code. A refused result
+// exits 0 on purpose: without an override nothing will happen, so a poller
+// must not treat it as pending work.
+func selfUpdateExitCode(res updater.Result) int {
+	if res.Blocked == updater.BlockNone && res.Newer {
+		return exitUpdateAvailable
+	}
+	return 0
+}
+
+func renderSelfUpdateJSON(res updater.Result) string {
+	payload := struct {
+		Current         string `json:"current"`
+		Latest          string `json:"latest"`
+		BinPath         string `json:"bin_path"`
+		UpdateAvailable bool   `json:"update_available"`
+		Blocked         string `json:"blocked"`
+	}{
+		Current:         res.Current,
+		Latest:          res.Latest,
+		BinPath:         res.BinPath,
+		UpdateAvailable: res.Blocked == updater.BlockNone && res.Newer,
+		Blocked:         string(res.Blocked),
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Sprintf("{\"error\":%q}", err.Error())
+	}
+	return string(out)
+}
+
+// renderSelfUpdateCheck renders the human report: versions, the file that
+// would be replaced, and a verdict that always names its own cause.
+func renderSelfUpdateCheck(res updater.Result) string {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "installed  %s\n", formatV(res.Current))
+	if res.Latest != "" {
+		fmt.Fprintf(&b, "latest     %s\n", formatV(res.Latest))
+	} else {
+		fmt.Fprintf(&b, "latest     unknown (release not resolved)\n")
+	}
+	fmt.Fprintf(&b, "binary     %s\n\n", res.BinPath)
+	b.WriteString(selfUpdateVerdict(res))
+	return b.String()
+}
+
+func selfUpdateVerdict(res updater.Result) string {
+	switch res.Blocked {
+	case updater.BlockNone:
+		if res.Newer {
+			return fmt.Sprintf("Update available: %s → %s\nRun `anchored self-update` to install it.\n",
+				formatV(res.Current), formatV(res.Latest))
+		}
+		return fmt.Sprintf("Up to date (%s).\n", formatV(res.Current))
+
+	case updater.BlockNotNewer:
+		return fmt.Sprintf("Up to date (%s).\n", formatV(res.Latest))
+
+	case updater.BlockDevBuild:
+		return fmt.Sprintf(`Refused: %s is a local dev build.
+A binary built from a checkout is never overwritten automatically — that
+would revert your own work to the release tag.
+Run `+"`anchored self-update --force`"+` to install %s over it.
+`, formatV(res.Current), formatV(res.Latest))
+
+	case updater.BlockOutsideCanonical:
+		return fmt.Sprintf(`Refused: the binary lives outside ~/.anchored/bin.
+  %s
+Only the canonical install is updated automatically.
+Run `+"`anchored self-update --force`"+` to update this path anyway.
+`, res.BinPath)
+
+	case updater.BlockEnvDisabled:
+		return `Refused: ANCHORED_NO_AUTOUPDATE=1 disables automatic updates.
+Unset it, or run ` + "`anchored self-update --force`" + ` to override it once.
+`
+
+	case updater.BlockNoVersion:
+		return `Refused: this binary reports no version, so there is nothing to
+compare against. It was built without ldflags — use ` + "`make build`" + `.
+`
+	}
+	return fmt.Sprintf("Refused: %s\n", res.Blocked)
+}
