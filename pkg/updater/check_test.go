@@ -623,6 +623,33 @@ func TestDownloadAndReplace_StalePrevIsNotPromotedOnAFreshInstall(t *testing.T) 
 	}
 }
 
+// The companion to the test above, and the one that actually drives the
+// guard: that one fails at the checksum, so it never reaches swapUsing. Here
+// the swap is attempted and the final rename fails, which is the only state
+// where the rollback can run. With no dst there was no backup to roll back
+// to, so promoting the stale .prev would fabricate dst from an old binary —
+// a failed install turned into a silent downgrade.
+func TestSwapUsing_StalePrevIsNotPromotedWhenThereWasNoBackup(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "anchored")
+	if err := os.WriteFile(dst+".prev", []byte("ANCIENT"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A staging path that does not exist is what makes the rename fail.
+	missing := filepath.Join(dir, "never-staged")
+
+	if err := swapUsing(missing, dst, backupByRename); err == nil {
+		t.Fatal("expected the rename to fail")
+	}
+	if _, err := os.Stat(dst); err == nil {
+		got, _ := os.ReadFile(dst)
+		t.Errorf("dst was fabricated from the stale backup: %q", got)
+	}
+	if got, _ := os.ReadFile(dst + ".prev"); string(got) != "ANCIENT" {
+		t.Errorf(".prev was disturbed: %q", got)
+	}
+}
+
 // The tag becomes a URL path segment and Go does not normalize dot-segments,
 // so the shape has to be validated here rather than trusted to whatever the
 // server does with it.
