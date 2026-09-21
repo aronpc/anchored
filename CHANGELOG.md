@@ -34,11 +34,13 @@ Follow-up on the self-update review, before any of it ships in a release.
   the config with a path that is empty unless `--config` is passed, which
   silently resolved to the compiled-in defaults — so `plugin.marketplace_dir`
   and `plugin.cache_dir` were ignored on every ordinary run.
-- **The binary swap works on Windows.** Backing the old binary up by hardlink
-  keeps it in place, and Windows will not let a running `.exe` be replaced,
-  so the final rename could only fail — as could the rollback. The backup
-  strategy is now chosen per platform: hardlink on unix, rename-aside on
-  windows.
+- **The binary swap no longer fails by construction on Windows.** Backing the
+  old binary up by hardlink keeps it in place, and Windows will not let a
+  running `.exe` be replaced, so the final rename could only fail — as could
+  the rollback. The backup strategy is now chosen per platform: hardlink on
+  unix, rename-aside on windows. The windows path is covered by tests through
+  an injected backup step; the platform-tagged code itself has not been run on
+  real hardware.
 - **A hardlink that fails for an unlisted reason no longer fails the update.**
   The degradation to rename was gated on three errnos; FAT, exFAT, fuse and
   overlay mounts report it differently.
