@@ -44,7 +44,12 @@ Follow-up on the self-update review, before any of it ships in a release.
   overlay mounts report it differently.
 - **`--force` no longer pulls a marketplace mirror that is already current.**
   A failed pull escalates to `git reset --hard` plus `git clean -fd`, so an
-  unnecessary refresh put local work in the mirror at risk.
+  unnecessary refresh put local work in the mirror at risk. This narrows the
+  window rather than closing it: the escalation still runs whenever the mirror
+  genuinely is behind, which is the ordinary case after a binary update. Note
+  the behaviour change — `--force` no longer refreshes a mirror carrying the
+  same version, so an upstream plugin fix shipped under an unchanged version
+  has to be pulled through Claude Code's own marketplace update.
 - **The `.sha256` sidecar is consulted only when `checksums.txt` does not list
   the asset**, which is the darwin case it was added for. Falling back on any
   error let whoever could break `checksums.txt` choose the expected digest.

@@ -77,8 +77,13 @@ func detectPluginDrift(cfg *config.Config, binaryVersion string) PluginDrift {
 	return detectPluginDriftWithForce(cfg, binaryVersion, false)
 }
 
-// detectPluginDriftWithForce is detectPluginDrift with the dev-build guard
-// made optional, for a user who asked for the update explicitly.
+// detectPluginDriftWithForce is detectPluginDrift for a user who asked for
+// the update explicitly. force relaxes two conservative defaults, not one:
+// the dev-build guard below is skipped, and a mirror carrying no version
+// stamp at all is treated as behind, since nothing else can tell. It does
+// NOT mean "always refresh" — a mirror already stamped at or above the
+// binary version is left alone, because a needless pull can escalate to
+// git reset --hard.
 func detectPluginDriftWithForce(cfg *config.Config, binaryVersion string, force bool) PluginDrift {
 	d := PluginDrift{
 		BinaryVersion:  binaryVersion,
