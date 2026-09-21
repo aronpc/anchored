@@ -104,8 +104,20 @@ Note: `+"`anchored update <id>`"+` updates a MEMORY, not the binary.
 	// reinstalling the version you are on is not a downgrade, so it must not
 	// fall through to renderDowngradeRefusal below.
 	if res.Blocked == updater.BlockNotNewer && !*force && (*target == "" || res.Latest == res.Current) {
+		// A pinned run resolved that tag, not the newest release, so neither
+		// the message nor the "latest" field may assert what the newest
+		// release is: a poller branching on it would conclude the pin is it.
+		pinned := *target != ""
+		out := applyOutcome{Action: "already_current", Current: res.Current}
+		if pinned {
+			out.Target = res.Latest
+		} else {
+			out.Latest = res.Latest
+		}
 		if *jsonOut {
-			fmt.Println(renderApplyJSON(applyOutcome{Action: "already_current", Current: res.Current, Latest: res.Latest}))
+			fmt.Println(renderApplyJSON(out))
+		} else if pinned {
+			fmt.Printf("Already on %s (pinned).\n", formatV(res.Latest))
 		} else {
 			fmt.Printf("Already on the latest release (%s).\n", formatV(res.Latest))
 		}
@@ -207,6 +219,7 @@ type applyOutcome struct {
 	Action   string      `json:"action"`
 	Current  string      `json:"current,omitempty"`
 	Latest   string      `json:"latest,omitempty"`
+	Target   string      `json:"target,omitempty"`
 	BinPath  string      `json:"bin_path,omitempty"`
 	Previous string      `json:"previous,omitempty"`
 	Blocked  string      `json:"blocked,omitempty"`
@@ -626,6 +639,11 @@ func selfUpdateVerdict(res updater.Result, target string, opts selfUpdateOpts) s
 		return fmt.Sprintf("Up to date (%s).\n", formatV(res.Current))
 
 	case updater.BlockNotNewer:
+		// Same reason as the apply path: a pinned lookup says nothing about
+		// what the newest release is.
+		if target != "" {
+			return fmt.Sprintf("Already on %s (pinned).\n", formatV(res.Latest))
+		}
 		return fmt.Sprintf("Up to date (%s).\n", formatV(res.Latest))
 
 	case updater.BlockDevBuild:

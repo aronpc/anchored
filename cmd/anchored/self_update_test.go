@@ -715,6 +715,35 @@ func TestSelfUpdateVerdict_ReinstallingThePinnedCurrentVersionIsNotADowngrade(t 
 	}
 }
 
+// A pinned lookup resolves that tag, not the newest release, so res.Latest
+// carries the pin. Reporting it as "the latest release" tells a poller the
+// pin is the newest thing published.
+func TestSelfUpdateVerdict_PinnedCurrentVersionIsNotCalledTheLatest(t *testing.T) {
+	out := selfUpdateVerdict(updater.Result{
+		Current: "0.16.0",
+		Latest:  "0.16.0",
+		Blocked: updater.BlockNotNewer,
+	}, "v0.16.0", selfUpdateOpts{})
+	if strings.Contains(out, "Up to date") {
+		t.Errorf("a pinned reinstall must not claim the pin is up to date\n---\n%s", out)
+	}
+	if !strings.Contains(out, "pinned") {
+		t.Errorf("a pinned reinstall should say so\n---\n%s", out)
+	}
+}
+
+// The JSON contract carries the same distinction: a pinned run reports the
+// version under "target", leaving "latest" absent rather than wrong.
+func TestApplyOutcome_PinnedAlreadyCurrentReportsTargetNotLatest(t *testing.T) {
+	raw := renderApplyJSON(applyOutcome{Action: "already_current", Current: "0.16.0", Target: "0.16.0"})
+	if strings.Contains(raw, `"latest"`) {
+		t.Errorf("a pinned already_current must not assert a latest release: %s", raw)
+	}
+	if !strings.Contains(raw, `"target":"0.16.0"`) {
+		t.Errorf("expected the pin under target: %s", raw)
+	}
+}
+
 // A genuinely older pin must still be refused as a downgrade.
 func TestSelfUpdateVerdict_OlderPinIsStillADowngrade(t *testing.T) {
 	out := selfUpdateVerdict(updater.Result{
