@@ -10,6 +10,7 @@ package updater
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -316,7 +317,23 @@ func fetchChecksum(ctx context.Context, url, assetName string) (string, error) {
 		return "", fmt.Errorf("checksums.txt: HTTP %d", resp.StatusCode)
 	}
 
-	scanner := bufio.NewScanner(io.LimitReader(resp.Body, maxChecksumsBytes))
+	// One byte past the ceiling, so a body that reaches the limit is
+	// distinguishable from one that merely fills it.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumsBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read checksums: %w", err)
+	}
+	// SECURITY INVARIANT: a clipped body must not reach the errDigestNotListed
+	// return below. io.LimitReader ends in a clean EOF, so scanning a truncated
+	// file looks exactly like scanning a complete one that omits the asset —
+	// and that sentinel is the single condition authorising the sidecar
+	// fallback. Without this check, padding this response past the ceiling is
+	// enough to choose which file declares the expected digest.
+	if int64(len(body)) > maxChecksumsBytes {
+		return "", fmt.Errorf("checksums.txt exceeds %d bytes", maxChecksumsBytes)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(body))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {

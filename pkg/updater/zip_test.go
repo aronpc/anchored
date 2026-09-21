@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -211,6 +212,48 @@ func TestResolveChecksum_TransportFailureDoesNotReachTheSidecar(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "sidecar") {
 		t.Errorf("a transport failure should not be reported as a sidecar miss, got %v", err)
+	}
+}
+
+// A checksums.txt clipped by the size ceiling is a file that could not be
+// read, not a file that omits the asset — io.LimitReader ends in a clean EOF,
+// so without an explicit length check the scan is indistinguishable from a
+// complete file and hands the sidecar the choice of expected digest.
+func TestResolveChecksum_ATruncatedBodyDoesNotReachTheSidecar(t *testing.T) {
+	localSeam(t)
+	asset := "anchored_1.0.0_linux_amd64.tar.gz"
+
+	// The asset IS listed, but only after more padding than the ceiling admits.
+	padding := strings.Repeat(strings.Repeat("b", 64)+"  filler.tar.gz\n", 20000)
+	if int64(len(padding)) <= maxChecksumsBytes {
+		t.Fatalf("padding %d bytes does not exceed the %d byte ceiling", len(padding), maxChecksumsBytes)
+	}
+
+	var sidecarHits atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/checksums.txt", func(w http.ResponseWriter, r *http.Request) {
+		if _, err := fmt.Fprintf(w, "%s%s  %s\n", padding, strings.Repeat("a", 64), asset); err != nil {
+			return
+		}
+	})
+	mux.HandleFunc("/"+asset+".sha256", func(w http.ResponseWriter, r *http.Request) {
+		sidecarHits.Add(1)
+		if _, err := fmt.Fprintf(w, "%s  %s\n", strings.Repeat("c", 64), asset); err != nil {
+			t.Errorf("write: %v", err)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	sum, err := resolveChecksum(context.Background(), srv.URL+"/checksums.txt", srv.URL+"/"+asset, asset)
+	if err == nil {
+		t.Fatalf("a truncated checksums.txt must not resolve to a digest, got %q", sum)
+	}
+	if n := sidecarHits.Load(); n != 0 {
+		t.Errorf("the sidecar was requested %d time(s) after a truncated body", n)
+	}
+	if errors.Is(err, errDigestNotListed) {
+		t.Errorf("a truncated body must not report as errDigestNotListed, got %v", err)
 	}
 }
 
