@@ -61,12 +61,32 @@ type ONNXPaths struct {
 	TokenizerFile string
 }
 
+// onnxArtifacts is everything about the ONNX embedder that is known without
+// loading the model into memory: where the files live and the identity they
+// produce. LazyONNXEmbedder answers identity questions from it alone.
+type onnxArtifacts struct {
+	paths         *ONNXPaths
+	modelName     string
+	modelRevision string
+}
+
 func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	logger = logger.With("component", "onnx-embedder")
 
+	artifacts, err := prepareONNXArtifacts(modelDir, logger)
+	if err != nil {
+		return nil, err
+	}
+	return loadONNXEmbedder(artifacts, logger)
+}
+
+// prepareONNXArtifacts downloads the runtime and model when missing, hashes
+// them into the model revision and initializes the ONNX environment. It does
+// NOT create an inference session, so it costs no model-sized memory.
+func prepareONNXArtifacts(modelDir string, logger *slog.Logger) (*onnxArtifacts, error) {
 	paths := resolveONNXPaths(modelDir)
 
 	if err := ensureONNXRuntime(paths, logger); err != nil {
@@ -86,6 +106,18 @@ func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error
 			return nil, fmt.Errorf("onnx: init environment: %w", err)
 		}
 	}
+
+	activeModel := onnxModelName
+	if strings.Contains(paths.ModelFile, legacyModelName) {
+		activeModel = legacyModelName
+	}
+	return &onnxArtifacts{paths: paths, modelName: activeModel, modelRevision: modelRevision}, nil
+}
+
+// loadONNXEmbedder creates the inference session: tokenizer, I/O tensors and
+// the model weights (~470 MB for the multilingual model).
+func loadONNXEmbedder(artifacts *onnxArtifacts, logger *slog.Logger) (*ONNXEmbedder, error) {
+	paths := artifacts.paths
 
 	var tokenizer Tokenizer
 	if fileExists(paths.TokenizerFile) {
@@ -156,22 +188,15 @@ func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error
 		return nil, fmt.Errorf("onnx: create session: %w", err)
 	}
 
-	var activeModel string
-	if strings.Contains(paths.ModelFile, legacyModelName) {
-		activeModel = legacyModelName
-	} else {
-		activeModel = onnxModelName
-	}
-
-	logger.Info("ONNX embedder initialized", "model", activeModel, "dims", onnxModelDims)
+	logger.Info("ONNX embedder initialized", "model", artifacts.modelName, "dims", onnxModelDims)
 
 	return &ONNXEmbedder{
 		session:       session,
 		tokenizer:     tokenizer,
 		dims:          onnxModelDims,
 		logger:        logger,
-		modelName:     activeModel,
-		modelRevision: modelRevision,
+		modelName:     artifacts.modelName,
+		modelRevision: artifacts.modelRevision,
 		inputIDs:      inputIDs,
 		attentionMask: attentionMask,
 		tokenTypeIDs:  tokenTypeIDs,

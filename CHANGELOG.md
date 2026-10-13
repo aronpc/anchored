@@ -24,6 +24,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Every session pinned ~600 MB for a model it rarely used** — the ONNX
+  embedder loaded the full multilingual model (470 MB fp32) at MCP startup, and
+  each AI session spawns its own MCP, so ten open sessions held ~6 GB even when
+  idle. The model now loads on the first embed and is released after
+  `embedding.idle_unload_minutes` without use (default 5; negative keeps it
+  loaded). Vectors are unchanged — same artifacts, same identity, no re-embed.
+  Measured on a real database: 671 MB → 154 MB at startup, 172 MB after idle;
+  the first search after an unload pays ~2 s to reload.
 - **A checkout started with no memory of its repository** — project identity
   came from the path, so every checkout of the same repository got a project row
   of its own and an empty memory, while the history stayed under whichever

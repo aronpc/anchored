@@ -74,7 +74,7 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 	if cfg.Embedding.Provider == "none" {
 		logger.Info("embeddings disabled (provider: none), search will be BM25-only")
 	} else {
-		e, err := NewONNXEmbedder(cfg.Embedding.ModelDir, logger)
+		e, err := NewLazyONNXEmbedder(cfg.Embedding.ModelDir, embedIdleUnload(cfg.Embedding.IdleUnloadMinutes), logger)
 		if err != nil {
 			logger.Warn("ONNX embedder not available, search will be BM25-only", "error", err)
 		} else {
@@ -107,6 +107,17 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 	svc.ensureDurableWorkers()
 
 	return svc, nil
+}
+
+func embedIdleUnload(minutes int) time.Duration {
+	switch {
+	case minutes == 0:
+		return DefaultEmbedIdleUnload
+	case minutes < 0:
+		return 0
+	default:
+		return time.Duration(minutes) * time.Minute
+	}
 }
 
 func (s *Service) Save(ctx context.Context, content, category, source string, cwd string) (*Memory, error) {

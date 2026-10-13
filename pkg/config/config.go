@@ -288,6 +288,10 @@ type EmbeddingConfig struct {
 	ModelDir   string `yaml:"model_dir"`
 	Quantize   bool   `yaml:"quantize"`
 	Dimensions int    `yaml:"dimensions"`
+	// IdleUnloadMinutes is how long the model may stay loaded without use
+	// before it is released (it is loaded on the first embed, not at startup).
+	// 0 or unset means the default (5); negative keeps it loaded once loaded.
+	IdleUnloadMinutes int `yaml:"idle_unload_minutes,omitempty"`
 }
 
 type SearchConfig struct {
