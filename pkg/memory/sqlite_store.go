@@ -7,14 +7,19 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/jholhewres/anchored/pkg/config"
 )
 
 type ImportRecord struct {
@@ -32,12 +37,16 @@ type ImportRecord struct {
 type SQLiteStore struct {
 	db                    *sql.DB
 	cache                 *VectorCache
+	path                  string
 	logger                *slog.Logger
 	now                   func() time.Time
 	embeddingGenerationMu sync.Mutex
 }
 
 func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
+	if err := KeepDatabasePrivate(dbPath); err != nil {
+		return nil, err
+	}
 	dsn := fmt.Sprintf("%s?_journal_mode=WAL&_busy_timeout=30000&_txlock=immediate&_foreign_keys=on", dbPath)
 
 	db, err := sql.Open("sqlite3", dsn)
@@ -58,19 +67,41 @@ func NewSQLiteStore(dbPath string, logger *slog.Logger) (*SQLiteStore, error) {
 	}
 
 	cache := NewVectorCache(logger)
-	store := &SQLiteStore{db: db, cache: cache, logger: logger, now: time.Now}
-	if active, activeErr := store.ActiveEmbeddingGeneration(context.Background()); activeErr != nil {
-		logger.Warn("active embedding generation lookup failed", "error", activeErr)
-	} else if active != nil {
-		if vectors, loadErr := store.LoadEmbeddingGeneration(context.Background(), active.ID); loadErr != nil {
-			logger.Warn("active embedding generation load failed", "generation", active.ID, "error", loadErr)
-		} else {
-			cache.Replace(vectors)
-			logger.Info("active embedding generation loaded", "generation", active.ID, "count", len(vectors))
-		}
-	}
+	store := &SQLiteStore{db: db, cache: cache, logger: logger, now: time.Now, path: dbPath}
+
+	// The active generation is deliberately NOT loaded here. NewService calls
+	// ensureCurrentEmbeddingGeneration immediately afterwards, which republishes
+	// the same generation into the same cache — so loading here decoded and
+	// quantized every vector in the corpus twice per process start, for nothing.
+	// Callers that own no Service (project detection, eval on a temp DB) never
+	// query vectors; the ones that do get a warm cache from the Service.
 
 	return store, nil
+}
+
+// Path is the database file the store was opened on.
+func (s *SQLiteStore) Path() string { return s.path }
+
+// WarmVectorCache fills the cache from the active generation. NewSQLiteStore
+// deliberately leaves it empty — a Service republishes the same generation
+// moments later, and doing both decoded every vector in the corpus twice — so
+// callers that hold a bare store and still want semantic search ask for it
+// here. It is a no-op when no generation is active.
+func (s *SQLiteStore) WarmVectorCache(ctx context.Context) error {
+	active, err := s.ActiveEmbeddingGeneration(ctx)
+	if err != nil {
+		return fmt.Errorf("active embedding generation lookup: %w", err)
+	}
+	if active == nil {
+		return nil
+	}
+	vectors, err := s.LoadEmbeddingGeneration(ctx, active.ID)
+	if err != nil {
+		return fmt.Errorf("active embedding generation load: %w", err)
+	}
+	s.cache.ReplaceSpace(active.SemanticSpaceID, vectors)
+	s.logger.Info("active embedding generation loaded", "generation", active.ID, "count", len(vectors))
+	return nil
 }
 
 func (s *SQLiteStore) DB() *sql.DB               { return s.db }
@@ -163,7 +194,18 @@ func safeFTSOr(query string) string {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	})
 	quoted := make([]string, 0, len(fields))
+	seen := make(map[string]bool, len(fields))
 	for _, f := range fields {
+		// The input may be an expanded expression: its operators are syntax,
+		// not words to look for.
+		switch f {
+		case "OR", "AND", "NOT", "NEAR":
+			continue
+		}
+		if seen[f] {
+			continue
+		}
+		seen[f] = true
 		quoted = append(quoted, `"`+f+`"`)
 	}
 	return strings.Join(quoted, " OR ")
@@ -189,11 +231,13 @@ func (s *SQLiteStore) Search(ctx context.Context, query string, opts SearchOptio
 		args = append(args, opts.Category)
 	}
 	if opts.ProjectID != "" {
-		qb.WriteString(" AND m.project_id = ?")
+		// Global memories (no project) hold everywhere, so a scoped search
+		// returns them too.
+		qb.WriteString(" AND (m.project_id = ? OR m.project_id IS NULL OR m.project_id = '')")
 		args = append(args, opts.ProjectID)
 	}
 
-	qb.WriteString(" ORDER BY rank LIMIT ?")
+	qb.WriteString(" ORDER BY rank, m.id LIMIT ?")
 	args = append(args, maxResults)
 	sqlStr := qb.String()
 
@@ -235,11 +279,12 @@ func (s *SQLiteStore) Search(ctx context.Context, query string, opts SearchOptio
 				json.Unmarshal([]byte(metadataStr.String), &m.Metadata)
 			}
 
-			// BM25 rank is negative (more negative = better match).
-			// Negate and normalize to positive [0,1] range for hybrid fusion.
+			// bm25() is more negative for a better match: -rank is the
+			// relevance, larger is better. The fusion normalizes each list by
+			// its own maximum, so no rescaling happens here.
 			score := 0.0
 			if rank < 0 {
-				score = 1.0 / (1.0 + -rank)
+				score = -rank
 			}
 			results = append(results, SearchResult{Memory: m, Score: score})
 		}
@@ -478,6 +523,11 @@ func (s *SQLiteStore) refreshVectorCache(ctx context.Context, id string) {
 		s.cache.Remove(id)
 		return
 	}
+	if active != nil && s.cache.Space() != "" && s.cache.Space() != active.SemanticSpaceID {
+		// This process still serves another generation until it rebinds; a
+		// vector from the active one would be scored in the wrong space.
+		return
+	}
 
 	var blob []byte
 	if active != nil {
@@ -509,6 +559,7 @@ func (s *SQLiteStore) refreshVectorCache(ctx context.Context, id string) {
 		return
 	}
 	s.cache.Put(id, vector)
+	s.refreshVectorScope(ctx, id)
 }
 
 func scanMemory(row *sql.Row) (*Memory, error) {
@@ -654,10 +705,46 @@ func (s *SQLiteStore) UpdateMetadata(ctx context.Context, id string, metadata an
 }
 
 func (s *SQLiteStore) SoftDelete(ctx context.Context, id string) error {
-	_, err := s.UpdateTemporal(ctx, id, TemporalMutation{
+	_, err := s.SoftDeleteIfActive(ctx, id)
+	return err
+}
+
+// SoftDeleteIfActive tombstones the memory through the temporal ledger and
+// reports whether anything changed: false when the memory is missing or
+// already deleted. Callers that spend a deletion budget count only real ones.
+func (s *SQLiteStore) SoftDeleteIfActive(ctx context.Context, id string) (bool, error) {
+	revision, err := s.UpdateTemporal(ctx, id, TemporalMutation{
 		ExpectedState: TemporalStateActive,
 	}, TemporalWriteOptions{Mode: TemporalTombstone})
-	return err
+	return revision != nil, err
+}
+
+// UndoUntrackedDelete clears deleted_at on a row that was deleted by a raw
+// UPDATE outside the temporal ledger (dream before v0.20, purge, curation
+// clean). The ledger still records such a memory as active, so restoring it
+// only makes the current view agree again: no revision is written, and the
+// current revision's vector, which compact keeps, serves search as before.
+// A delete the ledger did record (a tombstone) is left for Restore.
+func (s *SQLiteStore) UndoUntrackedDelete(ctx context.Context, id string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE memories SET deleted_at = NULL
+		WHERE id = ? AND deleted_at IS NOT NULL
+		  AND EXISTS (
+			SELECT 1 FROM memory_revisions r
+			WHERE r.revision_id = memories.current_revision_id AND NOT r.is_tombstone
+		  )`, id)
+	if err != nil {
+		return false, fmt.Errorf("undo untracked delete %s: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("undo untracked delete %s: %w", id, err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+	s.refreshVectorCache(ctx, id)
+	return true, nil
 }
 
 // Restore undoes a soft-delete (deleted_at -> NULL). It is the inverse of
@@ -1009,4 +1096,33 @@ func (s *SQLiteStore) BackfillContentHash(ctx context.Context) (int, error) {
 		total++
 	}
 	return total, rows.Err()
+}
+
+// KeepDatabasePrivate makes the database owner-only. SQLite creates the file
+// with 0644 minus the umask, usually world-readable, and gives the WAL and SHM
+// the main file's mode; so a new database is created 0600 here before SQLite
+// opens it, and an existing one (with its WAL/SHM) has any group or other bit
+// removed. Modes are only ever tightened, directories and files owned by
+// someone else are left alone, and a failure to tighten (a read-only or
+// network mount) is a warning, never a reason not to open the store. Every
+// path that opens the database, hooks included, calls it.
+func KeepDatabasePrivate(dbPath string) error {
+	if dbPath == "" || dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
+		return nil
+	}
+	f, err := os.OpenFile(dbPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, config.PrivateFileMode)
+	switch {
+	case err == nil:
+		_ = f.Close()
+	case !errors.Is(err, fs.ErrExist):
+		return fmt.Errorf("create database %s: %w", dbPath, err)
+	}
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if changed, err := config.TightenPerm(p, config.PrivateFileMode); err != nil {
+			slog.Warn("could not restrict database file permissions", "path", p, "error", err)
+		} else if changed {
+			slog.Info("tightened database file permissions to 0600", "path", p)
+		}
+	}
+	return nil
 }

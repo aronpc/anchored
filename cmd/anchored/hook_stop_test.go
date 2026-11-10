@@ -18,35 +18,18 @@ import (
 
 // ── schema helper ─────────────────────────────────────────────────────────────
 
-// newStopTestDB creates an in-memory SQLite DB with the minimal memories schema
-// used by the stop hook (no FTS5 needed: stop hook only does plain INSERT/SELECT).
+// newStopTestDB creates a SQLite DB carrying the real production schema, so a
+// column the stop hook must populate cannot go missing here and pass anyway.
 func newStopTestDB(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite3", ":memory:")
+	path := filepath.Join(t.TempDir(), "stop.db")
+	db, err := sql.Open("sqlite3", path+"?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=on")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	_, err = db.Exec(`
-		CREATE TABLE memories (
-			id               TEXT PRIMARY KEY,
-			project_id       TEXT,
-			category         TEXT NOT NULL,
-			content          TEXT NOT NULL,
-			content_hash     TEXT,
-			keywords         TEXT DEFAULT '[]',
-			embedding        BLOB,
-			source           TEXT,
-			created_at       DATETIME,
-			updated_at       DATETIME,
-			access_count     INTEGER DEFAULT 0,
-			metadata         TEXT,
-			sync_dirty       INTEGER DEFAULT 0,
-			deleted_at       DATETIME
-		);
-	`)
-	if err != nil {
-		t.Fatal(err)
+	if err := memory.Migrate(db); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 	return db
 }
@@ -54,8 +37,8 @@ func newStopTestDB(t *testing.T) *sql.DB {
 func insertStopMem(t *testing.T, db *sql.DB, id, content string) {
 	t.Helper()
 	_, err := db.Exec(
-		`INSERT INTO memories (id, category, content, content_hash, created_at, updated_at)
-		 VALUES (?, 'decision', ?, ?, datetime('now'), datetime('now'))`,
+		`INSERT INTO memories (id, category, content, content_hash, created_at, updated_at, logical_id, current_revision_id)
+		 VALUES (?, 'decision', ?, ?, datetime('now'), datetime('now'), ?1, ?1)`,
 		id, content, contentHashStop(content),
 	)
 	if err != nil {
@@ -523,7 +506,10 @@ func TestSaveLightweight_LockedDB_FailsFastWithinCap(t *testing.T) {
 		content TEXT NOT NULL, content_hash TEXT, keywords TEXT DEFAULT '[]',
 		embedding BLOB, source TEXT, created_at DATETIME, updated_at DATETIME,
 		access_count INTEGER DEFAULT 0, metadata TEXT, sync_dirty INTEGER DEFAULT 0,
-		deleted_at DATETIME)`); err != nil {
+		deleted_at DATETIME,
+		logical_id TEXT,
+		current_revision_id TEXT
+	)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -537,7 +523,7 @@ func TestSaveLightweight_LockedDB_FailsFastWithinCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(`INSERT INTO memories (id, category, content) VALUES ('lock-holder', 'fact', 'holding the write lock')`); err != nil {
+	if _, err := tx.Exec(`INSERT INTO memories (id, category, content, logical_id, current_revision_id) VALUES ('lock-holder', 'fact', 'holding the write lock', 'lock-holder', 'lock-holder')`); err != nil {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
@@ -557,8 +543,12 @@ func TestSaveLightweight_LockedDB_FailsFastWithinCap(t *testing.T) {
 	if saveErr == nil {
 		t.Fatal("save against a locked DB should fail, got nil error")
 	}
-	if elapsed > stopHardCap {
-		t.Errorf("locked save took %v, exceeds hard cap %v", elapsed, stopHardCap)
+	// The regression this guards is inheriting the store's 30 s busy_timeout:
+	// the save must give up after its own 300 ms (0.32 s end to end locally).
+	// Shared macOS CI runners measured 0.6-1.2 s for the same wait, so the
+	// bound sits well below 30 s instead of at the hook's hard cap.
+	if elapsed > 10*stopHardCap {
+		t.Errorf("locked save took %v: it waited for the lock instead of failing fast (hard cap %v)", elapsed, stopHardCap)
 	}
 }
 
@@ -581,8 +571,8 @@ func newUsedTestDB(t *testing.T) *sql.DB {
 		"mem-postgres": "we settled on postgres for durable team storage on the server side",
 	} {
 		if _, err := db.Exec(
-			`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata)
-			 VALUES (?, 'proj1', 'decision', ?, '', datetime('now'), datetime('now'), '{}')`,
+			`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata, logical_id, current_revision_id)
+			 VALUES (?, 'proj1', 'decision', ?, '', datetime('now'), datetime('now'), '{}', ?1, ?1)`,
 			id, content); err != nil {
 			t.Fatal(err)
 		}
@@ -656,5 +646,113 @@ func TestSignificantTokenSet_SplitsOnPunctuation(t *testing.T) {
 	}
 	if set["7000"] || set["call"] {
 		t.Errorf("short tokens must be dropped: %v", set)
+	}
+}
+
+// ── base revision in the temporal ledger ─────────────────────────────────────
+
+// TestStopHook_SaveLightweight_RecordsBaseRevision verifies the lightweight
+// insert joins the temporal ledger: curation resolves a memory through
+// memories.current_revision_id and the embedding queue joins on it, so a row
+// without a base revision is invisible to both.
+func TestStopHook_SaveLightweight_RecordsBaseRevision(t *testing.T) {
+	db := newStopTestDB(t)
+	hc := &HookContext{db: db}
+	ctx := context.Background()
+
+	const id = "stop-revision-1"
+	content := "A causa raiz foi a ausência de revisão base, o que deixava a memória fora da fila de embedding."
+	if err := saveMemoryLightweight(ctx, hc, id, "proj-A", "learning", content, "sess-1"); err != nil {
+		t.Fatalf("saveMemoryLightweight: %v", err)
+	}
+
+	var logicalID, revisionID string
+	if err := db.QueryRowContext(ctx,
+		`SELECT COALESCE(logical_id, ''), COALESCE(current_revision_id, '') FROM memories WHERE id = ?`, id,
+	).Scan(&logicalID, &revisionID); err != nil {
+		t.Fatalf("query memory: %v", err)
+	}
+	if logicalID != id {
+		t.Errorf("logical_id = %q, want %q", logicalID, id)
+	}
+	if revisionID == "" {
+		t.Fatal("current_revision_id is empty: the memory is orphaned from the ledger")
+	}
+
+	var mode string
+	var tombstone bool
+	var validFrom int64
+	var validTo, systemTo sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		`SELECT temporal_mode, is_tombstone, valid_from, valid_to, system_to
+		 FROM memory_revisions WHERE revision_id = ? AND memory_id = ? AND logical_id = ?`,
+		revisionID, id, id,
+	).Scan(&mode, &tombstone, &validFrom, &validTo, &systemTo); err != nil {
+		t.Fatalf("query revision: %v", err)
+	}
+	if mode != "supersede" {
+		t.Errorf("temporal_mode = %q, want supersede", mode)
+	}
+	if tombstone {
+		t.Error("base revision must not be a tombstone")
+	}
+	if validFrom == 0 {
+		t.Error("valid_from must be set")
+	}
+	if validTo.Valid || systemTo.Valid {
+		t.Error("base revision must stay open on both time axes")
+	}
+}
+
+// TestStopHook_SaveLightweight_DuplicateKeepsOneRevision verifies that the
+// INSERT OR IGNORE dedupe path does not fork the ledger with a second revision
+// pointing at a row that already has one.
+func TestStopHook_SaveLightweight_DuplicateKeepsOneRevision(t *testing.T) {
+	db := newStopTestDB(t)
+	hc := &HookContext{db: db}
+	ctx := context.Background()
+
+	const id = "stop-revision-dup"
+	content := "Decidimos manter uma única revisão base por memória inserida pelo hook."
+	for i := 0; i < 3; i++ {
+		if err := saveMemoryLightweight(ctx, hc, id, "proj-A", "decision", content, "sess-1"); err != nil {
+			t.Fatalf("saveMemoryLightweight #%d: %v", i+1, err)
+		}
+	}
+
+	var revisions int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM memory_revisions WHERE memory_id = ?`, id,
+	).Scan(&revisions); err != nil {
+		t.Fatalf("count revisions: %v", err)
+	}
+	if revisions != 1 {
+		t.Errorf("revisions = %d, want 1", revisions)
+	}
+}
+
+// TestStopHook_SaveLightweight_CurationCanUpdateMetadata is the regression that
+// ties cause to symptom: nightly curation calls UpdateMetadata, which records a
+// system-time correction and needs the revision the correction applies to.
+func TestStopHook_SaveLightweight_CurationCanUpdateMetadata(t *testing.T) {
+	store, err := memory.NewSQLiteStore(filepath.Join(t.TempDir(), "curation.db"), nil)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	hc := &HookContext{db: store.DB()}
+	ctx := context.Background()
+
+	const id = "stop-curation-1"
+	if err := saveMemoryLightweight(ctx, hc, id, "", "learning",
+		"Aprendemos que a curadoria noturna precisa de uma revisão base para reescrever metadados.",
+		"sess-1",
+	); err != nil {
+		t.Fatalf("saveMemoryLightweight: %v", err)
+	}
+
+	if err := store.UpdateMetadata(ctx, id, map[string]any{"curation_status": "low_signal"}); err != nil {
+		t.Fatalf("UpdateMetadata on a stop-hook memory: %v", err)
 	}
 }

@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -17,6 +18,7 @@ import (
 type Service struct {
 	store           Store
 	searcher        *HybridSearcher
+	entityDetector  *EntityDetector
 	sanitizer       *Sanitizer
 	projDet         *project.Detector
 	embedder        EmbeddingProvider
@@ -37,6 +39,26 @@ type Service struct {
 	embeddingMu     sync.RWMutex
 	embeddingID     EmbeddingIdentity
 	embeddingGenID  string
+
+	// legacyEmbedder is the legacy pipeline of the embedder, loaded while the
+	// active generation is one it built: it answers queries against that
+	// generation and embeds new saves into it until the generation of the
+	// current pipeline replaces it (embedding_upgrade.go).
+	legacyEmbedder          EmbeddingProvider
+	legacyID                EmbeddingIdentity
+	legacyGenID             string
+	servedGenID             string // generation answering queries; under embeddingMu
+	holdEmbeddingUpgrade    bool
+	confirmEmbeddingUpgrade bool
+	upgradeLog              upgradeLog
+	healthMu                sync.Mutex
+	healthGen               string
+	healthAt                time.Time
+	healthVal               float64
+	healthSampled           int
+	lastActivationTry       time.Time // worker goroutine only
+	reconcileMu             sync.Mutex
+	lastReconcile           map[string]time.Time
 }
 
 func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
@@ -60,6 +82,9 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 		logger:    logger,
 		embedSem:  make(chan struct{}, 10),
 		shutdown:  make(chan struct{}),
+
+		holdEmbeddingUpgrade:    cfg.Embedding.HoldUpgrade,
+		confirmEmbeddingUpgrade: cfg.Embedding.ConfirmUpgrade,
 	}
 
 	// provider "none" disables embeddings entirely (BM25-only search). It
@@ -74,10 +99,11 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 	if cfg.Embedding.Provider == "none" {
 		logger.Info("embeddings disabled (provider: none), search will be BM25-only")
 	} else {
-		e, err := NewLazyONNXEmbedder(cfg.Embedding.ModelDir, embedIdleUnload(cfg.Embedding.IdleUnloadMinutes), logger)
+		e, err := NewONNXEmbedderV2(cfg.Embedding.ModelDir, logger)
 		if err != nil {
 			logger.Warn("ONNX embedder not available, search will be BM25-only", "error", err)
 		} else {
+			e.SetIdleUnload(time.Duration(max(cfg.Embedding.IdleUnloadMinutes, 0)) * time.Minute)
 			embedder = e
 			svc.embedder = e
 		}
@@ -93,12 +119,13 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 	searchCfg.TemporalDecayHalfLifeDays = cfg.Search.TemporalDecayHalfLifeDays
 
 	entityDetector := NewEntityDetector(store.DB(), DefaultEntityDetectorConfig(), logger)
+	svc.entityDetector = entityDetector
 
 	topicChangeDetector := NewTopicChangeDetector(embedder, entityDetector)
 
 	svc.searcher = NewHybridSearcher(store, embedder, svc.cache, store.VectorCache(), searchCfg, entityDetector, topicChangeDetector, logger)
 	if embedder != nil {
-		if err := svc.ensureCurrentEmbeddingGeneration(context.Background()); err != nil {
+		if err := svc.warmEmbeddingGenerationAsync(context.Background()); err != nil {
 			_ = embedder.Close()
 			_ = store.Close()
 			return nil, fmt.Errorf("initialize embedding generation: %w", err)
@@ -107,17 +134,6 @@ func NewService(cfg *config.Config, logger *slog.Logger) (*Service, error) {
 	svc.ensureDurableWorkers()
 
 	return svc, nil
-}
-
-func embedIdleUnload(minutes int) time.Duration {
-	switch {
-	case minutes == 0:
-		return DefaultEmbedIdleUnload
-	case minutes < 0:
-		return 0
-	default:
-		return time.Duration(minutes) * time.Minute
-	}
 }
 
 func (s *Service) Save(ctx context.Context, content, category, source string, cwd string) (*Memory, error) {
@@ -201,7 +217,26 @@ func (s *Service) saveWithOptions(
 			CreatedAt:   existing.CreatedAt,
 			Metadata:    metadata,
 		}
-		durable, err := s.persistSave(ctx, upd, opts, durableOpts)
+
+		// Re-saving a memory unchanged is the single most common write an agent
+		// makes: the same fact is recalled and stored again every session. The
+		// temporal store has no notion of a no-op, so each one appended a fresh
+		// revision AND a verbatim copy of the existing embedding vector. Left
+		// unguarded that turned 84k memories into 1M revisions and a multi-GB
+		// database whose vector cache took a quarter-minute to load.
+		//
+		// A write that carries a remote envelope still goes through: the outbox
+		// is delivery state, not content, and skipping it would strand the sync.
+		outbox, err := deriveOutbox(durableOpts, upd)
+		if err != nil {
+			return nil, fmt.Errorf("derive remote outbox: %w", err)
+		}
+		if len(outbox) == 0 && sameStoredMemory(*existing, upd) {
+			s.logger.Debug("save is a no-op; skipping revision", "id", upd.ID)
+			return &upd, nil
+		}
+
+		durable, err := s.persistSave(ctx, upd, opts, withDerivedOutbox(durableOpts, outbox))
 		if err != nil {
 			return nil, fmt.Errorf("save: %w", err)
 		}
@@ -458,6 +493,31 @@ func (s *Service) SoftForget(ctx context.Context, id string) error {
 	return nil
 }
 
+// SoftDeleteIfActive is SoftForget for callers that need to know whether the
+// delete happened: it reports false, and notifies nobody, when the memory is
+// missing or already deleted.
+func (s *Service) SoftDeleteIfActive(ctx context.Context, id string) (bool, error) {
+	deleter, ok := s.store.(interface {
+		SoftDeleteIfActive(ctx context.Context, id string) (bool, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("store does not support conditional soft delete")
+	}
+	m, _ := s.store.Get(ctx, id)
+	changed, err := deleter.SoftDeleteIfActive(ctx, id)
+	if err != nil || !changed {
+		return false, err
+	}
+	var pid *string
+	if m != nil {
+		pid = m.ProjectID
+	}
+	s.notifyObservers(func(obs MemoryObserver) {
+		obs.OnMemoryDeleted(ctx, id, pid)
+	})
+	return true, nil
+}
+
 // Restore undoes a soft-delete so the memory re-enters search/list results.
 // It mirrors SoftForget in reverse: project id is read directly (Get filters
 // out deleted rows) so observers receive the same routing context they would
@@ -495,6 +555,47 @@ func (s *Service) Restore(ctx context.Context, id string) error {
 		obs.OnMemoryRestored(ctx, id, pid)
 	})
 	return nil
+}
+
+// RestoreDeleted brings back a deleted memory whichever way it was deleted:
+// a raw UPDATE outside the ledger is undone in place (see
+// SQLiteStore.UndoUntrackedDelete), a ledger tombstone through Restore. It
+// reports false when the memory is missing or already live.
+func (s *Service) RestoreDeleted(ctx context.Context, id string) (bool, error) {
+	var deleted bool
+	err := s.store.DB().QueryRowContext(ctx,
+		"SELECT deleted_at IS NOT NULL FROM memories WHERE id = ?", id).Scan(&deleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup memory %s: %w", id, err)
+	}
+	if !deleted {
+		return false, nil
+	}
+	if undoer, ok := s.store.(interface {
+		UndoUntrackedDelete(ctx context.Context, id string) (bool, error)
+	}); ok {
+		undone, err := undoer.UndoUntrackedDelete(ctx, id)
+		if err != nil {
+			return false, err
+		}
+		if undone {
+			var pid *string
+			if m, _ := s.store.Get(ctx, id); m != nil {
+				pid = m.ProjectID
+			}
+			s.notifyObservers(func(obs MemoryObserver) {
+				obs.OnMemoryRestored(ctx, id, pid)
+			})
+			return true, nil
+		}
+	}
+	if err := s.Restore(ctx, id); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ForgetScope removes every memory matching the scope; with DryRun it only
@@ -775,6 +876,10 @@ func (s *Service) Close() {
 			close(s.shutdown)
 		}
 		s.wg.Wait()
+		if s.entityDetector != nil {
+			s.entityDetector.Close()
+		}
+		s.retireLegacyPipeline()
 		if s.embedder != nil {
 			s.embedder.Close()
 		}

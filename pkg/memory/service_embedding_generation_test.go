@@ -91,6 +91,12 @@ func newGenerationTestService(
 	embedder EmbeddingProvider,
 ) *Service {
 	t.Helper()
+	// An empty, readable process root: the pre-0.20 gate sees no holders on
+	// every platform (macOS has no /proc, where the gate would hold).
+	if procRoot == "/proc" {
+		procRoot = t.TempDir()
+		t.Cleanup(func() { procRoot = "/proc" })
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := &Service{
 		store:    store,
@@ -257,6 +263,9 @@ func TestGenerationVectorsFollowContentStableRevisionsAcrossRestart(t *testing.T
 		t.Fatal(err)
 	}
 	defer reopened.Close()
+	if err := reopened.WarmVectorCache(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if got, ok := reopened.VectorCache().Get(saved.ID); !ok || len(got) != 2 {
 		t.Fatalf("generation vector missing after restart: vector=%v ok=%v", got, ok)
 	}

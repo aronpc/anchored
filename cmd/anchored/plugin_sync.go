@@ -74,15 +74,22 @@ type PluginDrift struct {
 // behind the binary counts as drift. The hook is best-effort: any IO or
 // parse failure is silently treated as "no signal" rather than propagated.
 func detectPluginDrift(cfg *config.Config, binaryVersion string) PluginDrift {
+	return detectPluginDriftWithForce(cfg, binaryVersion, false)
+}
+
+// detectPluginDriftWithForce is detectPluginDrift with the dev-build guard
+// made optional, for a user who asked for the update explicitly.
+func detectPluginDriftWithForce(cfg *config.Config, binaryVersion string, force bool) PluginDrift {
 	d := PluginDrift{
 		BinaryVersion:  binaryVersion,
 		MarketplaceDir: cfg.Plugin.MarketplaceDir,
 		CacheDir:       cfg.Plugin.CacheDir,
 	}
-	if binaryVersion == "" || updater.IsDevBuild(binaryVersion) {
+	if !force && (binaryVersion == "" || updater.IsDevBuild(binaryVersion)) {
 		// "dev" placeholder = local `go build` without ldflags; dev-stamped
 		// builds (make build) carry a git hash suffix. Drift comparison is
-		// meaningless for either.
+		// meaningless for either — which is why this guard froze the plugin
+		// alongside the binary until force gave the user a way past it.
 		return d
 	}
 
@@ -94,7 +101,13 @@ func detectPluginDrift(cfg *config.Config, binaryVersion string) PluginDrift {
 	// up any newer plugin upstream. It does NOT by itself mean the user must act
 	// — the plugin is versioned on its own track, so the mirror routinely trails
 	// the binary version even when fully up to date.
-	if d.MirrorVersion != "" && compareSemver(d.MirrorVersion, binaryVersion) < 0 {
+	// force does not mean "always refresh": it means the version stamp can be
+	// trusted whether or not it says the mirror is behind, OR, when there is no
+	// stamp at all to compare against, that the mirror is refreshed anyway
+	// because there is no other way to tell. A force run against a mirror that
+	// already carries the same (or a newer) version must not re-pull.
+	if (d.MirrorVersion != "" && compareSemver(d.MirrorVersion, binaryVersion) < 0) ||
+		(force && d.MirrorVersion == "") {
 		d.MirrorBehind = true
 	}
 	// CacheBehind is the real, user-facing signal: the installed cache is older

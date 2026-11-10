@@ -6,6 +6,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -55,7 +57,10 @@ type RemoteEntry struct {
 	Default   bool   `yaml:"default,omitempty"`
 	// Paths are glob patterns matched against a project's local path to
 	// route it to this remote (e.g. "/home/me/work/*"). path.Match
-	// semantics: `*` does not cross `/`.
+	// semantics: `*` does not cross `/`. A glob covers the repositories it
+	// matches, with their subdirectories, symlinks to them and their linked
+	// worktrees (see ResolveRemoteWithPattern), and a repository a glob
+	// covers reads from and writes to this remote only.
 	Paths []string `yaml:"paths,omitempty"`
 	// Projects are remote project IDs linked to THIS server via
 	// `anchored remote link --remote <name> <id>`. IDs are server-scoped,
@@ -239,6 +244,13 @@ func (p PluginConfig) ContextGateMode() string {
 type DebugConfig struct {
 	Enabled bool   `yaml:"enabled"`
 	Path    string `yaml:"path"`
+	// Content records the text of prompts, tool arguments and outputs
+	// (credentials redacted). Off by default: events then carry only the size
+	// of that text.
+	Content bool `yaml:"content"`
+	// MaxAgeDays stops a forgotten debug mode: logging ends this many days
+	// after it started. 0 means no limit.
+	MaxAgeDays int `yaml:"max_age_days"`
 }
 
 type ContextOptimizerConfig struct {
@@ -288,10 +300,18 @@ type EmbeddingConfig struct {
 	ModelDir   string `yaml:"model_dir"`
 	Quantize   bool   `yaml:"quantize"`
 	Dimensions int    `yaml:"dimensions"`
-	// IdleUnloadMinutes is how long the model may stay loaded without use
-	// before it is released (it is loaded on the first embed, not at startup).
-	// 0 or unset means the default (5); negative keeps it loaded once loaded.
-	IdleUnloadMinutes int `yaml:"idle_unload_minutes,omitempty"`
+	// HoldUpgrade keeps a rebuilt embedding generation from replacing the
+	// active one even after it passes every check; the new one keeps being
+	// built and kept current. Off by default.
+	HoldUpgrade bool `yaml:"hold_upgrade"`
+	// ConfirmUpgrade stands in for the "no binary older than v0.20 holds the
+	// database" check where it cannot run (no /proc: macOS, Windows): set it
+	// once every client is upgraded.
+	ConfirmUpgrade bool `yaml:"confirm_upgrade"`
+	// IdleUnloadMinutes is how long the model stays in memory after its last
+	// embed. It loads again, in about a second, on the next one. 0 keeps it
+	// loaded once used.
+	IdleUnloadMinutes int `yaml:"idle_unload_minutes"`
 }
 
 type SearchConfig struct {
@@ -316,11 +336,12 @@ func Defaults() *Config {
 			DatabasePath: "~/.anchored/data/anchored.db",
 		},
 		Embedding: EmbeddingConfig{
-			Provider:   "onnx",
-			Model:      "paraphrase-multilingual-MiniLM-L12-v2",
-			ModelDir:   "~/.anchored/data/onnx",
-			Quantize:   true,
-			Dimensions: 384,
+			Provider:          "onnx",
+			Model:             "paraphrase-multilingual-MiniLM-L12-v2",
+			ModelDir:          "~/.anchored/data/onnx",
+			Quantize:          true,
+			Dimensions:        384,
+			IdleUnloadMinutes: 5,
 		},
 		Search: SearchConfig{
 			VectorWeight: 0.7,
@@ -364,8 +385,9 @@ func Defaults() *Config {
 			FetchCacheTTL:  24,
 		},
 		Debug: DebugConfig{
-			Enabled: false,
-			Path:    "~/.anchored/debug.log",
+			Enabled:    false,
+			Path:       "~/.anchored/debug.log",
+			MaxAgeDays: 7,
 		},
 		Plugin: PluginConfig{
 			// Default true — same policy as the binary auto-updater.
@@ -392,6 +414,14 @@ func Load(path string) (*Config, error) {
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+
+	// The config carries remote API keys; an older writer or a manual edit
+	// may have left it group/world readable.
+	if changed, err := TightenPerm(path, PrivateFileMode); err != nil {
+		slog.Debug("could not tighten config permissions", "path", path, "error", err)
+	} else if changed {
+		slog.Info("tightened config permissions to 0600", "path", path)
 	}
 
 	cfg.migrateRemotes()
@@ -429,8 +459,10 @@ func (c *Config) migrateRemotes() {
 	// Merge the legacy singular `remote:` block into the named map as
 	// "default" so it keeps resolving alongside named entries. Without
 	// this, adding a second (named) server would silently drop the first
-	// from routing. An explicit "default" entry in the map wins.
-	if c.Remote.ServerURL == "" {
+	// from routing. An explicit "default" entry in the map wins. A block
+	// turned off (`remote configure --disable`, shown as disabled by `remote
+	// status`) stays out of routing, search and sync.
+	if c.Remote.ServerURL == "" || !c.Remote.Enabled {
 		return
 	}
 	if _, exists := c.Remotes["default"]; exists {
@@ -456,22 +488,95 @@ func (c *Config) migrateRemotes() {
 	}
 }
 
+// ResolveRemote picks the remote a project path routes to: the remote whose
+// path glob matches, else the default remote. Ties resolve the same way on
+// every call. Between globs, the most specific wins: the one with the most
+// literal characters, then the remote's name. Between several defaults, the
+// first by name wins; DefaultRemoteNames lists them so `remote status` can
+// warn.
 func (c *Config) ResolveRemote(projectPath string) *RemoteEntry {
-	for name, entry := range c.Remotes {
+	entry, _ := c.ResolveRemoteWithPattern(projectPath)
+	return entry
+}
+
+// ResolveRemoteWithPattern is ResolveRemote that also returns the glob that
+// routed the path, or "" when the default remote did. A glob is matched
+// against the path and the root of the repository holding it (see
+// routingPaths), so a repository's subdirectories, a symlink to it and its
+// linked worktrees route like the repository; a relative path is taken from
+// the process's working directory, and an empty one matches no glob.
+func (c *Config) ResolveRemoteWithPattern(projectPath string) (*RemoteEntry, string) {
+	dirs := routingPaths(projectPath)
+	var best *RemoteEntry
+	bestPattern, bestScore := "", -1
+	for _, name := range c.RemoteNames() {
+		entry := c.Remotes[name]
 		for _, pattern := range entry.Paths {
-			if globMatch(pattern, projectPath) {
+			if score := globLiteralLen(pattern); score > bestScore && globMatchAny(pattern, dirs) {
 				entry.Name = name
-				return &entry
+				best, bestPattern, bestScore = &entry, pattern, score
 			}
 		}
 	}
-	for name, entry := range c.Remotes {
-		if entry.Default {
-			entry.Name = name
-			return &entry
+	if best != nil {
+		return best, bestPattern
+	}
+	return c.DefaultRemote(), ""
+}
+
+// DefaultRemote is the remote a path no glob matches routes to: the first
+// remote marked default, by name, or nil.
+func (c *Config) DefaultRemote() *RemoteEntry {
+	names := c.DefaultRemoteNames()
+	if len(names) == 0 {
+		return nil
+	}
+	entry := c.Remotes[names[0]]
+	entry.Name = names[0]
+	return &entry
+}
+
+// DefaultRemoteNames lists, sorted, the remotes marked default. More than one
+// is a configuration mistake: ResolveRemote then uses the first.
+func (c *Config) DefaultRemoteNames() []string {
+	var names []string
+	for _, name := range c.RemoteNames() {
+		if c.Remotes[name].Default {
+			names = append(names, name)
 		}
 	}
-	return nil
+	return names
+}
+
+// RemoteNames lists the configured remotes, sorted by name.
+func (c *Config) RemoteNames() []string {
+	names := make([]string, 0, len(c.Remotes))
+	for name := range c.Remotes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// globLiteralLen counts a glob's literal characters. *, ? and a [...] class
+// match a choice of characters, so they make a pattern no more specific.
+func globLiteralLen(pattern string) int {
+	n := 0
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '*', '?':
+		case '[':
+			for i < len(pattern) && pattern[i] != ']' {
+				i++
+			}
+		case '\\':
+			i++
+			n++
+		default:
+			n++
+		}
+	}
+	return n
 }
 
 func (e *RemoteEntry) AutoSyncEnabled() bool {
@@ -485,6 +590,139 @@ func globMatch(pattern, s string) bool {
 	matched, _ := path.Match(pattern, s)
 	return matched
 }
+
+// globMatchAny reports whether pattern, or the same pattern with the
+// directory before its first metacharacter resolved (see globVariants),
+// matches any of dirs.
+func globMatchAny(pattern string, dirs []string) bool {
+	for _, variant := range globVariants(pattern) {
+		for _, d := range dirs {
+			if globMatch(variant, d) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// globVariants is pattern and, when the directory it names before its first
+// metacharacter is reached through a symlink, the same pattern under the
+// resolved directory. Routing matches resolved paths (the repository root git
+// reports), so a glob written as /var/x/* must also match /private/var/x/a.
+func globVariants(pattern string) []string {
+	dir := pattern
+	if i := strings.IndexAny(pattern, globMeta); i >= 0 {
+		dir = pattern[:strings.LastIndex(pattern[:i], "/")+1]
+	}
+	dir = strings.TrimSuffix(dir, "/")
+	// Only an absolute directory: a relative glob matches no repository path,
+	// and resolving it would read the process's working directory.
+	if dir == "" || !filepath.IsAbs(filepath.FromSlash(dir)) {
+		return []string{pattern}
+	}
+	real, err := filepath.EvalSymlinks(filepath.FromSlash(dir))
+	if err != nil {
+		return []string{pattern}
+	}
+	if real = filepath.ToSlash(real); real == dir {
+		return []string{pattern}
+	}
+	return []string{pattern, globEscape(real) + pattern[len(dir):]}
+}
+
+// globMeta are path.Match's metacharacters, the escape included.
+const globMeta = `*?[\`
+
+// globEscape quotes path.Match's metacharacters so s matches only itself.
+func globEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if strings.ContainsRune(globMeta, r) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// routingPaths lists, without repeats, the directories a glob may match for
+// p: the absolute path and the root of the repository holding it, each also
+// with symlinks resolved, and the main checkout when that repository is a
+// linked worktree. Directories above a repository's root are left out, so a
+// glob covers what it matches and the repositories inside it, never more. An
+// empty path has none.
+func routingPaths(p string) []string {
+	if p == "" {
+		return nil
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	starts := []string{filepath.Clean(p)}
+	if real, err := filepath.EvalSymlinks(p); err == nil {
+		starts = append(starts, real)
+	}
+	var paths []string
+	seen := map[string]bool{}
+	add := func(d string) {
+		if d = filepath.ToSlash(d); d != "" && !seen[d] {
+			seen[d] = true
+			paths = append(paths, d)
+		}
+	}
+	for _, start := range starts {
+		add(start)
+		root, main := repositoryRoots(start)
+		add(root)
+		if root != "" {
+			if real, err := filepath.EvalSymlinks(root); err == nil {
+				add(real)
+			}
+		}
+		// The main checkout comes from the .git file as written; it is not
+		// resolved, so a planted gitdir line never drives filesystem lookups.
+		add(main)
+	}
+	return paths
+}
+
+// repositoryRoots walks up from dir to the first .git and returns the
+// directory holding it and, when that .git is a linked worktree's file, the
+// main checkout it points to ("gitdir: <main>/.git/worktrees/<name>"). Both
+// are "" outside a repository. Only a small regular file is read, and no git
+// is run.
+func repositoryRoots(dir string) (root, main string) {
+	for d := dir; ; d = filepath.Dir(d) {
+		gitPath := filepath.Join(d, ".git")
+		if info, err := os.Lstat(gitPath); err == nil {
+			if !info.Mode().IsRegular() || info.Size() > maxGitFileSize {
+				return d, ""
+			}
+			data, err := os.ReadFile(gitPath)
+			if err != nil {
+				return d, ""
+			}
+			gitdir, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+			if !ok {
+				return d, ""
+			}
+			gitdir = strings.TrimSpace(gitdir)
+			if !filepath.IsAbs(gitdir) {
+				gitdir = filepath.Join(d, gitdir)
+			}
+			if m, _, found := strings.Cut(filepath.ToSlash(gitdir), "/.git/worktrees/"); found {
+				return d, filepath.FromSlash(m)
+			}
+			return d, ""
+		}
+		if filepath.Dir(d) == d {
+			return "", ""
+		}
+	}
+}
+
+// maxGitFileSize bounds the .git file read for a worktree's gitdir line.
+const maxGitFileSize = 4 << 10
 
 func EnsureDirs(cfg *Config) error {
 	dirs := []string{

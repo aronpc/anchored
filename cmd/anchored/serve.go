@@ -66,10 +66,14 @@ func runServe(args []string) {
 	go watchParent(ctx, cancel, logger)
 	go forceExitAfterShutdown(ctx, logger)
 
+	stopRegistration := registerProcess(memSvc, "serve", "embedder", "outbox")
+	defer stopRegistration()
+
 	go updater.Run(ctx, updater.Options{
 		CurrentVersion: Version,
 		Logger:         logger,
 	})
+	go runDashboardRefresh(ctx, logger, dashboardRefreshEvery)
 
 	// session_events grows by ~1 row per tool call (PostToolUse hook). Without
 	// retention the table balloons in long-lived projects. We sweep on serve
@@ -92,6 +96,9 @@ func runServe(args []string) {
 func serveConfigPath(args []string) string {
 	fs := newFlagSet("serve")
 	configPath := fs.String("config", "", "path to config file")
+	// stdio is the only transport; the flag is accepted so the documented
+	// `anchored serve --stdio` and registrations that pass it keep working.
+	fs.Bool("stdio", true, "serve MCP over stdin/stdout (the only transport)")
 	fs.Parse(args)
 	return *configPath
 }

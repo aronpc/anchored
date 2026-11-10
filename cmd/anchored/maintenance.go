@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,7 @@ import (
 //   - backfill — embed memories still missing a vector, in a bounded slice
 //   - dream    — consolidate (dedup, merge, flag contradictions)
 //   - curation — reconcile quality/importance scores
+//   - compact  — reclaim redundant revisions and superseded embedding copies
 //
 // `anchored maintenance run` executes the four steps as isolated subprocesses
 // (a failure in one step is logged but does not abort the others). `install`
@@ -64,6 +66,7 @@ func printMaintenanceUsage() {
 	fmt.Fprintln(os.Stderr, "  --skip-backfill          skip the backfill step")
 	fmt.Fprintln(os.Stderr, "  --skip-dream             skip the dream step")
 	fmt.Fprintln(os.Stderr, "  --skip-curation          skip the curation reconcile step")
+	fmt.Fprintln(os.Stderr, "  --skip-compact           skip the compact step")
 }
 
 // runMaintenanceRun executes the upkeep steps as isolated subprocesses.
@@ -79,14 +82,25 @@ func runMaintenanceRun(args []string) {
 	skipBackfill := fs.Bool("skip-backfill", false, "skip the backfill step")
 	skipDream := fs.Bool("skip-dream", false, "skip the dream step")
 	skipCuration := fs.Bool("skip-curation", false, "skip the curation reconcile step")
+	skipCompact := fs.Bool("skip-compact", false, "skip the compact step")
 	fs.Parse(args)
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	exe, err := maintenanceExe()
-	if err != nil {
-		slog.Error("locate executable", "error", err)
-		os.Exit(1)
+	// Resolved on the first step that runs: with every step skipped nothing
+	// is spawned, and under `go test` the lookup falls back to PATH, where
+	// no anchored binary may exist.
+	var exePath string
+	exe := func() string {
+		if exePath == "" {
+			resolved, err := resolveMaintenanceExe()
+			if err != nil {
+				slog.Error("locate executable", "error", err)
+				os.Exit(1)
+			}
+			exePath = resolved
+		}
+		return exePath
 	}
 
 	start := time.Now()
@@ -105,7 +119,7 @@ func runMaintenanceRun(args []string) {
 		cmd := build()
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
-		err := cmd.Run()
+		err := runMaintenanceStep(cmd)
 		dur := time.Since(t0).Round(time.Millisecond)
 		if err != nil {
 			logger.Error("maintenance: step failed", "step", step, "duration", dur, "error", err)
@@ -125,20 +139,20 @@ func runMaintenanceRun(args []string) {
 	// 1. Import — pulls fresh memories from connected tools. It saves with
 	// SkipEmbed, so vectors are the next step's job, not this one's.
 	runStep("import", *skipImport, func() *exec.Cmd {
-		return maintenanceCmd(exe, *configPath, "import", "all")
+		return maintenanceCmd(exe(), *configPath, "import", "all")
 	})
 
 	// 2. Backfill — embed any memories still missing a vector (e.g. from a
 	// historical import done with --skip-embeddings). Capped at 2000 per run
 	// so a large backlog drains in daily slices instead of one multi-hour pass.
 	runStep("backfill", *skipBackfill, func() *exec.Cmd {
-		return maintenanceCmd(exe, *configPath, "backfill", "--max", "2000")
+		return maintenanceCmd(exe(), *configPath, "backfill", "--max", "2000")
 	})
 
 	// 3. Dream — analyze + apply consolidation. --dry-run=false forces apply
 	// (the flag defaults to dry-run=true for interactive safety).
 	runStep("dream", *skipDream, func() *exec.Cmd {
-		cmd := maintenanceCmd(exe, *configPath, "dream",
+		cmd := maintenanceCmd(exe(), *configPath, "dream",
 			"--dry-run=false",
 			"--aggressiveness", *aggressiveness,
 			fmt.Sprintf("--max-deletions=%d", *maxDeletions),
@@ -149,7 +163,17 @@ func runMaintenanceRun(args []string) {
 	// 4. Curation — reconcile quality/importance metadata. --yes skips the
 	// interactive confirmation prompt (unsupervised timer context).
 	runStep("curation", *skipCuration, func() *exec.Cmd {
-		return maintenanceCmd(exe, *configPath, "curation", "reconcile", "--yes")
+		return maintenanceCmd(exe(), *configPath, "curation", "reconcile", "--yes")
+	})
+
+	// 5. Compact — drop revisions that repeat a state already recorded, the
+	// embedding copies they dragged along, and completed job rows for revisions
+	// that are gone. Runs last: the steps above write revisions of their own,
+	// and this reclaims whatever they made redundant. The file itself is left
+	// alone: rewriting it needs the database to itself, which an unattended
+	// timer cannot assume, so --shrink stays an explicit `anchored compact`.
+	runStep("compact", *skipCompact, func() *exec.Cmd {
+		return maintenanceCmd(exe(), *configPath, "compact")
 	})
 
 	failed := 0
@@ -165,6 +189,13 @@ func runMaintenanceRun(args []string) {
 	}
 }
 
+// runMaintenanceStep is the seam every step's subprocess goes through. Tests
+// replace it so exercising the orchestration loop can never actually spawn:
+// the steps run the binary that launched them, and under `go test` that binary
+// is the test suite itself, so one unskipped step turns into unbounded
+// recursion.
+var runMaintenanceStep = func(cmd *exec.Cmd) error { return cmd.Run() }
+
 // maintenanceCmd builds a subprocess for one upkeep step, threading --config
 // through only when set so the default config discovery still applies.
 func maintenanceCmd(exe, configPath, sub string, extra ...string) *exec.Cmd {
@@ -179,14 +210,38 @@ func maintenanceCmd(exe, configPath, sub string, extra ...string) *exec.Cmd {
 // maintenanceExe resolves the anchored binary to invoke for sub-steps. Prefers
 // the running executable (so the timer uses the exact version that installed
 // it), falling back to PATH lookup.
+//
+// A test binary is refused outright. It answers to os.Executable() like any
+// other process but ignores the subcommand it is handed and re-runs the whole
+// suite instead, so a step that reached it would fork itself without end.
+// resolveMaintenanceExe is maintenanceExe behind a seam: tests that intercept
+// the steps also stand in for the binary they would run.
+var resolveMaintenanceExe = maintenanceExe
+
 func maintenanceExe() (string, error) {
-	if exe, err := os.Executable(); err == nil {
+	if exe, err := os.Executable(); err == nil && !isTestBinary(exe) {
 		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 			return resolved, nil
 		}
 		return exe, nil
 	}
 	return exec.LookPath("anchored")
+}
+
+func isTestBinary(path string) bool {
+	if isTestBinaryPath(path) {
+		return true
+	}
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "-test.") {
+			return true
+		}
+	}
+	return false
+}
+
+func isTestBinaryPath(path string) bool {
+	return strings.HasSuffix(path, ".test") || strings.HasSuffix(path, ".test.exe")
 }
 
 // --- systemd --user timer management (Linux only; best-effort) ---

@@ -2,6 +2,8 @@ package memory
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,5 +127,91 @@ func TestONNXAssetURLsKeepLegacyTokenizerWithLegacyModel(t *testing.T) {
 	}
 	if want := onnxLegacyModelBaseURL + "/vocab.txt"; vocab != want {
 		t.Fatalf("legacy vocab URL=%q, want %q", vocab, want)
+	}
+}
+
+// Every vector up to v0.19 carries the legacy pipeline revision; changing the
+// string would orphan the active generation of every installation.
+func TestLegacyPipelineRevisionNeverChanges(t *testing.T) {
+	if onnxPipelineRevision != "wordpiece-v1:maxseq128:mean-pool:l2-v1" {
+		t.Fatalf("legacy pipeline revision changed to %q", onnxPipelineRevision)
+	}
+}
+
+// The v2 pipeline names the tokenizer that loaded: the HF tokenizer.json path
+// and the vocab.txt fallback produce different vectors. The legacy pipeline
+// keeps v0.19's single revision for both.
+func TestLoadONNXTokenizer_PipelineNamesTheTokenizerThatLoaded(t *testing.T) {
+	dir := t.TempDir()
+	withJSON := &ONNXPaths{TokenizerFile: writeTestTokenizerJSON(t, dir), VocabFile: filepath.Join(dir, "missing-vocab.txt")}
+	vocabOnly := &ONNXPaths{TokenizerFile: filepath.Join(dir, "missing.json"), VocabFile: filepath.Join(dir, "vocab.txt")}
+	if err := os.WriteFile(vocabOnly.VocabFile, []byte("[PAD]\n[UNK]\n[CLS]\n[SEP]\nhello\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cases := []struct {
+		name   string
+		paths  *ONNXPaths
+		legacy bool
+		want   string
+		fast   bool
+	}{
+		{"tokenizer.json, legacy", withJSON, true, onnxPipelineRevision, true},
+		{"tokenizer.json, v2", withJSON, false, onnxPipelineRevisionHF, true},
+		{"vocab.txt, legacy", vocabOnly, true, onnxPipelineRevision, false},
+		{"vocab.txt, v2", vocabOnly, false, onnxPipelineRevisionVocabV2, false},
+	}
+	for _, c := range cases {
+		tok, pipeline, err := loadONNXTokenizer(c.paths, c.legacy, logger)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		ft, isFast := tok.(*FastTokenizer)
+		if pipeline != c.want || isFast != c.fast || (isFast && ft.legacy != c.legacy) {
+			t.Errorf("%s: pipeline %q fast=%v, want %q fast=%v", c.name, pipeline, isFast, c.want, c.fast)
+		}
+	}
+}
+
+// Pipelines built from one load share the runtime: closing one (twice) leaves
+// the others working, drops its tokenizer, and the last Close releases the
+// runtime.
+func TestONNXPipeline_RefcountsTheSharedSession(t *testing.T) {
+	dir := t.TempDir()
+	paths := &ONNXPaths{TokenizerFile: writeTestTokenizerJSON(t, dir), VocabFile: filepath.Join(dir, "none.txt"), ModelFile: filepath.Join(dir, "model.onnx")}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	pipeline := expectedONNXPipeline(paths, false)
+	rev, err := onnxArtifactRevisionForPipeline(paths, pipeline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2 := &ONNXEmbedder{rt: newONNXRuntime(paths, false, logger), modelRevision: rev, pipeline: pipeline,
+		logger: logger, dims: onnxModelDims, modelName: onnxModelName}
+	le, err := v2.Pipeline(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !le.Legacy() || le.ModelRevision() == v2.ModelRevision() || le.rt != v2.rt || v2.rt.refs[true] != 1 || v2.rt.refs[false] != 1 {
+		t.Fatalf("legacy pipeline: legacy=%v same revision=%v shared runtime=%v refs=%v",
+			le.Legacy(), le.ModelRevision() == v2.ModelRevision(), le.rt == v2.rt, v2.rt.refs)
+	}
+	// Loading the legacy tokenizer, then closing its pipeline, drops it.
+	v2.rt.mu.Lock()
+	if _, err := v2.rt.tokenizerLocked(true, le.pipeline); err != nil {
+		v2.rt.mu.Unlock()
+		t.Fatal(err)
+	}
+	v2.rt.mu.Unlock()
+	_ = le.Close()
+	_ = le.Close()
+	if !v2.rt.openLocked() || v2.rt.refs[true] != 0 || v2.rt.tokenizers[true] != nil {
+		t.Fatalf("after closing the legacy pipeline twice: refs=%v legacy tokenizer kept=%v", v2.rt.refs, v2.rt.tokenizers[true] != nil)
+	}
+	_ = v2.Close()
+	if v2.rt.openLocked() {
+		t.Fatalf("refs after the last close: %v", v2.rt.refs)
+	}
+	if _, err := v2.Embed(context.Background(), []string{"x"}); err == nil {
+		t.Fatal("embedding with a closed embedder should fail")
 	}
 }

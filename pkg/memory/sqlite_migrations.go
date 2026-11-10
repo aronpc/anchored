@@ -1,7 +1,9 @@
 package memory
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 
 	ctxpkg "github.com/jholhewres/anchored/pkg/context"
@@ -12,17 +14,163 @@ type migration struct {
 	Up   string
 }
 
+// migrationBackfillLedgerOrphans re-runs 018's ledger backfill for rows that
+// were created after 018 applied. Migration 018 only reached the corpus that
+// existed when it ran, so any later write path that skipped the ledger left
+// rows with no revision — unreachable to curation and to the embedding queue.
+const migrationBackfillLedgerOrphans = `
+			UPDATE memories
+			SET logical_id = id
+			WHERE logical_id IS NULL OR logical_id = '';
+
+			INSERT OR IGNORE INTO memory_revisions (
+				revision_id, memory_id, logical_id, project_id, category,
+				content, content_hash, keywords, source, source_id, metadata,
+				memory_created_at, memory_updated_at, author, remote_project_key,
+				temporal_mode, is_tombstone, valid_from, valid_to,
+				system_from, system_to, created_at
+			)
+			SELECT
+				'legacy:' || id || ':base',
+				id,
+				id,
+				project_id,
+				category,
+				content,
+				content_hash,
+				keywords,
+				source,
+				source_id,
+				metadata,
+				COALESCE(created_at, CURRENT_TIMESTAMP),
+				COALESCE(updated_at, created_at, CURRENT_TIMESTAMP),
+				author,
+				remote_project_key,
+				'supersede',
+				FALSE,
+				CAST(strftime('%s', COALESCE(created_at, CURRENT_TIMESTAMP)) AS INTEGER) * 1000000000,
+				NULL,
+				CAST(strftime('%s', COALESCE(created_at, CURRENT_TIMESTAMP)) AS INTEGER) * 1000000000,
+				NULL,
+				COALESCE(created_at, CURRENT_TIMESTAMP)
+			FROM memories
+			WHERE deleted_at IS NULL
+				AND (current_revision_id IS NULL OR current_revision_id = '');
+
+			INSERT OR IGNORE INTO memory_revisions (
+				revision_id, memory_id, logical_id, project_id, category,
+				content, content_hash, keywords, source, source_id, metadata,
+				memory_created_at, memory_updated_at, author, remote_project_key,
+				temporal_mode, is_tombstone, valid_from, valid_to,
+				system_from, system_to, created_at
+			)
+			SELECT
+				'legacy:' || id || ':tombstone',
+				id,
+				id,
+				project_id,
+				category,
+				content,
+				content_hash,
+				keywords,
+				source,
+				source_id,
+				metadata,
+				COALESCE(created_at, CURRENT_TIMESTAMP),
+				COALESCE(updated_at, deleted_at, created_at, CURRENT_TIMESTAMP),
+				author,
+				remote_project_key,
+				'tombstone',
+				TRUE,
+				CAST(strftime('%s', deleted_at) AS INTEGER) * 1000000000,
+				NULL,
+				CAST(strftime('%s', deleted_at) AS INTEGER) * 1000000000,
+				NULL,
+				deleted_at
+			FROM memories
+			WHERE deleted_at IS NOT NULL
+				AND (current_revision_id IS NULL OR current_revision_id = '');
+
+			UPDATE memories
+			SET current_revision_id = CASE
+				WHEN deleted_at IS NULL THEN 'legacy:' || id || ':base'
+				ELSE 'legacy:' || id || ':tombstone'
+			END
+			WHERE current_revision_id IS NULL OR current_revision_id = '';
+		`
+
 func Migrate(db *sql.DB) error {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS migrations (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		name TEXT NOT NULL UNIQUE,
-		applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-	)`)
+	return migrate(db, schemaMigrations())
+}
+
+func migrate(db *sql.DB, migrations []migration) error {
+	pending, err := pendingMigrations(db, migrations)
 	if err != nil {
+		return err
+	}
+	// Every process migrates on open; an up-to-date database, the common
+	// case, is answered by reads alone so opening never waits behind a
+	// long writer.
+	if len(pending) == 0 {
+		return nil
+	}
+	if err := withImmediateTx(db, func(conn *sql.Conn) error {
+		_, err := conn.ExecContext(context.Background(), `CREATE TABLE IF NOT EXISTS migrations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`)
+		return err
+	}); err != nil {
 		return fmt.Errorf("create migrations table: %w", err)
 	}
+	for _, m := range pending {
+		if err := applyMigration(db, m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
-	migrations := []migration{
+// pendingMigrations returns, without taking the write lock, the migrations
+// not yet recorded; all of them when the migrations table does not exist.
+func pendingMigrations(db *sql.DB, migrations []migration) ([]migration, error) {
+	var tables int
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migrations'",
+	).Scan(&tables); err != nil {
+		return nil, fmt.Errorf("check migrations table: %w", err)
+	}
+	if tables == 0 {
+		return migrations, nil
+	}
+	rows, err := db.Query("SELECT name FROM migrations")
+	if err != nil {
+		return nil, fmt.Errorf("list applied migrations: %w", err)
+	}
+	defer rows.Close()
+	applied := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("list applied migrations: %w", err)
+		}
+		applied[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list applied migrations: %w", err)
+	}
+	var pending []migration
+	for _, m := range migrations {
+		if !applied[m.Name] {
+			pending = append(pending, m)
+		}
+	}
+	return pending, nil
+}
+
+func schemaMigrations() []migration {
+	return []migration{
 		{Name: "001_initial_schema", Up: initSchema()},
 		{Name: "002_indexed_files", Up: `CREATE TABLE IF NOT EXISTS indexed_files (
 			path TEXT PRIMARY KEY,
@@ -422,37 +570,110 @@ func Migrate(db *sql.DB) error {
 			CREATE INDEX IF NOT EXISTS idx_memories_normalized_hash
 				ON memories(normalized_hash, project_id);
 		`},
+		{Name: "021_backfill_ledger_orphans", Up: migrationBackfillLedgerOrphans},
+		// The backfill above adopts the rows earlier write paths orphaned; this
+		// trigger stops new ones from ever being created. Curation resolves a
+		// memory through current_revision_id and the embedding queue joins on
+		// it, so a row without one is invisible to both — a silent half-write
+		// that only surfaces as a nightly error and a missing embedding.
+		//
+		// NOT NULL on the column cannot do this job: both columns arrived via
+		// ALTER TABLE as nullable, and tightening them would mean rebuilding a
+		// table that carries FTS triggers and tens of thousands of rows.
+		{Name: "022_require_ledger_identity", Up: `
+			CREATE TRIGGER IF NOT EXISTS memories_require_ledger_identity
+			BEFORE INSERT ON memories
+			WHEN NEW.logical_id IS NULL OR NEW.logical_id = ''
+				OR NEW.current_revision_id IS NULL OR NEW.current_revision_id = ''
+			BEGIN
+				SELECT RAISE(ABORT, 'memory insert requires logical_id and current_revision_id');
+			END;
+		`},
+		// Long-lived processes (MCP servers, hub, dashboard, maintenance)
+		// register here so steps that cannot be undone can wait until no
+		// older binary still has the database open.
+		{Name: "023_process_registry", Up: `
+			CREATE TABLE IF NOT EXISTS processes (
+				host TEXT NOT NULL,
+				pid INTEGER NOT NULL,
+				version TEXT NOT NULL,
+				role TEXT NOT NULL,
+				capabilities TEXT NOT NULL DEFAULT '',
+				started_at INTEGER NOT NULL,
+				heartbeat_at INTEGER NOT NULL,
+				PRIMARY KEY (host, pid)
+			);
+		`},
+		// The current view is written by an upsert that always sets content,
+		// so the unconditional trigger rewrote the FTS index on every
+		// tombstone, restore and re-save of unchanged text.
+		{Name: "024_fts_update_only_on_change", Up: `
+			DROP TRIGGER IF EXISTS memories_fts_update;
+			CREATE TRIGGER memories_fts_update AFTER UPDATE OF content, keywords ON memories
+			WHEN old.content IS NOT new.content OR old.keywords IS NOT new.keywords BEGIN
+				INSERT INTO memories_fts(memories_fts, rowid, content, keywords) VALUES('delete', old.rowid, old.content, old.keywords);
+				INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.rowid, new.content, new.keywords);
+			END;
+		`},
 	}
+}
 
-	for _, m := range migrations {
+// applyMigration runs one migration under the database write lock and checks
+// again, inside it, whether another process got there first. Every anchored
+// process (one per editor session, plus hooks and the maintenance timer)
+// migrates on open, so a new binary starts that race on every machine; the
+// check outside the lock only spares the common already-applied case a write
+// lock.
+func applyMigration(db *sql.DB, m migration) error {
+	return withImmediateTx(db, func(conn *sql.Conn) error {
+		ctx := context.Background()
 		var count int
-		err := db.QueryRow("SELECT COUNT(*) FROM migrations WHERE name = ?", m.Name).Scan(&count)
-		if err != nil {
+		if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM migrations WHERE name = ?", m.Name).Scan(&count); err != nil {
 			return fmt.Errorf("check migration %s: %w", m.Name, err)
 		}
 		if count > 0 {
-			continue
+			return nil
 		}
-
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("begin tx for migration %s: %w", m.Name, err)
-		}
-
-		if _, err := tx.Exec(m.Up); err != nil {
-			tx.Rollback()
+		if _, err := conn.ExecContext(ctx, m.Up); err != nil {
 			return fmt.Errorf("apply migration %s: %w", m.Name, err)
 		}
-
-		if _, err := tx.Exec("INSERT INTO migrations (name) VALUES (?)", m.Name); err != nil {
-			tx.Rollback()
+		if _, err := conn.ExecContext(ctx, "INSERT INTO migrations (name) VALUES (?)", m.Name); err != nil {
 			return fmt.Errorf("record migration %s: %w", m.Name, err)
 		}
+		return nil
+	})
+}
 
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %s: %w", m.Name, err)
-		}
+// withImmediateTx runs fn inside BEGIN IMMEDIATE on a dedicated connection,
+// so the write lock is taken up front, waiting out the busy timeout, whatever
+// _txlock the caller's DSN sets. A deferred transaction would instead read
+// first and fail with SQLITE_BUSY when it tries to upgrade to a write.
+func withImmediateTx(db *sql.DB, fn func(conn *sql.Conn) error) error {
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("open connection: %w", err)
 	}
+	defer conn.Close()
 
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin immediate: %w", err)
+	}
+	if err := fn(conn); err != nil {
+		rollback(ctx, conn)
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		rollback(ctx, conn)
+		return fmt.Errorf("commit: %w", err)
+	}
 	return nil
+}
+
+// rollback ends the transaction on conn; if even that fails, the connection
+// is discarded instead of going back to the pool mid-transaction.
+func rollback(ctx context.Context, conn *sql.Conn) {
+	if _, err := conn.ExecContext(ctx, "ROLLBACK"); err != nil {
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
 }

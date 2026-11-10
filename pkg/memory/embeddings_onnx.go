@@ -31,7 +31,14 @@ const (
 	legacyModelRevision = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 	// Bump whenever tokenization, truncation, pooling, or normalization changes
 	// without changing the downloaded model artifacts.
-	onnxPipelineRevision = "wordpiece-v1:maxseq128:mean-pool:l2-v1"
+	//
+	// onnxPipelineRevision names the legacy pipeline (NewLegacyFastTokenizer,
+	// or vocab.txt WordPiece when tokenizer.json is missing): every vector up
+	// to v0.19 was built by it, so it never changes. The v2 pipeline names the
+	// tokenizer that actually loaded, since the two produce different vectors.
+	onnxPipelineRevision        = "wordpiece-v1:maxseq128:mean-pool:l2-v1"
+	onnxPipelineRevisionHF      = "hf-tokenizer-v2:maxseq128:mean-pool:l2-v1"
+	onnxPipelineRevisionVocabV2 = "vocab-wordpiece-v2:maxseq128:mean-pool:l2-v1"
 
 	onnxRuntimeURLTemplate = "https://github.com/microsoft/onnxruntime/releases/download/v%s/onnxruntime-%s-%s-%s.tgz"
 	onnxModelBaseURL       = "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/" + onnxModelRevision
@@ -39,125 +46,182 @@ const (
 )
 
 type ONNXEmbedder struct {
-	session       *ort.AdvancedSession
-	tokenizer     Tokenizer
+	rt            *onnxRuntime
 	dims          int
 	logger        *slog.Logger
 	modelName     string
 	modelRevision string
+	// pipeline is the revision of the pipeline this embedder's vectors are
+	// built with. The tokenizer that loads must name the same one.
+	pipeline string
+	legacy   bool
+	closed   bool
+}
 
+// onnxDefaultIdleUnload is how long the model stays loaded after its last
+// embed.
+const onnxDefaultIdleUnload = 5 * time.Minute
+
+// onnxRuntime holds what is heavy about an embedder: the model session, its
+// tensors and the tokenizers of the pipelines built from one load (Pipeline).
+// It loads on the first embed and unloads after idleAfter without one, so a
+// process that is not embedding (an idle MCP session, the dashboard, a CLI
+// command) does not keep the ~500 MB model resident. mu serializes inference
+// and the load/unload transitions across every pipeline; the last Close
+// releases everything.
+type onnxRuntime struct {
+	mu        sync.Mutex
+	paths     *ONNXPaths
+	logger    *slog.Logger
+	idleAfter time.Duration
+
+	session       *ort.AdvancedSession
 	inputIDs      *ort.Tensor[int64]
 	attentionMask *ort.Tensor[int64]
 	tokenTypeIDs  *ort.Tensor[int64]
 	output        *ort.Tensor[float32]
+	tokenizers    map[bool]Tokenizer
 
-	mu sync.Mutex
+	// refs counts the open embedders per pipeline (legacy or not); the
+	// tokenizer of a pipeline is dropped when its last embedder closes.
+	refs    map[bool]int
+	lastUse time.Time
+	idle    *time.Timer
+	loads   int
 }
 
-type ONNXPaths struct {
-	RuntimeLib    string
-	ModelFile     string
-	VocabFile     string
-	TokenizerFile string
-}
-
-// onnxArtifacts is everything about the ONNX embedder that is known without
-// loading the model into memory: where the files live and the identity they
-// produce. LazyONNXEmbedder answers identity questions from it alone.
-type onnxArtifacts struct {
-	paths         *ONNXPaths
-	modelName     string
-	modelRevision string
-}
-
-func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error) {
-	if logger == nil {
-		logger = slog.Default()
+func newONNXRuntime(paths *ONNXPaths, legacy bool, logger *slog.Logger) *onnxRuntime {
+	return &onnxRuntime{
+		paths:      paths,
+		logger:     logger,
+		idleAfter:  onnxDefaultIdleUnload,
+		tokenizers: map[bool]Tokenizer{},
+		refs:       map[bool]int{legacy: 1},
 	}
-	logger = logger.With("component", "onnx-embedder")
+}
 
-	artifacts, err := prepareONNXArtifacts(modelDir, logger)
+func (rt *onnxRuntime) openLocked() bool {
+	for _, n := range rt.refs {
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// tokenizerLocked returns the tokenizer of a pipeline, loading it if needed.
+func (rt *onnxRuntime) tokenizerLocked(legacy bool, pipeline string) (Tokenizer, error) {
+	if tok := rt.tokenizers[legacy]; tok != nil {
+		return tok, nil
+	}
+	tok, got, err := loadONNXTokenizer(rt.paths, legacy, rt.logger)
 	if err != nil {
 		return nil, err
 	}
-	return loadONNXEmbedder(artifacts, logger)
+	if got != pipeline {
+		// The embedder's identity was derived from the files on disk; a
+		// tokenizer that loads as another pipeline would put its vectors in
+		// a space they are not labelled with.
+		return nil, fmt.Errorf("onnx: tokenizer loaded as pipeline %q, embedder built for %q", got, pipeline)
+	}
+	rt.tokenizers[legacy] = tok
+	return tok, nil
 }
 
-// prepareONNXArtifacts downloads the runtime and model when missing, hashes
-// them into the model revision and initializes the ONNX environment. It does
-// NOT create an inference session, so it costs no model-sized memory.
-func prepareONNXArtifacts(modelDir string, logger *slog.Logger) (*onnxArtifacts, error) {
-	paths := resolveONNXPaths(modelDir)
-
-	if err := ensureONNXRuntime(paths, logger); err != nil {
-		return nil, fmt.Errorf("onnx: runtime setup: %w", err)
+// sessionLocked loads the model session if it is not loaded.
+func (rt *onnxRuntime) sessionLocked() error {
+	if rt.session != nil {
+		return nil
 	}
-	if err := ensureONNXModel(paths, logger); err != nil {
-		return nil, fmt.Errorf("onnx: model setup: %w", err)
-	}
-	modelRevision, err := onnxArtifactRevision(paths)
-	if err != nil {
-		return nil, fmt.Errorf("onnx: identify model artifacts: %w", err)
-	}
-
-	ort.SetSharedLibraryPath(paths.RuntimeLib)
-	if !ort.IsInitialized() {
-		if err := ort.InitializeEnvironment(); err != nil {
-			return nil, fmt.Errorf("onnx: init environment: %w", err)
-		}
-	}
-
-	activeModel := onnxModelName
-	if strings.Contains(paths.ModelFile, legacyModelName) {
-		activeModel = legacyModelName
-	}
-	return &onnxArtifacts{paths: paths, modelName: activeModel, modelRevision: modelRevision}, nil
-}
-
-// loadONNXEmbedder creates the inference session: tokenizer, I/O tensors and
-// the model weights (~470 MB for the multilingual model).
-func loadONNXEmbedder(artifacts *onnxArtifacts, logger *slog.Logger) (*ONNXEmbedder, error) {
-	paths := artifacts.paths
-
-	var tokenizer Tokenizer
-	if fileExists(paths.TokenizerFile) {
-		tok, err := NewFastTokenizer(paths.TokenizerFile, onnxMaxSeqLen)
-		if err != nil {
-			logger.Warn("fast tokenizer failed, falling back to wordpiece", "error", err)
-		} else {
-			tokenizer = tok
-			logger.Info("using fast tokenizer (tokenizer.json)")
-		}
-	}
-	if tokenizer == nil {
-		tok, err := NewWordPieceTokenizer(paths.VocabFile, onnxMaxSeqLen)
-		if err != nil {
-			return nil, fmt.Errorf("onnx: load tokenizer: %w", err)
-		}
-		tokenizer = tok
-		logger.Info("using wordpiece tokenizer (vocab.txt)")
-	}
-
 	shape := ort.NewShape(1, int64(onnxMaxSeqLen))
+	var made []interface{ Destroy() error }
+	fail := func(err error) error {
+		destroyAll(made...)
+		return err
+	}
 	inputIDs, err := ort.NewEmptyTensor[int64](shape)
 	if err != nil {
-		return nil, fmt.Errorf("onnx: create input_ids tensor: %w", err)
+		return fail(fmt.Errorf("onnx: create input_ids tensor: %w", err))
 	}
+	made = append(made, inputIDs)
 	attentionMask, err := ort.NewEmptyTensor[int64](shape)
 	if err != nil {
-		return nil, fmt.Errorf("onnx: create attention_mask tensor: %w", err)
+		return fail(fmt.Errorf("onnx: create attention_mask tensor: %w", err))
 	}
+	made = append(made, attentionMask)
 	tokenTypeIDs, err := ort.NewEmptyTensor[int64](shape)
 	if err != nil {
-		return nil, fmt.Errorf("onnx: create token_type_ids tensor: %w", err)
+		return fail(fmt.Errorf("onnx: create token_type_ids tensor: %w", err))
 	}
-
-	outputShape := ort.NewShape(1, int64(onnxMaxSeqLen), int64(onnxModelDims))
-	output, err := ort.NewEmptyTensor[float32](outputShape)
+	made = append(made, tokenTypeIDs)
+	output, err := ort.NewEmptyTensor[float32](ort.NewShape(1, int64(onnxMaxSeqLen), int64(onnxModelDims)))
 	if err != nil {
-		return nil, fmt.Errorf("onnx: create output tensor: %w", err)
+		return fail(fmt.Errorf("onnx: create output tensor: %w", err))
 	}
+	made = append(made, output)
+	session, err := newONNXSession(rt.paths.ModelFile, inputIDs, attentionMask, tokenTypeIDs, output)
+	if err != nil {
+		return fail(err)
+	}
+	rt.session, rt.inputIDs, rt.attentionMask, rt.tokenTypeIDs, rt.output = session, inputIDs, attentionMask, tokenTypeIDs, output
+	rt.loads++
+	rt.logger.Info("ONNX model loaded", "loads", rt.loads)
+	return nil
+}
 
+// destroyAll frees ONNX values. A failed Destroy leaves nothing to recover:
+// the value is gone either way.
+func destroyAll(values ...interface{ Destroy() error }) {
+	for _, v := range values {
+		_ = v.Destroy()
+	}
+}
+
+// touchLocked records a use and pushes the idle unload back.
+func (rt *onnxRuntime) touchLocked() {
+	rt.lastUse = time.Now()
+	if rt.idleAfter <= 0 {
+		return
+	}
+	if rt.idle == nil {
+		rt.idle = time.AfterFunc(rt.idleAfter, rt.unloadIfIdle)
+		return
+	}
+	rt.idle.Reset(rt.idleAfter)
+}
+
+func (rt *onnxRuntime) unloadIfIdle() {
+	rt.mu.Lock()
+	if rt.session == nil && len(rt.tokenizers) == 0 {
+		rt.mu.Unlock()
+		return
+	}
+	if rt.idleAfter <= 0 {
+		rt.mu.Unlock()
+		return
+	}
+	if wait := rt.idleAfter - time.Since(rt.lastUse); wait > 0 {
+		rt.idle.Reset(wait)
+		rt.mu.Unlock()
+		return
+	}
+	rt.releaseLocked()
+	rt.mu.Unlock()
+	releaseMemoryToOS()
+	rt.logger.Info("ONNX model unloaded after idle", "idle", rt.idleAfter)
+}
+
+// releaseLocked destroys the session and drops the tokenizers.
+func (rt *onnxRuntime) releaseLocked() {
+	if rt.session != nil {
+		destroyAll(rt.session, rt.inputIDs, rt.attentionMask, rt.tokenTypeIDs, rt.output)
+		rt.session, rt.inputIDs, rt.attentionMask, rt.tokenTypeIDs, rt.output = nil, nil, nil, nil, nil
+	}
+	rt.tokenizers = map[bool]Tokenizer{}
+}
+
+// newONNXSession opens the model with inference capped at one thread per op.
+func newONNXSession(modelFile string, inputIDs, attentionMask, tokenTypeIDs *ort.Tensor[int64], output *ort.Tensor[float32]) (*ort.AdvancedSession, error) {
 	// Cap ONNX intra/inter-op parallelism. Embeds are short, single-sequence
 	// inferences run by a background worker that may live in several processes at
 	// once (the hub daemon plus each per-session MCP). With the default (nil)
@@ -168,16 +232,15 @@ func loadONNXEmbedder(artifacts *onnxArtifacts, logger *slog.Logger) (*ONNXEmbed
 	if err != nil {
 		return nil, fmt.Errorf("onnx: create session options: %w", err)
 	}
-	defer sessOpts.Destroy()
+	defer destroyAll(sessOpts)
 	if err := sessOpts.SetIntraOpNumThreads(1); err != nil {
 		return nil, fmt.Errorf("onnx: set intra-op threads: %w", err)
 	}
 	if err := sessOpts.SetInterOpNumThreads(1); err != nil {
 		return nil, fmt.Errorf("onnx: set inter-op threads: %w", err)
 	}
-
 	session, err := ort.NewAdvancedSession(
-		paths.ModelFile,
+		modelFile,
 		[]string{"input_ids", "attention_mask", "token_type_ids"},
 		[]string{"last_hidden_state"},
 		[]ort.Value{inputIDs, attentionMask, tokenTypeIDs},
@@ -187,21 +250,142 @@ func loadONNXEmbedder(artifacts *onnxArtifacts, logger *slog.Logger) (*ONNXEmbed
 	if err != nil {
 		return nil, fmt.Errorf("onnx: create session: %w", err)
 	}
+	return session, nil
+}
 
-	logger.Info("ONNX embedder initialized", "model", artifacts.modelName, "dims", onnxModelDims)
+type ONNXPaths struct {
+	RuntimeLib    string
+	ModelFile     string
+	VocabFile     string
+	TokenizerFile string
+}
+
+// NewONNXEmbedder loads the model with the legacy pipeline, the one every
+// vector up to v0.19 was built with (see NewLegacyFastTokenizer).
+func NewONNXEmbedder(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error) {
+	return newONNXEmbedder(modelDir, true, logger)
+}
+
+// NewONNXEmbedderV2 loads the model with the v2 pipeline (the HuggingFace
+// tokenizer); see onnxPipelineRevisionHF.
+func NewONNXEmbedderV2(modelDir string, logger *slog.Logger) (*ONNXEmbedder, error) {
+	return newONNXEmbedder(modelDir, false, logger)
+}
+
+func newONNXEmbedder(modelDir string, legacy bool, logger *slog.Logger) (*ONNXEmbedder, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger = logger.With("component", "onnx-embedder")
+	paths := resolveONNXPaths(modelDir)
+	if err := ensureONNXRuntime(paths, logger); err != nil {
+		return nil, fmt.Errorf("onnx: runtime setup: %w", err)
+	}
+	if err := ensureONNXModel(paths, logger); err != nil {
+		return nil, fmt.Errorf("onnx: model setup: %w", err)
+	}
+
+	ort.SetSharedLibraryPath(paths.RuntimeLib)
+	if !ort.IsInitialized() {
+		if err := ort.InitializeEnvironment(); err != nil {
+			return nil, fmt.Errorf("onnx: init environment: %w", err)
+		}
+	}
+
+	if !legacy && !strings.Contains(paths.ModelFile, onnxModelName) {
+		// The v2 pipeline is verified (TestTokenizerGolden) for the
+		// multilingual model only; an install still on the older English
+		// model keeps the pipeline its vectors were built with.
+		logger.Info("v2 embedding pipeline is only verified for "+onnxModelName+"; keeping the legacy pipeline", "model", paths.ModelFile)
+		legacy = true
+	}
+
+	// The pipeline, and so the embedder's identity, follows from the files
+	// on disk; the tokenizer and the model load on the first embed.
+	pipeline := expectedONNXPipeline(paths, legacy)
+	modelRevision, err := onnxArtifactRevisionForPipeline(paths, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("onnx: identify model artifacts: %w", err)
+	}
+
+	var activeModel string
+	if strings.Contains(paths.ModelFile, legacyModelName) {
+		activeModel = legacyModelName
+	} else {
+		activeModel = onnxModelName
+	}
+
+	logger.Info("ONNX embedder ready; the model loads on first use", "model", activeModel, "dims", onnxModelDims)
 
 	return &ONNXEmbedder{
-		session:       session,
-		tokenizer:     tokenizer,
+		rt:            newONNXRuntime(paths, legacy, logger),
 		dims:          onnxModelDims,
 		logger:        logger,
-		modelName:     artifacts.modelName,
-		modelRevision: artifacts.modelRevision,
-		inputIDs:      inputIDs,
-		attentionMask: attentionMask,
-		tokenTypeIDs:  tokenTypeIDs,
-		output:        output,
+		modelName:     activeModel,
+		modelRevision: modelRevision,
+		pipeline:      pipeline,
+		legacy:        legacy,
 	}, nil
+}
+
+// expectedONNXPipeline is the pipeline loadONNXTokenizer picks for these
+// files when the tokenizer loads.
+func expectedONNXPipeline(paths *ONNXPaths, legacy bool) string {
+	switch {
+	case legacy:
+		return onnxPipelineRevision
+	case fileExists(paths.TokenizerFile):
+		return onnxPipelineRevisionHF
+	default:
+		return onnxPipelineRevisionVocabV2
+	}
+}
+
+// Legacy reports whether e embeds with the legacy pipeline.
+func (e *ONNXEmbedder) Legacy() bool { return e.legacy }
+
+// Pipeline returns an embedder for the legacy (true) or v2 pipeline that
+// shares e's model session: the two tokenize differently, so their vectors
+// live in different semantic spaces, but the 470 MB model is loaded once. The
+// result must be closed like any embedder.
+func (e *ONNXEmbedder) Pipeline(legacy bool) (*ONNXEmbedder, error) {
+	pipeline, revision := e.pipeline, e.modelRevision
+	if legacy != e.legacy {
+		pipeline = expectedONNXPipeline(e.rt.paths, legacy)
+		rev, err := onnxArtifactRevisionForPipeline(e.rt.paths, pipeline)
+		if err != nil {
+			return nil, fmt.Errorf("onnx: identify model artifacts: %w", err)
+		}
+		revision = rev
+	}
+	e.rt.mu.Lock()
+	e.rt.refs[legacy]++
+	e.rt.mu.Unlock()
+	sibling := *e
+	sibling.pipeline = pipeline
+	sibling.modelRevision = revision
+	sibling.legacy = legacy
+	sibling.closed = false
+	return &sibling, nil
+}
+
+// Loaded reports whether the model is in memory now.
+func (e *ONNXEmbedder) Loaded() bool {
+	e.rt.mu.Lock()
+	defer e.rt.mu.Unlock()
+	return e.rt.session != nil
+}
+
+// SetIdleUnload sets how long the model stays loaded after its last embed; 0
+// keeps it loaded once it has been used. It applies to every pipeline sharing
+// the model.
+func (e *ONNXEmbedder) SetIdleUnload(d time.Duration) {
+	e.rt.mu.Lock()
+	defer e.rt.mu.Unlock()
+	e.rt.idleAfter = d
+	if d <= 0 && e.rt.idle != nil {
+		e.rt.idle.Stop()
+	}
 }
 
 func (e *ONNXEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
@@ -217,25 +401,37 @@ func (e *ONNXEmbedder) Embed(_ context.Context, texts []string) ([][]float32, er
 }
 
 func (e *ONNXEmbedder) embedSingle(text string) ([]float32, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	rt := e.rt
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if !rt.openLocked() {
+		return nil, fmt.Errorf("onnx: embedder closed")
+	}
 
-	ids, mask, typeIDs := e.tokenizer.Tokenize(text)
+	tokenizer, err := rt.tokenizerLocked(e.legacy, e.pipeline)
+	if err != nil {
+		return nil, err
+	}
+	if err := rt.sessionLocked(); err != nil {
+		return nil, err
+	}
+	ids, mask, typeIDs := tokenizer.Tokenize(text)
 
-	copy(e.inputIDs.GetData(), ids)
-	copy(e.attentionMask.GetData(), mask)
-	copy(e.tokenTypeIDs.GetData(), typeIDs)
+	copy(rt.inputIDs.GetData(), ids)
+	copy(rt.attentionMask.GetData(), mask)
+	copy(rt.tokenTypeIDs.GetData(), typeIDs)
 
-	if err := e.session.Run(); err != nil {
+	if err := rt.session.Run(); err != nil {
 		return nil, fmt.Errorf("session run: %w", err)
 	}
 
-	raw := e.output.GetData()
+	raw := rt.output.GetData()
 	vec := meanPool(raw, mask, onnxMaxSeqLen, e.dims)
 	l2Normalize(vec)
 
 	result := make([]float32, len(vec))
 	copy(result, vec)
+	rt.touchLocked()
 	return result, nil
 }
 
@@ -244,6 +440,33 @@ func (e *ONNXEmbedder) Name() string          { return "onnx" }
 func (e *ONNXEmbedder) Model() string         { return e.modelName }
 func (e *ONNXEmbedder) ModelRevision() string { return e.modelRevision }
 func (e *ONNXEmbedder) Normalization() string { return "l2" }
+
+// loadONNXTokenizer picks the tokenizer.json tokenizer, falling back to
+// vocab.txt WordPiece, and returns the pipeline revision that names it. The
+// legacy pipeline keeps v0.19's selection and its single revision.
+func loadONNXTokenizer(paths *ONNXPaths, legacy bool, logger *slog.Logger) (Tokenizer, string, error) {
+	if fileExists(paths.TokenizerFile) {
+		newTok, pipeline := NewFastTokenizer, onnxPipelineRevisionHF
+		if legacy {
+			newTok, pipeline = NewLegacyFastTokenizer, onnxPipelineRevision
+		}
+		tok, err := newTok(paths.TokenizerFile, onnxMaxSeqLen)
+		if err == nil {
+			logger.Info("using fast tokenizer (tokenizer.json)", "legacy", legacy)
+			return tok, pipeline, nil
+		}
+		logger.Warn("fast tokenizer failed, falling back to wordpiece", "error", err, "legacy", legacy)
+	}
+	tok, err := NewWordPieceTokenizer(paths.VocabFile, onnxMaxSeqLen)
+	if err != nil {
+		return nil, "", fmt.Errorf("onnx: load tokenizer: %w", err)
+	}
+	logger.Info("using wordpiece tokenizer (vocab.txt)", "legacy", legacy)
+	if legacy {
+		return tok, onnxPipelineRevision, nil
+	}
+	return tok, onnxPipelineRevisionVocabV2, nil
+}
 
 func onnxArtifactRevision(paths *ONNXPaths) (string, error) {
 	return onnxArtifactRevisionForPipeline(paths, onnxPipelineRevision)
@@ -282,20 +505,23 @@ func hashArtifact(digest hash.Hash, path string) error {
 }
 
 func (e *ONNXEmbedder) Close() error {
-	if e.session != nil {
-		e.session.Destroy()
+	if e.closed || e.rt == nil {
+		return nil
 	}
-	if e.inputIDs != nil {
-		e.inputIDs.Destroy()
+	e.closed = true
+	rt := e.rt
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.refs[e.legacy]--
+	if rt.refs[e.legacy] <= 0 {
+		delete(rt.refs, e.legacy)
+		delete(rt.tokenizers, e.legacy)
 	}
-	if e.attentionMask != nil {
-		e.attentionMask.Destroy()
-	}
-	if e.tokenTypeIDs != nil {
-		e.tokenTypeIDs.Destroy()
-	}
-	if e.output != nil {
-		e.output.Destroy()
+	if !rt.openLocked() {
+		if rt.idle != nil {
+			rt.idle.Stop()
+		}
+		rt.releaseLocked()
 	}
 	return nil
 }

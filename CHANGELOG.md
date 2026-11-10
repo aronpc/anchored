@@ -6,32 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Added
-
-- **Contextual remote skills** — when a repo has an active remote, procedural
-  work routes through `anchored_skill(action=search, intent=...)` before memory
-  search, and only the best-matching skill body is loaded. Skills are a separate
-  instruction plane from memories, so a procedure the team maintains centrally
-  reaches the agent without being mixed into recall. Fail-open: no match, or no
-  remote capability, and the session continues normally.
-- **`anchored migrate --remote <url>`** — move a local database to a hosted
-  Anchored server. It pushes records rather than uploading the SQLite file, so
-  the transfer is resumable and the server never opens a database it did not
-  create. The first run is a **dry run** that reports what would move and what
-  the import would cost; writing takes an explicit `--apply`. It only ever reads
-  the local database — switching the local client off stays a separate, manual
-  decision.
-
 ### Fixed
 
-- **Every session pinned ~600 MB for a model it rarely used** — the ONNX
-  embedder loaded the full multilingual model (470 MB fp32) at MCP startup, and
-  each AI session spawns its own MCP, so ten open sessions held ~6 GB even when
-  idle. The model now loads on the first embed and is released after
-  `embedding.idle_unload_minutes` without use (default 5; negative keeps it
-  loaded). Vectors are unchanged — same artifacts, same identity, no re-embed.
-  Measured on a real database: 671 MB → 154 MB at startup, 172 MB after idle;
-  the first search after an unload pays ~2 s to reload.
 - **A checkout started with no memory of its repository** — project identity
   came from the path, so every checkout of the same repository got a project row
   of its own and an empty memory, while the history stayed under whichever
@@ -52,7 +28,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   back to the path — two such checkouts stay separate, because nothing available
   says otherwise.
 
-  This **reverses** the note published with the previous fix, which said
+  This **reverses** the note published with the 0.18.0 worktree fix, which said
   independent clones of the same remote would stay separate to keep a repository
   checked out for different operational contexts from having its memory merged.
   That guarantee was never held by a test — the one that appeared to guard it
@@ -61,6 +37,481 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   repository is the same project, and a framework that clones a repository per
   experiment arm was starting every arm blind to the memory of the repository it
   had just cloned.
+
+## [0.20.2] - 2026-10-17
+
+Search latency and remote routing. On an 85k-memory database a search takes
+0.2 s instead of 4.4–4.9 s, with the same ranking. Remotes are now chosen the
+same way on every run, and a path glob keeps a repository on its remote.
+
+### Fixed
+
+- **Search no longer rebuilds the entity lexicon on every call.** Each search
+  scanned the keywords of every memory, about 4 s on a large store. The
+  lexicon now loads once per process and refreshes in the background with
+  only the memories added since. `eval recall --real` is unchanged.
+- **A remote that is down no longer stalls every search.** Remotes are asked
+  at the same time: the routed one first, the others after a second. Each one
+  gets at most 2.5 s, and the server keeps the answer for a few minutes.
+- **Ties between remotes resolve the same way every time.** Between path
+  globs, the one with the most literal characters wins, then the remote's
+  name. Between several remotes marked default, the first by name wins, and
+  `remote status` warns about the duplicates and shows the glob that routed
+  the repository.
+- **`anchored remote sync --all` works.** It failed on its own flag. It now
+  shares `sync-per-project`, which routes each project through the named
+  remotes, reuses the project it created before (matched by the repository's
+  routing key, never by folder name alone), and checks each project's
+  memories against that project's own folder instead of the current
+  directory. Both commands take `--remote` and `--dry-run`. A project ID
+  shorter than 8 characters no longer crashes them.
+
+### Changed
+
+- **Writes wait for a remote that may own the repository.** When a remote
+  ranked first does not answer, or refuses the credentials, automatic saves,
+  `kg_add` and `remote sync` hold the write instead of sending it to another
+  server. Held saves are retried a minute later without using up their
+  attempts. A 401/403 asks you to log in again.
+- **A path glob keeps a repository on its remote.** When a remote's `paths`
+  glob matches a repository, searches, skills and writes go to that remote
+  only, even if another remote lists a project under the same routing key.
+  If the glob's remote does not have the project yet, `remote sync` stops
+  and says so, and `sync --all` creates it there. `remote status` warns when
+  the repository is registered on another remote. A glob also covers the
+  repository's subdirectories, symlinks to it and its linked worktrees, but
+  never directories above a repository's root.
+- **`remote sync --all` and `sync-per-project` exit 1** when a project was held
+  or failed to sync, and `--all` refuses `--project-id`, `--project`,
+  `--full-store` and `--force` instead of ignoring them.
+- The `modernc.org/sqlite` dependency is gone.
+
+## [0.20.1] - 2026-09-29
+
+Memory and CPU. Measured with one `serve` on an 85k-memory database: it
+starts at 100 MB instead of 1,182 MB, idles at 0.05% of a core instead of
+0.9%, and drops back to ~150 MB after the model's idle delay instead of
+staying at ~1 GB.
+
+### Fixed
+
+- **An idle process no longer keeps the embedding model in memory.** Every
+  `serve`, the dashboard and every CLI command loaded the ~500 MB model at
+  start, whether or not it ever embedded anything. With several MCP sessions
+  open, that was about a gigabyte per session and the machine swapped.
+  - The model now loads on the first embed, in about a second.
+  - It unloads after `embedding.idle_unload_minutes` (default 5) without an
+    embed, and the freed memory goes back to the system. 0 keeps it loaded
+    once used.
+  - A new memory queued by another process is left for a minute to a process
+    that has the model loaded. A process loads the model for it only if no
+    other process takes the job.
+- **The vector cache holds each vector once.** It kept a float32 copy of every
+  vector next to the 8-bit form that scoring uses: 130 MB more per process for
+  85k memories.
+  - Ranking is unchanged: the real-embedder eval gives the same recall@5
+    (0.380) and MRR@10 (0.357).
+  - Diversification (MMR) and dream's semantic tiers now compare the 8-bit
+    form.
+- **Idle workers no longer take the database write lock to find nothing.**
+  Each process opened a write transaction four times a second to look for
+  jobs, even with none queued. It now checks with a read first. When there is
+  nothing to do, the check backs off from 250 ms to 2 s. A save in the same
+  process still starts its job at once.
+- **`anchored remote configure --disable` takes the default remote out of
+  routing.** The `remote:` block was merged into the remote list whether or
+  not it was enabled. A disabled or dead default server still received every
+  search and sync, and each search waited out its timeout: 5–7 s instead of
+  0.2 s.
+- **A short CLI command no longer warns "embedding generation warm
+  failed".** The command closed before the background cache warm finished; a
+  warm stopped by shutdown now logs at debug level.
+
+## [0.20.0] - 2026-09-28
+
+The first stable 0.20 release. It carries everything in 0.20.0-rc.1 and
+0.20.0-rc.2 below: search fixed at the root (tokenizer, BM25, scope, ranking),
+a background rebuild of every embedding that keeps semantic search on, dream
+no longer deleting across projects, and a private database, config and debug
+log.
+
+After the update, each process rebuilds embeddings in the background.
+`anchored stats` shows the progress. Search switches to the new vectors once
+every live memory has one and no process older than 0.20 holds the database.
+`anchored doctor --processes` lists the processes it is waiting for; restart
+the MCP clients that started them.
+
+### Fixed
+
+- **The dashboard service picks up an update without a reboot.** An update
+  replaces the binary on disk. The `anchored-dashboard` systemd unit kept
+  running the old code, and an old dashboard holds the database, so it held
+  the embedding switch indefinitely. `serve` now restarts the unit when its
+  process runs a binary that has since been replaced at the same path. It
+  checks at startup and every 10 minutes, with `try-restart --no-block`.
+  `self-update` does the same right after installing. A dashboard started from
+  another path is left alone, and so is a stopped unit.
+
+## [0.20.0-rc.2] - 2026-09-26
+
+Release candidate, published as a GitHub pre-release: auto-update does not
+install it.
+
+### Fixed
+
+- **The embedding rebuild no longer pegs a CPU core per process for hours.**
+  Every embedding job re-ran a reconciliation that scanned every live memory
+  (1.5 s on 84k memories) and queued at most 200 jobs. On a real database the
+  rebuild ran at about one memory per second across four processes, each at
+  100% CPU. Missing jobs are now queued in one pass, the reconciliation runs
+  at most every 2 minutes, and jobs of the active generation no longer reload
+  the whole vector cache. On a copy of that database: about 170 memories per
+  minute per process, up from about 17.
+- **Maintenance tests no longer need an installed `anchored` binary.** The run
+  looked its own executable up before checking whether any step would run.
+
+## [0.20.0-rc.1] - 2026-09-26
+
+Release candidate: published as a GitHub pre-release, so auto-update does
+not install it. It fixes search at the root: the embedding tokenizer, BM25,
+scope and ranking. The embeddings of existing memories are rebuilt in the
+background without switching semantic search off. It also stops dream from
+deleting across projects, and makes the database, the config and the debug
+log private.
+
+### Fixed
+
+- **Embeddings match the model again.** The tokenizer misread the
+  multilingual model's `tokenizer.json`. The whole text was one word, every
+  space became token id -1, and neither the Precompiled normalizer nor the
+  Viterbi segmentation ran. Every vector landed in a collapsed space: random
+  pairs of real memories had a mean cosine of 0.73. The tokenizer now matches
+  the HuggingFace reference on all 2,054 sentences of a golden set. On the
+  real-embedder eval, recall@5 goes from 0.171 to 0.380 and MRR@10 from 0.121
+  to 0.357; on the real corpus the mean cosine drops to 0.23.
+- **Upgrading re-embeds without switching semantic search off.**
+  - The new generation is built in the background. The existing one keeps
+    answering queries through the old pipeline, and new memories go into
+    both.
+  - The switch waits until the new generation covers every live memory, its
+    vectors are healthy (mean cosine ≤ 0.45), and no binary older than 0.20
+    holds the database. On macOS and Windows, which have no `/proc`, that last
+    check cannot run, so the switch waits for `embedding.confirm_upgrade:
+    true`.
+  - Every running process follows a switch made by another within 30
+    seconds. If an older binary brings the old generation back, the
+    processes follow it too and switch again once the checks pass.
+  - `embedding.hold_upgrade: true` keeps the old generation.
+  - `anchored doctor` and `anchored stats` show the progress.
+  - The upgrade applies to the multilingual model. An installation still on
+    the older English model keeps its current pipeline.
+- **BM25 no longer ranks the weakest lexical match first.** The score was
+  inverted, so the best full-text hit weighed least in the fusion.
+- **A project-scoped search includes global memories**, and the vector top-k
+  is taken inside the scope, so a small project is not crowded out by a large
+  one closer to the query.
+- **The same search returns the same ranking.** Diversification by session
+  happens before the cut to k, so a search no longer returns fewer results
+  than it could.
+- **One age decay:** exponential from the later of creation and last use.
+  Pinned memories do not decay.
+- **Queries:**
+  - words with punctuation (`node.js`, `config.yaml`, `foo-bar`) no longer
+    break the full-text expression; a broken one fell back to matching the
+    literal words "and"/"or";
+  - `a NEAR/5 b` works again;
+  - long pasted queries are cut to their first 32 words;
+  - prefix terms start at five letters;
+  - more Portuguese and Spanish function words are ignored;
+  - a memory covering every word of the query gets twice the score of one
+    matching only part of it;
+  - synonyms that matched unrelated memories were removed.
+- **Dream no longer deletes memories across projects.** Exact dedup grouped
+  memories by content hash alone, so the same text saved in two projects
+  counted as a duplicate and one project lost its copy. On the database that
+  surfaced this, 2,005 memories were deleted with no live copy left in their
+  project. Dedup now groups by project and hash and keeps the oldest copy.
+  Every delete goes through the temporal ledger, which leaves a restorable
+  tombstone and cancels the memory's pending sync. The per-run budget counts
+  only rows that actually changed.
+- **A stored proposal is re-checked when it is applied.** Before `dream
+  --apply` deletes anything, the keeper must still be live, in the same
+  project, and hold identical content. Proposals outlive the text they were
+  computed on, and 397k near-duplicate proposals came from a collapsed vector
+  space. Applied proposals are now marked `applied`.
+- **Concurrent processes no longer race to apply a migration.** Every anchored
+  process migrates on open. Each pending migration now runs under `BEGIN
+  IMMEDIATE` and is re-checked inside the lock. Before, two processes could
+  both apply it and the second failed to start.
+- **Opening an up-to-date database never waits for the write lock.** Before,
+  `serve`, the CLI and the dashboard could stall behind a long writer.
+- **The full-text index is only rewritten when content changes.** The index
+  used to be rewritten on every tombstone, restore and re-save of unchanged
+  text. Migration 024 replaces the trigger on existing databases.
+- **The database, config and backups are created private (0600).** They
+  used to get the default mode minus the umask, usually 0644, so any local
+  user could read every memory and the remotes' API keys. This covered the
+  database and its WAL and SHM, the config, the `init` backups, and the
+  `compact --shrink` and `purge --hard` copies. Existing files are tightened
+  when opened: bits are only ever removed, never added. Other tools'
+  configs keep their own mode, and their backups inherit it.
+- **An unknown subcommand no longer starts a server.** `anchored staus`
+  started an MCP server that sat waiting on stdin. It now prints the usage and
+  exits with 2. No argument, or a leading flag, is still `serve`.
+- **`anchored serve --stdio` works.** It is the documented form, and it used
+  to fail with `flag provided but not defined`.
+- **Release builds are optimised again.** FTS5 was enabled by overriding
+  `CGO_CFLAGS`, which dropped cgo's default `-O2`. The `sqlite_fts5` build tag
+  enables it instead. On a real database, full-text search went from 29 ms to
+  12 ms.
+
+### Added
+
+- **`anchored restore --id <id>` and `anchored restore --dream-lost`.** `--id`
+  brings back a memory however it was deleted. `--dream-lost` finds memories
+  dream deleted as duplicates with no copy left in their project. It only
+  reports until `--yes` is passed.
+  - It recognises a dream delete by three traces together: a raw delete, a
+    dedup proposal naming the memory, and a delete time inside a completed
+    dream run. Anything purged, cleaned or forgotten on purpose stays deleted.
+  - Raw transcript imports are left out unless `--include-imported` is passed.
+- **Process registry and `anchored doctor --processes`.** `serve`, the hub
+  and the dashboard register and heartbeat in the database.
+  - `doctor --processes` lists every process holding the database, found by
+    its open files, so a binary renamed by self-update still shows up. It also
+    shows which of them would block one-way upgrade steps.
+  - Values of secret flags on command lines are redacted.
+- `anchored dream --semantic` runs the vector tiers (near-duplicate, synthesis,
+  contradiction), which are now off by default.
+- **The debug log no longer stores what you typed.** With `debug.enabled`,
+  prompts, tool arguments, output and error messages went to
+  `~/.anchored/debug.log` verbatim and without a size limit.
+  - Text is now recorded as its length only. `debug.content: true` records it
+    redacted and truncated.
+  - Every string and error field is scrubbed: credentials are redacted, URL
+    queries are cut and length is capped.
+  - The log rotates at 10 MB and keeps three generations.
+  - Logging stops after `debug.max_age_days` (default 7). `ANCHORED_DEBUG=1`
+    overrides the limit.
+  - A log written by an earlier version is moved to `debug.log.legacy`, and
+    `doctor` asks you to delete it.
+- **Shared redaction, with more formats.** Memory content and the debug log
+  use one set of rules. It adds JSON/YAML keys with escaped quotes,
+  credentials in any URL's userinfo, Basic auth, and the key prefixes
+  `sk-ant-`/`sk-proj-`, `sk_live_`/`rk_`/`pk_`, `github_pat_`, `glpat-`,
+  `AIza` and `anc_live_`.
+- **`anchored version`** prints the version without opening the database or
+  loading the model.
+- **`anchored eval recall --real` and `anchored eval embedding-health`.**
+  - `recall --real` scores search with the real embedder on a PT/EN/ES
+    fixture: recall@5, MRR@10 and nDCG@10.
+  - It can save a baseline tied to the fixture and the model, and fail when a
+    change does not beat it.
+  - `embedding-health` measures how spread out the database's vectors are.
+- **CI runs the tests, the eval and the linter.** A release is only published
+  when the tag, `VERSION` and the plugin manifests agree.
+
+## [0.19.2] - 2026-09-22
+
+### Fixed
+
+- **`anchored compact` no longer needs twice the database in free space.** The
+  rewrite that returns freed pages to the filesystem used in-place `VACUUM`,
+  which builds its copy beside the original — so it demanded roughly double the
+  current size, on exactly the disk that a caller reaching for this command has
+  already run short of. It now uses `VACUUM INTO`, which writes only the live
+  pages, dropping the requirement to the *final* size.
+- **The rewrite refuses to run while another process holds the database.**
+  Replacing the file under a running editor or agent would send its writes to an
+  unlinked inode, where they vanish. The rewrite now takes the database
+  exclusively first and exits with an explanation instead, and the new file is
+  read back — integrity-checked and counted against the original — before it
+  replaces anything.
+
+### Changed
+
+- The rewrite moved behind `anchored compact --shrink` (replacing
+  `--no-vacuum`). The row sweep still runs by default and leaves freed pages
+  available for SQLite to reuse; only returning them to the filesystem needs the
+  database to itself. `anchored maintenance run` sweeps rows and never rewrites
+  the file, which an unattended timer cannot do safely.
+
+## [0.19.1] - 2026-09-22
+
+MCP clients were dropping the connection to `anchored serve` on a 30s handshake
+timeout. The handshake itself was never slow — startup was, and it had grown
+slow because the database had grown huge for a reason that turns out to be a
+bug in the save path.
+
+### Fixed
+
+- **Re-saving an unchanged memory no longer appends a revision.** Recalling a
+  fact and storing it again is the most common write an agent makes, and the
+  temporal store had no notion of a no-op: each one appended a fresh revision
+  *and* a verbatim copy of the memory's embedding vector. On the database that
+  surfaced this, 886k of 1.03M revisions (86%) were byte-identical repeats of a
+  state already recorded — one memory alone had 7,678 revisions and a single
+  distinct content hash. A save whose content, category, source, project,
+  keywords and metadata all match what is stored now returns the existing
+  memory untouched. Saves carrying a remote envelope still write, so a pending
+  sync is never stranded.
+- **The vector cache is no longer loaded twice per process start.**
+  `NewSQLiteStore` eagerly published the active generation, then the service
+  republished the same generation into the same cache moments later — decoding
+  and quantizing every vector in the corpus twice, for nothing. Callers holding
+  a bare store can warm it explicitly with `SQLiteStore.WarmVectorCache`.
+- **Startup no longer blocks on filling the vector cache.** The generation
+  manifest — the part that can genuinely fail on a misconfigured provider — is
+  still resolved synchronously, so a bad configuration still aborts startup. The
+  fill moved to a background goroutine, and a search arriving mid-fill waits on
+  the cache's warm gate rather than silently scoring against an empty vector
+  space.
+- **Quantizing the cache fans out across cores.** The copy-and-quantize pass is
+  the expensive half of a warm and every entry is independent; results are
+  identical to the sequential form.
+
+Measured against the 5.2 GB database that prompted this: **8.0s → 1.3s** to the
+first MCP response.
+
+### Added
+
+- **`anchored compact`** — reclaims the space already on disk: revisions that
+  repeat a state already recorded, the embedding copies they dragged along, and
+  completed job rows for revisions that are gone. The earliest entry of each
+  repeated state survives (it records when the state began) along with every
+  memory's current revision, so nothing readable is lost. `--dry-run` measures
+  without writing, `--keep-history` prunes only derived data, `--no-vacuum`
+  skips the file rewrite. It also runs as the last step of
+  `anchored maintenance run` (with `--no-vacuum`; `--skip-compact` opts out).
+
+## [0.19.0] - 2026-09-22
+
+### Added
+
+- **`anchored self-update`** — update the binary from the latest official
+  release, from the binary itself. The download is verified against the release
+  checksums before the swap and the previous binary is kept at `<bin>.prev`.
+  `--check` reports without writing (exit 10 when an update is available,
+  `--json` for scripts), `--version <tag>` pins or rolls back to a specific
+  release, and the Claude Code plugin is synchronized alongside the binary
+  (`--no-plugin` opts out).
+- **`anchored self-update --force`** — install past a refusal you have decided
+  against. Automatic updates skip dev builds and binaries outside
+  `~/.anchored/bin` on purpose, but until now that refusal was a debug log
+  inside a background goroutine, so such an install could sit releases behind
+  with no signal at all. `--force` overrides it, asks before replacing a dev
+  build (`--yes` to confirm up front), and reaches the plugin too — both halves
+  were frozen by the same guard.
+- **Release check in `anchored doctor`** — reports when a newer release is
+  available and hands over the command. Best-effort: with no network it degrades
+  to "not checked" and never fails the run.
+
+### Upgrade note — macOS and Windows need one manual reinstall
+
+Self-update is new in this release, and the binary that performs an update is
+the one already installed, so this release cannot repair the installs that
+precede it.
+
+Releases up to and including v0.18.0 shipped a background updater that, on
+macOS, resolves the archive but no digest — the darwin archives are absent from
+`checksums.txt` and that build cannot read the `.sha256` sidecar — and, on
+Windows, resolves no archive at all, because it matches only `.tar.gz` while
+Windows publishes `.zip`. Both were silent: the refusal was a debug log inside a
+background goroutine.
+
+Linux installs need nothing and pick this release up on their own. On macOS and
+Windows, download this release once and replace the binary in `~/.anchored/bin`
+by hand. Every update after that one is in-place.
+
+### Fixed
+
+Found by reviewing the self-update work above and fixed before it shipped, so
+none of these ever reached a release.
+
+- **Self-update reads `~/.anchored/config.yaml` again.** The plugin half loaded
+  the config with a path that is empty unless `--config` is passed, which
+  silently resolved to the compiled-in defaults — so `plugin.marketplace_dir`
+  and `plugin.cache_dir` were ignored on every ordinary run.
+- **The binary swap works on Windows.** Backing the old binary up by hardlink
+  keeps it in place, and Windows will not let a running `.exe` be replaced,
+  so the final rename could only fail — as could the rollback. The backup
+  strategy is now chosen per platform: hardlink on unix, rename-aside on
+  windows.
+- **A hardlink that fails for an unlisted reason no longer fails the update.**
+  The degradation to rename was gated on three errnos; FAT, exFAT, fuse and
+  overlay mounts report it differently.
+- **`--force` no longer pulls a marketplace mirror that is already current.**
+  A failed pull escalates to `git reset --hard` plus `git clean -fd`, so an
+  unnecessary refresh put local work in the mirror at risk.
+- **The `.sha256` sidecar is consulted only when `checksums.txt` does not list
+  the asset**, which is the darwin case it was added for. Falling back on any
+  error let whoever could break `checksums.txt` choose the expected digest.
+- **The archive format is read from the asset name, not the download URL.**
+  Both come from the release document and are independent there, so the pair
+  could disagree and route a zip payload into the tar reader.
+- **Reinstalling the version you already run is no longer refused as a
+  downgrade** that would "revert any fix released in between".
+- **A refusal's suggested override keeps `--config` and `--no-plugin`** instead
+  of handing back a command that quietly drops them.
+- **`--json --force` only requires `--yes` when the confirmation prompt would
+  actually appear**, i.e. when a dev build is being replaced.
+
+
+## [0.18.0] - 2026-09-04
+
+### Added
+
+- **Contextual remote skills** — when a repo has an active remote, procedural
+  work routes through `anchored_skill(action=search, intent=...)` before memory
+  search, and only the best-matching skill body is loaded. Skills are a separate
+  instruction plane from memories, so a procedure the team maintains centrally
+  reaches the agent without being mixed into recall. Fail-open: no match, or no
+  remote capability, and the session continues normally.
+- **`anchored migrate --remote <url>`** — move a local database to a hosted
+  Anchored server. It pushes records rather than uploading the SQLite file, so
+  the transfer is resumable and the server never opens a database it did not
+  create. The first run is a **dry run** that reports what would move and what
+  the import would cost; writing takes an explicit `--apply`. It only ever reads
+  the local database — switching the local client off stays a separate, manual
+  decision.
+
+- **`anchored project consolidate`** — folds the project rows that worktree
+  detection used to create before it was fixed. The detection fix only helps
+  from now on; a worktree that already accumulated its own row keeps holding
+  memory the main checkout cannot see. Proving which path is a worktree of which
+  repository needs git and the filesystem, so this cannot be a migration — it is
+  an explicit command, and like `anchored migrate` the first run is a **dry run**
+  that reports what would move. Only linked worktrees are folded: independent
+  clones and submodules stay apart. A project whose directory is gone is
+  reported with how many memories are stranded there and left alone, because
+  `remote_key` cannot settle it — independent clones of the same remote share
+  that key, so folding on it would merge exactly what must stay separate.
+
+### Changed
+
+- **A memory can no longer be written outside the temporal ledger.** Migration
+  `021` adopts the rows earlier write paths orphaned; migration `022` adds a
+  `BEFORE INSERT` trigger so new ones cannot appear. Curation resolves a memory
+  through `current_revision_id` and the embedding queue joins on it, so a row
+  without ledger identity is invisible to both — a half-write that only surfaces
+  later as a nightly error and a missing embedding. `NOT NULL` could not serve
+  here: both columns arrived via `ALTER TABLE` as nullable, and tightening them
+  would mean rebuilding a table carrying FTS triggers and tens of thousands of
+  rows.
+
+### Fixed
+
+- **Worktrees started with no memory of their repository** — project identity
+  came from `git rev-parse --show-toplevel`, which in a linked worktree returns
+  the worktree's own path. Since projects are looked up by exact path, every
+  worktree got a project row of its own and therefore an empty memory, while
+  the repository's history stayed under the main checkout. Detection now
+  resolves the shared repository through `--git-common-dir`, so a worktree and
+  its main checkout are one project. Only a linked worktree is redirected:
+  independent clones of the same remote stay separate, which keeps a repository
+  checked out for different operational contexts from having its memory merged,
+  and a submodule keeps the identity of its own working tree rather than of the
+  `.git/modules` directory that backs it.
 
 - **Memories orphaned from the temporal ledger** — the stop hook's lightweight
   insert wrote straight into `memories` without `logical_id` or
@@ -73,6 +524,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   revision in the same transaction as the row, and migration
   `021_backfill_ledger_orphans` adopts the rows earlier versions left behind
   (base revision for active rows, tombstone for soft-deleted ones).
+
 - **The nightly `maintenance run` burned hours of CPU** — on this machine the
   import step grew from 31 minutes to **6h57m of CPU time** over a week, and the
   cause was one line on the save path. Every save that misses the exact content

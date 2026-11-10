@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jholhewres/anchored/pkg/config"
 	"github.com/jholhewres/anchored/pkg/debuglog"
@@ -114,7 +115,9 @@ func TestBM25TopHits_EndToEnd(t *testing.T) {
 			content TEXT,
 			keywords TEXT,
 			metadata TEXT,
-			deleted_at DATETIME
+			deleted_at DATETIME,
+			logical_id TEXT,
+			current_revision_id TEXT
 		);
 		CREATE VIRTUAL TABLE memories_fts USING fts5(
 			content, keywords, content=memories, content_rowid=rowid
@@ -130,7 +133,7 @@ func TestBM25TopHits_EndToEnd(t *testing.T) {
 	insert := func(id, projectID, category, content string) {
 		t.Helper()
 		_, err := db.Exec(
-			`INSERT INTO memories (id, project_id, category, content, keywords) VALUES (?,?,?,?,'')`,
+			`INSERT INTO memories (id, project_id, category, content, keywords, logical_id, current_revision_id) VALUES (?,?,?,?,'', ?1, ?1)`,
 			id, projectID, category, content,
 		)
 		if err != nil {
@@ -197,7 +200,9 @@ func newFTSTestDB(t *testing.T) *sql.DB {
 	schema := `
 		CREATE TABLE memories (
 			id TEXT PRIMARY KEY, project_id TEXT, category TEXT,
-			content TEXT, keywords TEXT, metadata TEXT, deleted_at DATETIME
+			content TEXT, keywords TEXT, metadata TEXT, deleted_at DATETIME,
+			logical_id TEXT,
+			current_revision_id TEXT
 		);
 		CREATE VIRTUAL TABLE memories_fts USING fts5(
 			content, keywords, content=memories, content_rowid=rowid
@@ -214,7 +219,7 @@ func newFTSTestDB(t *testing.T) *sql.DB {
 func insertMem(t *testing.T, db *sql.DB, id, projectID, category, content string) {
 	t.Helper()
 	if _, err := db.Exec(
-		`INSERT INTO memories (id, project_id, category, content, keywords) VALUES (?,?,?,?,'')`,
+		`INSERT INTO memories (id, project_id, category, content, keywords, logical_id, current_revision_id) VALUES (?,?,?,?,'', ?1, ?1)`,
 		id, projectID, category, content,
 	); err != nil {
 		t.Fatal(err)
@@ -230,7 +235,7 @@ func BenchmarkBM25TopHits(b *testing.B) {
 	}
 	defer db.Close()
 	schema := `
-		CREATE TABLE memories (id TEXT PRIMARY KEY, project_id TEXT, category TEXT, content TEXT, keywords TEXT, metadata TEXT, deleted_at DATETIME);
+		CREATE TABLE memories (id TEXT PRIMARY KEY, project_id TEXT, category TEXT, content TEXT, keywords TEXT, metadata TEXT, deleted_at DATETIME, logical_id TEXT, current_revision_id TEXT);
 		CREATE VIRTUAL TABLE memories_fts USING fts5(content, keywords, content=memories, content_rowid=rowid);
 		CREATE TRIGGER t AFTER INSERT ON memories BEGIN INSERT INTO memories_fts(rowid, content, keywords) VALUES (new.rowid, new.content, new.keywords); END;`
 	if _, err := db.Exec(schema); err != nil {
@@ -238,7 +243,7 @@ func BenchmarkBM25TopHits(b *testing.B) {
 	}
 	tx, _ := db.Begin()
 	for i := 0; i < 5000; i++ {
-		_, _ = tx.Exec(`INSERT INTO memories (id, project_id, category, content, keywords) VALUES (?,?,?,?,'')`,
+		_, _ = tx.Exec(`INSERT INTO memories (id, project_id, category, content, keywords, logical_id, current_revision_id) VALUES (?,?,?,?,'', ?1, ?1)`,
 			"m"+itoaBench(i), "proj-A", "decision",
 			"decision number "+itoaBench(i)+" about postgres sqlite redis kafka architecture and sync engine design", "")
 	}
@@ -686,6 +691,9 @@ func TestAutoRecallPreview_FailSafe(t *testing.T) {
 // injection. Uses a real config file + migrated DB so the write path matches
 // production.
 func TestRecordInjection_TracksWorkingSetAndCount(t *testing.T) {
+	old := injectionWriteTimeout
+	injectionWriteTimeout = 10 * time.Second
+	t.Cleanup(func() { injectionWriteTimeout = old })
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "test.db")
 	cfgPath := filepath.Join(dir, "config.yaml")
@@ -702,8 +710,8 @@ func TestRecordInjection_TracksWorkingSetAndCount(t *testing.T) {
 	}
 	for _, id := range []string{"mem-a", "mem-b"} {
 		if _, err := db.Exec(
-			`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata)
-			 VALUES (?, 'proj1', 'decision', 'content of '||?, '', datetime('now'), datetime('now'), '{}')`,
+			`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata, logical_id, current_revision_id)
+			 VALUES (?, 'proj1', 'decision', 'content of '||?, '', datetime('now'), datetime('now'), '{}', ?1, ?1)`,
 			id, id); err != nil {
 			t.Fatal(err)
 		}
@@ -748,9 +756,9 @@ func TestBM25TopHits_ExcludesLowSignal(t *testing.T) {
 	db := newFTSTestDB(t)
 	insertMem(t, db, "ok-1", "proj-A", "decision", "postgres storage decision for the team server")
 	if _, err := db.Exec(
-		`INSERT INTO memories (id, project_id, category, content, keywords, metadata)
+		`INSERT INTO memories (id, project_id, category, content, keywords, metadata, logical_id, current_revision_id)
 		 VALUES ('demoted-1', 'proj-A', 'decision', 'postgres storage noise that was demoted', '',
-		         '{"curation_status":"low_signal","curation_rule":"never_used"}')`); err != nil {
+		         '{"curation_status":"low_signal","curation_rule":"never_used"}', 'demoted-1', 'demoted-1')`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -840,8 +848,8 @@ func TestAutoRecallPreview_CreditsGateEndToEnd(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 	if _, err := db.Exec(
-		`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata)
-		 VALUES ('m1', '', 'decision', 'we settled on postgres for the billing ledger', '', datetime('now'), datetime('now'), '{}')`,
+		`INSERT INTO memories (id, project_id, category, content, content_hash, created_at, updated_at, metadata, logical_id, current_revision_id)
+		 VALUES ('m1', '', 'decision', 'we settled on postgres for the billing ledger', '', datetime('now'), datetime('now'), '{}', 'm1', 'm1')`,
 	); err != nil {
 		t.Fatal(err)
 	}

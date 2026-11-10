@@ -717,20 +717,31 @@ func (c *Client) ResolveProjectIDByRemoteKey(ctx context.Context, remoteKey stri
 // fetched once and matched in memory, so passing multiple keys (e.g. canonical
 // then legacy) costs a single round-trip. Empty keys are skipped.
 func (c *Client) ResolveProjectIDByRemoteKeys(ctx context.Context, keys ...string) (projectID, matchedKey string) {
-	hasKey := false
-	for _, k := range keys {
-		if k != "" {
-			hasKey = true
-			break
-		}
-	}
-	if !hasKey {
-		return "", ""
-	}
-	projects, err := c.ListProjects(ctx)
+	pid, matched, err := c.lookupProjectIDByRemoteKeys(ctx, keys...)
 	if err != nil {
 		return "", ""
 	}
+	return pid, matched
+}
+
+// lookupProjectIDByRemoteKeys is ResolveProjectIDByRemoteKeys that also says
+// whether the server failed to answer, as opposed to answering that it knows
+// none of the keys.
+func (c *Client) lookupProjectIDByRemoteKeys(ctx context.Context, keys ...string) (projectID, matchedKey string, err error) {
+	if !anyKey(keys) {
+		return "", "", nil
+	}
+	projects, err := c.ListProjects(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	projectID, matchedKey = MatchProjectByRemoteKeys(projects, keys...)
+	return projectID, matchedKey, nil
+}
+
+// MatchProjectByRemoteKeys finds the listed project registered under the first
+// of keys that any project carries, and says which key matched.
+func MatchProjectByRemoteKeys(projects []RemoteProject, keys ...string) (projectID, matchedKey string) {
 	for _, k := range keys {
 		if k == "" {
 			continue

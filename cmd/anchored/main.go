@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 )
 
 // Version is overridden at build time via `-ldflags -X main.Version=$(cat VERSION)`
@@ -29,6 +30,8 @@ func main() {
 		runList(os.Args[2:])
 	case "forget":
 		runForget(os.Args[2:])
+	case "restore":
+		runRestore(os.Args[2:])
 	case "update":
 		runUpdate(os.Args[2:])
 	case "stats":
@@ -51,6 +54,8 @@ func main() {
 		runBootstrap(os.Args[2:])
 	case "retention":
 		runRetention(os.Args[2:])
+	case "compact":
+		runCompact(os.Args[2:])
 	case "hook":
 		runHook(os.Args[2:])
 	case "dream":
@@ -79,15 +84,33 @@ func main() {
 		runHub(os.Args[2:])
 	case "maintenance":
 		runMaintenance(os.Args[2:])
+	case "self-update", "upgrade":
+		runSelfUpdate(os.Args[2:])
 	case "migrate":
 		runMigrate(os.Args[2:])
-	case "--version", "-v":
+	case "project":
+		runProject(os.Args[2:])
+	case "version", "--version", "-v":
 		fmt.Printf("anchored %s\n", Version)
-	case "--help", "-h":
+	case "--help", "-h", "help":
 		printUsage()
 	default:
+		if !unrecognisedArgIsServe(os.Args[1]) {
+			fmt.Fprintf(os.Stderr, "anchored: unknown command %q\n\n", os.Args[1])
+			printUsage()
+			os.Exit(2)
+		}
 		runServe(os.Args[1:])
 	}
+}
+
+// unrecognisedArgIsServe reports whether a first argument that matched no
+// subcommand still means the MCP server: clients register a bare `anchored`
+// and some pass flags first (`anchored --config x`). Any other word is a
+// mistyped or unknown command, which must not boot a server (ONNX, workers,
+// a writer on the database) in its place.
+func unrecognisedArgIsServe(arg string) bool {
+	return strings.HasPrefix(arg, "-")
 }
 
 func printUsage() {
@@ -100,6 +123,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored save <content>     Save a memory\n")
 	fmt.Fprintf(os.Stderr, "  anchored list               List memories\n")
 	fmt.Fprintf(os.Stderr, "  anchored forget <id>        Remove a memory\n")
+	fmt.Fprintf(os.Stderr, "  anchored restore --id <id>  Bring back a deleted memory (--dream-lost: undo dream's lost dedups)\n")
 	fmt.Fprintf(os.Stderr, "  anchored update <id>        Update a memory\n")
 	fmt.Fprintf(os.Stderr, "  anchored stats              Show memory statistics\n")
 	fmt.Fprintf(os.Stderr, "  anchored identity [edit]    View or edit identity file\n")
@@ -109,12 +133,14 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored handoff            Save a handoff snapshot for session continuity\n")
 	fmt.Fprintf(os.Stderr, "  anchored bootstrap          Bootstrap project memories from sources\n")
 	fmt.Fprintf(os.Stderr, "  anchored retention sweep    Sweep expired/episodic memories\n")
+	fmt.Fprintf(os.Stderr, "  anchored compact            Reclaim space from redundant revisions/vectors\n")
 	fmt.Fprintf(os.Stderr, "  anchored hook <subcommand>  Run session continuity hooks\n")
 	fmt.Fprintf(os.Stderr, "  anchored dream              Analyze and consolidate duplicate memories\n")
 	fmt.Fprintf(os.Stderr, "  anchored curation status    Show curation worker state\n")
 	fmt.Fprintf(os.Stderr, "  anchored curation disable   Disable serve-time curation worker\n")
 	fmt.Fprintf(os.Stderr, "  anchored curation score     Score and mark low-signal memories\n")
 	fmt.Fprintf(os.Stderr, "  anchored curation reconcile Re-score entire corpus, repair stale flags\n")
+	fmt.Fprintf(os.Stderr, "  anchored self-update        Update the BINARY from the latest release (see: update)\n")
 	fmt.Fprintf(os.Stderr, "  anchored doctor             Diagnose installation, config, MCP registration\n")
 	fmt.Fprintf(os.Stderr, "  anchored purge              Wipe memories (--hard for full DB reset)\n")
 	fmt.Fprintf(os.Stderr, "  anchored inspect <id>      Show full memory details\n")
@@ -129,7 +155,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "  anchored dashboard install  Install dashboard as a systemd --user service\n")
 	fmt.Fprintf(os.Stderr, "  anchored maintenance run    Periodic upkeep: import + dream + curation reconcile\n")
 	fmt.Fprintf(os.Stderr, "  anchored maintenance install  Install upkeep as a systemd --user daily timer\n")
-	fmt.Fprintf(os.Stderr, "  anchored --version          Print version\n")
+	fmt.Fprintf(os.Stderr, "  anchored project consolidate  Fold worktree projects into their repository (dry run by default)\n")
+	fmt.Fprintf(os.Stderr, "  anchored version            Print version\n")
 	fmt.Fprintf(os.Stderr, "\nImport sources: claude-code devclaw opencode cursor all\n")
 	fmt.Fprintf(os.Stderr, "\nFlags:\n")
 	fmt.Fprintf(os.Stderr, "  --config <path>   Use specific config file\n")

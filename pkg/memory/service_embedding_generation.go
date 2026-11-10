@@ -11,6 +11,22 @@ import (
 // explicitly identified semantic space. It is safe to call repeatedly: the
 // manifest and its snapshot/delta jobs are idempotent.
 func (s *Service) ensureCurrentEmbeddingGeneration(ctx context.Context) error {
+	return s.ensureEmbeddingGeneration(ctx, false)
+}
+
+// warmEmbeddingGenerationAsync does the same binding, but publishes the vectors
+// on a background goroutine. Startup gets the cheap, failure-prone half —
+// identity resolution and the generation manifest — synchronously, so a
+// misconfigured provider still aborts NewService; the expensive half (decode
+// and quantize every vector in the corpus) no longer sits between process start
+// and the first request. Searches that arrive before the fill completes block
+// on the cache's warm gate, so results never silently degrade to an empty
+// vector space.
+func (s *Service) warmEmbeddingGenerationAsync(ctx context.Context) error {
+	return s.ensureEmbeddingGeneration(ctx, true)
+}
+
+func (s *Service) ensureEmbeddingGeneration(ctx context.Context, warmAsync bool) error {
 	if s.embedder == nil {
 		return nil
 	}
@@ -39,42 +55,117 @@ func (s *Service) ensureCurrentEmbeddingGeneration(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if active != nil && active.Identity.Compatible(identity) {
-		if err := s.enableEmbeddingGeneration(ctx, generations, active); err != nil {
-			return err
-		}
-	} else {
-		// NewSQLiteStore may have loaded an active generation for a different
-		// provider/model. Clear it before the current provider can issue a query.
-		if active != nil {
-			s.logger.Warn("embedding generation mismatch; semantic search disabled until backfill",
-				"active_generation", active.ID,
-				"active_model", active.Identity.Model,
-				"active_dimensions", active.Identity.Dimensions,
-				"building_generation", generation.ID,
-				"configured_model", identity.Model,
-				"configured_dimensions", identity.Dimensions,
-			)
-		} else {
-			s.logger.Info("embedding generation building; semantic search temporarily disabled",
-				"generation", generation.ID,
-				"model", identity.Model,
-				"dimensions", identity.Dimensions,
-			)
-		}
-		if cache := s.store.VectorCache(); cache != nil {
-			cache.Replace(nil)
-		}
-		if s.searcher != nil {
-			s.searcher.UseEmbeddingGeneration(nil)
-		}
+	var legacy EmbeddingProvider
+	if active != nil && !active.Identity.Compatible(identity) {
+		// Built by the legacy pipeline of the same model? Then it keeps
+		// answering queries while the current pipeline's generation builds.
+		legacy = s.legacyProviderFor(active)
 	}
 
-	if _, err := generations.EnsureEmbeddingGenerationJobs(ctx, generation.ID, 0); err != nil {
+	publish := func(ctx context.Context) error {
+		if active != nil && active.Identity.Compatible(identity) {
+			if err := s.enableEmbeddingGeneration(ctx, generations, active); err != nil {
+				return err
+			}
+		} else if legacy != nil {
+			s.logger.Info("building a new embedding generation; the legacy one keeps serving search",
+				"active_generation", active.ID, "building_generation", generation.ID)
+			if err := s.enableEmbeddingGeneration(ctx, generations, active); err != nil {
+				return err
+			}
+			// Saves made while no v0.20 process ran still need their vectors in
+			// the generation that answers queries until the switch.
+			if _, err := s.ensureGenerationJobs(ctx, generations, active.ID); err != nil {
+				return err
+			}
+		} else {
+			// An active generation may belong to a different provider/model.
+			// Clear it before the current provider can issue a query.
+			if active != nil {
+				s.logger.Warn("embedding generation mismatch; semantic search disabled until backfill",
+					"active_generation", active.ID,
+					"active_model", active.Identity.Model,
+					"active_dimensions", active.Identity.Dimensions,
+					"building_generation", generation.ID,
+					"configured_model", identity.Model,
+					"configured_dimensions", identity.Dimensions,
+				)
+			} else {
+				s.logger.Info("embedding generation building; semantic search temporarily disabled",
+					"generation", generation.ID,
+					"model", identity.Model,
+					"dimensions", identity.Dimensions,
+				)
+			}
+			if cache := s.store.VectorCache(); cache != nil {
+				cache.ReplaceSpace("", nil)
+			}
+			s.setServedGeneration("")
+			if s.searcher != nil {
+				s.searcher.UseEmbeddingGeneration(nil)
+			}
+		}
+
+		if _, err := s.ensureGenerationJobs(ctx, generations, generation.ID); err != nil {
+			return err
+		}
+		_, err := s.tryActivateEmbeddingGeneration(ctx, generations, generation.ID)
 		return err
 	}
-	_, err = s.tryActivateEmbeddingGeneration(ctx, generations, generation.ID)
-	return err
+
+	if !warmAsync {
+		return publish(ctx)
+	}
+
+	// Open the warm gate BEFORE returning, so a search racing this call waits
+	// for the fill instead of observing the empty cache it started from.
+	var done func()
+	if cache := s.store.VectorCache(); cache != nil {
+		done = cache.BeginWarm()
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		if done != nil {
+			defer done()
+		}
+		warmCtx, cancel := s.shutdownContext()
+		defer cancel()
+		started := time.Now()
+		if err := publish(warmCtx); err != nil {
+			if warmCtx.Err() != nil {
+				// The service closed first, as a short CLI command does.
+				s.logger.Debug("embedding generation warm stopped by shutdown", "error", err)
+				return
+			}
+			s.logger.Warn("embedding generation warm failed; semantic search stays cold", "error", err)
+			return
+		}
+		if cache := s.store.VectorCache(); cache != nil {
+			s.logger.Info("vector cache warm", "count", cache.Len(), "took", time.Since(started).String())
+		}
+		// The fill decodes every vector before quantizing it; hand those
+		// buffers back instead of keeping them as heap headroom.
+		releaseMemoryToOS()
+	}()
+	return nil
+}
+
+// shutdownContext derives a context cancelled when the service closes, so a
+// background warm does not outlive the process it belongs to.
+func (s *Service) shutdownContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if s.shutdown == nil {
+		return ctx, cancel
+	}
+	go func() {
+		select {
+		case <-s.shutdown:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 func (s *Service) currentEmbeddingGenerationID() string {
@@ -92,6 +183,17 @@ func (s *Service) currentEmbeddingIdentity() (EmbeddingIdentity, bool) {
 	return identity, generationID != ""
 }
 
+// ensureGenerationJobs reconciles the durable jobs that embed into
+// generationID, under the job kind its pipeline uses.
+func (s *Service) ensureGenerationJobs(ctx context.Context, generations EmbeddingGenerationStore, generationID string) (int, error) {
+	if kinded, ok := generations.(interface {
+		EnsureEmbeddingGenerationJobsOfKind(ctx context.Context, generationID, kind string, limit int) (int, error)
+	}); ok {
+		return kinded.EnsureEmbeddingGenerationJobsOfKind(ctx, generationID, s.jobKindFor(generationID), 0)
+	}
+	return generations.EnsureEmbeddingGenerationJobs(ctx, generationID, 0)
+}
+
 func (s *Service) enableEmbeddingGeneration(
 	ctx context.Context,
 	generations EmbeddingGenerationStore,
@@ -100,29 +202,43 @@ func (s *Service) enableEmbeddingGeneration(
 	if generation == nil {
 		return fmt.Errorf("active embedding generation is nil")
 	}
-	identity, ok := s.currentEmbeddingIdentity()
-	if !ok || !generation.Identity.Compatible(identity) {
+	provider := s.providerFor(generation.Identity)
+	if provider == nil {
 		return fmt.Errorf("active embedding generation is incompatible with configured provider")
 	}
 	if publisher, ok := s.store.(EmbeddingGenerationPublicationStore); ok && s.searcher != nil {
-		return s.searcher.publishEmbeddingGeneration(generation.Identity,
+		if err := s.searcher.publishEmbeddingGeneration(generation.Identity, provider,
 			func(publish func(map[string][]float32) error) error {
 				return publisher.PublishEmbeddingGeneration(
 					ctx, generation.ID, false, publish,
 				)
-			})
+			}); err != nil {
+			return err
+		}
+		s.servingGeneration(generation.ID)
+		return nil
 	}
 	vectors, err := generations.LoadEmbeddingGeneration(ctx, generation.ID)
 	if err != nil {
 		return err
 	}
 	if cache := s.store.VectorCache(); cache != nil {
-		cache.Replace(vectors)
+		cache.ReplaceSpace(generation.SemanticSpaceID, vectors)
 	}
 	if s.searcher != nil {
-		s.searcher.UseEmbeddingGeneration(&generation.Identity)
+		s.searcher.useEmbeddingGenerationWith(&generation.Identity, provider)
 	}
+	s.servingGeneration(generation.ID)
 	return nil
+}
+
+// servingGeneration records the generation this process now answers queries
+// from, and drops the legacy pipeline once that is no longer the legacy one.
+func (s *Service) servingGeneration(generationID string) {
+	s.setServedGeneration(generationID)
+	if legacy := s.legacyGenerationID(); legacy != "" && legacy != generationID {
+		s.retireLegacyPipeline()
+	}
 }
 
 func (s *Service) tryActivateEmbeddingGeneration(
@@ -140,11 +256,44 @@ func (s *Service) tryActivateEmbeddingGeneration(
 	if generation.State != EmbeddingGenerationBuilding {
 		return false, nil
 	}
-	if _, err := generations.EnsureEmbeddingGenerationJobs(ctx, generationID, 0); err != nil {
+	// Only the current pipeline's generation is ever activated here: a
+	// building generation of another space (a legacy one revived by an older
+	// binary, one of a newer release) is not this process's to switch to.
+	if generationID != s.currentEmbeddingGenerationID() {
+		return false, nil
+	}
+	provider := s.providerFor(generation.Identity)
+	if provider == nil {
+		return false, nil
+	}
+	// Reconciliation scans every live revision (1.5 s on an 84k-memory
+	// database) and this runs after every embedding job of the build: once per
+	// reconcileEvery is enough to pick up memories saved without a job.
+	if s.reconcileDue(generationID) {
+		if _, err := s.ensureGenerationJobs(ctx, generations, generationID); err != nil {
+			return false, err
+		}
+	}
+	// Replacing an active generation is a one-way step for every process that
+	// can only query the old space: it waits for the upgrade gates.
+	if active, err := generations.ActiveEmbeddingGeneration(ctx); err != nil {
 		return false, err
+	} else if active != nil && active.ID != generationID {
+		reason, health, err := s.upgradeGate(ctx, generations, generation)
+		if err != nil {
+			return false, err
+		}
+		if reason != "" {
+			if s.upgradeLog.changed(reason) {
+				s.logger.Info("embedding generation upgrade held", "generation", generationID, "reason", reason)
+			}
+			return false, nil
+		}
+		s.logger.Info("activating embedding generation", "generation", generationID,
+			"replaces", active.ID, "mean_cosine", health)
 	}
 	if publisher, ok := s.store.(EmbeddingGenerationPublicationStore); ok && s.searcher != nil {
-		err := s.searcher.publishEmbeddingGeneration(generation.Identity,
+		err := s.searcher.publishEmbeddingGeneration(generation.Identity, provider,
 			func(publish func(map[string][]float32) error) error {
 				return publisher.PublishEmbeddingGeneration(
 					ctx, generationID, true, publish,
@@ -156,6 +305,7 @@ func (s *Service) tryActivateEmbeddingGeneration(
 		if err != nil {
 			return false, err
 		}
+		s.servingGeneration(generationID)
 		return true, nil
 	}
 	if err := generations.ActivateEmbeddingGeneration(ctx, generationID); err != nil {
@@ -183,12 +333,12 @@ func (s *Service) embedRevisionForGeneration(
 	if generation == nil || revision == nil {
 		return fmt.Errorf("embedding generation and revision are required")
 	}
-	identity, ok := s.currentEmbeddingIdentity()
-	if !ok || !generation.Identity.Compatible(identity) {
+	provider := s.providerFor(generation.Identity)
+	if provider == nil {
 		return fmt.Errorf("embedding generation %q is incompatible with configured provider", generation.ID)
 	}
 	vectors, err := EmbedForPurpose(
-		ctx, s.embedder, EmbeddingPurposeDocument,
+		ctx, provider, EmbeddingPurposeDocument,
 		[]string{revision.Memory.Content},
 	)
 	if err != nil {
