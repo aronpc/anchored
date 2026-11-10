@@ -279,3 +279,112 @@ func TestConsolidate_IsIdempotent(t *testing.T) {
 		t.Errorf("memories = %d, want 3", got)
 	}
 }
+
+// Two checkouts of one repository are one project, so their rows fold into the
+// one holding the most memory — the repair for databases written while
+// identity was the path. The survivor gains the remote_key when it had none.
+func TestConsolidate_FoldsCheckoutsOfTheSameOrigin(t *testing.T) {
+	db := openConsolidateTestDB(t)
+	d := NewDetector(db)
+	const origin = "git@github.com:user/repo.git"
+
+	base := realTempDir(t)
+	rich := repoComOrigin(t, filepath.Join(base, "main"), origin)
+	poor := repoComOrigin(t, filepath.Join(base, "other"), origin)
+	seedFragmentedProject(t, db, "p-rich", "main", rich, 5)
+	seedFragmentedProject(t, db, "p-poor", "other", poor, 2)
+
+	report, err := d.PlanConsolidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Merges) != 1 {
+		t.Fatalf("merges = %d, want 1: %+v", len(report.Merges), report.Merges)
+	}
+	m := report.Merges[0]
+	if m.Kind != KindOrigin || m.From.ID != "p-poor" || m.Into.ID != "p-rich" {
+		t.Fatalf("merge = %s %s -> %s, want origin p-poor -> p-rich", m.Kind, m.From.ID, m.Into.ID)
+	}
+	if m.Rows["memories"] != 2 {
+		t.Errorf("rows[memories] = %d, want 2", m.Rows["memories"])
+	}
+
+	if err := d.ApplyConsolidate(report); err != nil {
+		t.Fatal(err)
+	}
+	if got := countMemories(t, db, "p-rich"); got != 7 {
+		t.Errorf("p-rich memories = %d, want 7", got)
+	}
+	var rk string
+	if err := db.QueryRow(`SELECT COALESCE(remote_key,'') FROM projects WHERE id = 'p-rich'`).Scan(&rk); err != nil {
+		t.Fatal(err)
+	}
+	if rk != DeriveRemoteKeyFromURL(origin) {
+		t.Errorf("survivor remote_key = %q, want the origin's key", rk)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM projects`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("projects = %d, want 1", n)
+	}
+
+	again, err := d.PlanConsolidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again.Merges) != 0 {
+		t.Errorf("second plan still has %d merges", len(again.Merges))
+	}
+}
+
+// A checkout whose directory is gone can still be placed when its row carries
+// the remote_key of a repository that is on disk: the key, not the path, is
+// the identity.
+func TestConsolidate_FoldsVanishedCheckoutByStoredKey(t *testing.T) {
+	db := openConsolidateTestDB(t)
+	d := NewDetector(db)
+	const origin = "git@github.com:user/repo.git"
+
+	base := realTempDir(t)
+	live := repoComOrigin(t, filepath.Join(base, "main"), origin)
+	seedFragmentedProject(t, db, "p-live", "main", live, 3)
+	seedFragmentedProject(t, db, "p-gone", "arm-a", filepath.Join(base, "runs", "arm-a"), 2)
+	if _, err := db.Exec(`UPDATE projects SET remote_key = ? WHERE id = 'p-gone'`, DeriveRemoteKeyFromURL(origin)); err != nil {
+		t.Fatal(err)
+	}
+	// No key and no directory: nothing identifies it, so it stays reported.
+	seedFragmentedProject(t, db, "p-lost", "lost", filepath.Join(base, "nowhere"), 1)
+
+	report, err := d.PlanConsolidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Merges) != 1 || report.Merges[0].From.ID != "p-gone" || report.Merges[0].Into.ID != "p-live" {
+		t.Fatalf("merges = %+v, want p-gone -> p-live", report.Merges)
+	}
+	if len(report.Missing) != 1 || report.Missing[0].Project.ID != "p-lost" {
+		t.Fatalf("missing = %+v, want only p-lost", report.Missing)
+	}
+}
+
+// Different origins never fold, however alike the directories look.
+func TestConsolidate_KeepsDifferentOriginsApart(t *testing.T) {
+	db := openConsolidateTestDB(t)
+	d := NewDetector(db)
+
+	base := realTempDir(t)
+	a := repoComOrigin(t, filepath.Join(base, "a"), "git@github.com:user/one.git")
+	b := repoComOrigin(t, filepath.Join(base, "b"), "git@github.com:user/two.git")
+	seedFragmentedProject(t, db, "p-a", "a", a, 1)
+	seedFragmentedProject(t, db, "p-b", "b", b, 1)
+
+	report, err := d.PlanConsolidate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Merges) != 0 {
+		t.Fatalf("merges = %+v, want none", report.Merges)
+	}
+}

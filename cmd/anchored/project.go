@@ -12,18 +12,16 @@ import (
 	"github.com/jholhewres/anchored/pkg/project"
 )
 
-// `anchored project consolidate` folds the project rows that worktree
-// detection used to create.
+// `anchored project consolidate` folds the project rows of one repository into
+// a single project.
 //
-// Identity used to come from `git rev-parse --show-toplevel`, which in a linked
-// worktree returns the worktree's own path. Projects are looked up by exact
-// path, so every worktree got a row of its own and started with no memory of
-// the repository. Detection is fixed, but only from now on: proving which path
-// is a worktree of which repository needs git and the filesystem, so folding
-// the rows that already fragmented cannot be a SQL migration.
+// Identity used to be the path, so every checkout of a repository — a linked
+// worktree, a second clone, a directory later renamed — got a row of its own
+// and started with no memory of it. Detection now keys on the git origin, but
+// only from now on: reading the origin of the rows that already fragmented
+// needs git and the filesystem, so folding them cannot be a SQL migration.
 //
 // Like `anchored migrate`, the first run writes nothing.
-
 func runProject(args []string) {
 	if len(args) == 0 {
 		projectUsage()
@@ -42,7 +40,7 @@ func runProject(args []string) {
 func projectUsage() {
 	fmt.Fprintf(os.Stderr, `Usage: anchored project consolidate [--apply]
 
-Folds worktree project rows into the repository they belong to.
+Folds the project rows of one repository into a single project.
 `)
 }
 
@@ -53,17 +51,19 @@ func runProjectConsolidate(args []string) {
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: anchored project consolidate [--apply]
 
-Folds the project rows that worktree detection used to create into the
-repository they belong to, so a worktree and its main checkout share one
-memory again.
+Folds the project rows of one repository into a single project, so every
+checkout of it shares one memory again. Rows fragmented while identity was the
+path: a linked worktree, a second clone, a directory later renamed.
 
 The first run is a DRY RUN: it reports which projects would be folded, into
 what, and how many rows move. Nothing is written until you pass --apply.
 
-Only linked worktrees are folded. Independent clones of the same remote stay
-separate, and so does a submodule: both are checkouts a person keeps apart on
-purpose. A project whose path is gone from disk is reported and left alone,
-because there is no way to prove what it was without the filesystem.
+A linked worktree folds into its repository. Checkouts with the same git
+origin fold into the one holding the most memory. A repository with no origin
+is identified by its path alone and is left as it is, and so is a submodule
+with an origin of its own. A project whose path is gone from disk is folded
+when its stored remote_key matches a repository still present; otherwise it is
+reported and left alone, because nothing identifies it.
 
 Flags:
 `)
@@ -129,7 +129,7 @@ func printConsolidateReport(r *project.Report, apply bool) {
 	fmt.Printf("Scanned %d project(s).\n\n", r.Scanned)
 
 	if len(r.Merges) == 0 {
-		fmt.Println("No worktree projects to fold. Nothing to do.")
+		fmt.Println("No projects to fold. Nothing to do.")
 	}
 
 	for _, m := range r.Merges {
@@ -139,10 +139,14 @@ func printConsolidateReport(r *project.Report, apply bool) {
 			fmt.Printf("       ->  %s\n", m.IntoPath)
 			fmt.Printf("          (the repository has no project row yet; this one moves onto it)\n")
 		default:
-			fmt.Printf("  merge   %s  [%s]\n", m.From.Path, m.From.ID[:min(8, len(m.From.ID))])
+			label := "merge "
+			if m.Kind == project.KindOrigin {
+				label = "origin"
+			}
+			fmt.Printf("  %s  %s  [%s]\n", label, m.From.Path, m.From.ID[:min(8, len(m.From.ID))])
 			fmt.Printf("       ->  %s  [%s]\n", m.Into.Path, m.Into.ID[:min(8, len(m.Into.ID))])
 			if len(m.Rows) == 0 {
-				fmt.Printf("          no rows to move (the worktree never accumulated anything)\n")
+				fmt.Printf("          no rows to move (this checkout never accumulated anything)\n")
 			} else {
 				tables := make([]string, 0, len(m.Rows))
 				for t := range m.Rows {
@@ -167,9 +171,8 @@ func printConsolidateReport(r *project.Report, apply bool) {
 		for _, s := range r.Missing {
 			fmt.Printf("  %-60s %d memories\n", s.Project.Path, s.Memories)
 		}
-		fmt.Printf("\n  Whether these were worktrees cannot be proven without the directory,\n")
-		fmt.Printf("  so nothing is guessed. remote_key would not settle it either: it is\n")
-		fmt.Printf("  shared by independent clones of the same remote, which must stay apart.\n")
+		fmt.Printf("\n  The directory is gone and no repository on disk shares their remote_key,\n")
+		fmt.Printf("  so nothing identifies them and nothing is guessed.\n")
 		fmt.Printf("  Restore a path and re-run to fold it, or leave them as they are.\n\n")
 	}
 

@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`anchored project consolidate` now folds by git origin.** It only folded
+  linked worktrees, and refused to use `remote_key`, which contradicted
+  detection once identity moved to the origin: a database written while
+  identity was the path kept one row per checkout, and detection could only
+  ever show one of them. Checkouts of the same origin now fold into the row
+  holding the most memory, which also receives the `remote_key` if it had none.
+  A checkout whose directory is gone folds when its stored key matches a
+  repository still on disk; one that nothing identifies is still reported and
+  left alone. The first run remains a dry run.
+- **Detection could answer with the wrong row of a repository.** When the
+  repository's history sat under a row with no `remote_key` and another
+  checkout had created a keyed row later, the lookup by key returned the keyed
+  row and never reached the history. Detection now compares it with the row
+  stored at the current path and keeps the one holding more memory.
 - **A checkout started with no memory of its repository** — project identity
   came from the path, so every checkout of the same repository got a project row
   of its own and an empty memory, while the history stayed under whichever
