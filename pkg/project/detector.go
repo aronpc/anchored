@@ -79,6 +79,7 @@ func (d *Detector) Detect(cwd string) (*Project, error) {
 			if existing == nil {
 				continue
 			}
+			existing = d.preferirLinhaDoCaminho(existing, gitRoot)
 			d.reconciliar(existing, canonical, gitRoot)
 			return existing, nil
 		}
@@ -139,6 +140,31 @@ func (d *Detector) porRemoteKey(chave string) (*Project, error) {
 		return nil, err
 	}
 	return &p, nil
+}
+
+// preferirLinhaDoCaminho swaps the row found by key for the row stored at this
+// very path when that one holds more memories. A database older than
+// remote_key keeps the repository's history under a row with no key yet; a
+// keyed row created later by another checkout would otherwise win the lookup
+// and hide it. Reconciling the chosen row then gives it the key, after which
+// porRemoteKey's own ordering keeps picking it.
+func (d *Detector) preferirLinhaDoCaminho(porChave *Project, gitRoot string) *Project {
+	noCaminho, err := d.porPath(gitRoot)
+	if err != nil || noCaminho == nil || noCaminho.ID == porChave.ID {
+		return porChave
+	}
+	if d.contarMemorias(noCaminho.ID) > d.contarMemorias(porChave.ID) {
+		return noCaminho
+	}
+	return porChave
+}
+
+func (d *Detector) contarMemorias(projectID string) int {
+	var n int
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM memories WHERE project_id = ?", projectID).Scan(&n); err != nil {
+		return 0
+	}
+	return n
 }
 
 func (d *Detector) porPath(caminho string) (*Project, error) {

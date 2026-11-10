@@ -799,6 +799,53 @@ func TestDetect_ComDuplicatasEscolheAQueTemAMemoria(t *testing.T) {
 	}
 }
 
+// A database older than remote_key can hold the repository's real history in a
+// row that has NO key yet, next to a keyed row some other checkout created
+// later. Measured on a real database: 77 memories under the unkeyed row of the
+// main checkout, 1 under the keyed row of a throwaway checkout. Looking up by
+// key alone returns the keyed row and never reaches the history.
+func TestDetect_UnkeyedRowAtThisPathBeatsAPoorerKeyedRow(t *testing.T) {
+	db := openTestDB(t)
+	d := NewDetector(db)
+	const origin = "git@github.com:user/repo.git"
+
+	raiz := t.TempDir()
+	principal := repoComOrigin(t, filepath.Join(raiz, "principal"), origin)
+	rk := DeriveRemoteKeyFromURL(origin)
+
+	if _, err := db.Exec("INSERT INTO projects (id, name, path) VALUES ('p-rico', 'principal', ?)", principal); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO projects (id, name, path, remote_key) VALUES ('p-pobre', 'efemero', ?, ?)",
+		filepath.Join(raiz, "efemero"), rk); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 77; i++ {
+		if _, err := db.Exec("INSERT INTO memories (id, project_id, content) VALUES (?, 'p-rico', 'x')",
+			fmt.Sprintf("rico-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec("INSERT INTO memories (id, project_id, content) VALUES ('pobre-0', 'p-pobre', 'x')"); err != nil {
+		t.Fatal(err)
+	}
+
+	p, err := d.Detect(principal)
+	if err != nil || p == nil {
+		t.Fatalf("detect: %v", err)
+	}
+	if p.ID != "p-rico" {
+		t.Fatalf("picked %q; want p-rico, the row holding the 77 memories", p.ID)
+	}
+	if p.RemoteKey != rk {
+		t.Errorf("remote_key = %q, want it backfilled to %q", p.RemoteKey, rk)
+	}
+	// Once keyed, the richest-row ordering keeps the answer stable.
+	if q, err := d.Detect(principal); err != nil || q == nil || q.ID != "p-rico" {
+		t.Fatalf("second detect = %v (err=%v), want p-rico", q, err)
+	}
+}
+
 // TestDetect_SubmoduleKeepsItsWorkingTree guards the boundary of the worktree
 // fix. A submodule's --git-common-dir is <super>/.git/modules/<name>, a
 // metadata directory nobody works in; identifying the submodule by it would
